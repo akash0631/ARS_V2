@@ -237,6 +237,10 @@ export const settingsAPI = {
   get: (category) => api.get(`/settings/${category}`),
   update: (category, settings) => api.put('/settings', { category, settings }),
   testConnection: (config) => api.post('/settings/test-connection', config || {}),
+  // Database tab uses this instead of update(): tests, saves to JSON + .env,
+  // and hot-reloads the live engines so the app reconnects to the new server
+  // without a process restart.
+  applyDatabase: (config) => api.post('/settings/database/apply', config || {}),
   testEmail: (to) => api.post('/settings/test-email', { to_address: to }),
   systemInfo: () => api.get('/settings/system/info'),
   // Backup

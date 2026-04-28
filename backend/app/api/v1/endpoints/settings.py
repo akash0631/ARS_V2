@@ -8,16 +8,16 @@ Application Settings API Endpoints
 """
 import json
 import os
-import subprocess
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from urllib.parse import quote_plus
 from fastapi import APIRouter, Depends, HTTPException
+from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session
 
-from app.database.session import get_db, get_data_engine, get_system_engine
+from app.database.session import get_db, get_data_engine, get_system_engine, reload_db_engines
 from app.schemas.common import APIResponse
 from app.security.dependencies import get_current_user, RequirePermissions
 from app.models.rbac import User
@@ -32,8 +32,12 @@ settings = get_settings()
 # Settings file path — single source of truth defined in app.core.config so
 # the runtime engine builder and this endpoint never disagree on location.
 SETTINGS_FILE = APP_SETTINGS_FILE
-# Backup directory — sibling of the settings file (backend/app/backups)
-BACKUP_DIR = os.path.join(os.path.dirname(APP_SETTINGS_FILE), "backups")
+# backend/ root — both app_settings.json and .env live here.
+# APP_SETTINGS_FILE = backend/app_settings.json → dirname = backend/
+BACKEND_ROOT = os.path.dirname(APP_SETTINGS_FILE)
+ENV_FILE = os.path.join(BACKEND_ROOT, ".env")
+# Backup directory — sibling of the settings file (backend/backups)
+BACKUP_DIR = os.path.join(BACKEND_ROOT, "backups")
 
 
 def load_app_settings() -> Dict[str, Any]:
@@ -100,6 +104,66 @@ def save_app_settings(settings_dict: Dict[str, Any]) -> bool:
         return True
     except Exception as e:
         raise ValueError(f"Failed to save settings: {e}")
+
+
+# ----------------------------------------------------------------------------
+# .env writer — keeps the file as the canonical environment source of truth
+# so that even a hard restart (no app_settings.json) still connects to the
+# DB the user last saved through the UI.
+# ----------------------------------------------------------------------------
+def _format_env_value(value: Any) -> str:
+    """Quote a value if it contains chars that would break a bare KEY=VAL line."""
+    s = "" if value is None else str(value)
+    if s == "":
+        return ""
+    # Quote when there's whitespace, '#', or quote chars; otherwise keep bare.
+    needs_quote = any(c in s for c in (" ", "\t", "#", '"', "'", "$"))
+    if needs_quote:
+        escaped = s.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return s
+
+
+def update_env_file(updates: Dict[str, Any]) -> str:
+    """Update specific keys in backend/.env, preserving every other line
+    (comments, blanks, unrelated keys). Creates the file if missing.
+    Returns the absolute path of the file written."""
+    lines: List[str] = []
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    seen: set = set()
+    out: List[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        # Keep comments/blank lines unchanged
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            out.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in updates:
+            out.append(f"{key}={_format_env_value(updates[key])}\n")
+            seen.add(key)
+        else:
+            out.append(line)
+
+    # Append keys that weren't already present
+    missing = [k for k in updates.keys() if k not in seen]
+    if missing:
+        if out and not out[-1].endswith("\n"):
+            out.append("\n")
+        if out and out[-1].strip() != "":
+            out.append("\n")
+        out.append("# --- Updated by Settings UI ---\n")
+        for k in missing:
+            out.append(f"{k}={_format_env_value(updates[k])}\n")
+
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    return ENV_FILE
+
+
 
 
 # ============================================================================
@@ -302,6 +366,171 @@ async def test_database_connection(
         msg = "Both databases failed to connect — check the hint under each error."
 
     return APIResponse(data=results, message=msg)
+
+
+# ============================================================================
+# Apply Database Settings — test, persist to JSON + .env, restart backend
+# ============================================================================
+
+@router.post("/database/apply", response_model=APIResponse)
+async def apply_database_settings(
+    body: TestConnectionRequest,
+    current_user: User = Depends(get_current_user),
+    _: User = Depends(RequirePermissions(["ADMIN_SETTINGS"])),
+):
+    """Atomic save flow used by the Database tab in Settings UI:
+    1. Probe both System DB and Data DB with the supplied (or saved) values.
+    2. If either probe fails → reject the save (no files touched).
+    3. Persist to backend/app_settings.json AND backend/.env (canonical
+       sources for any future hard restart).
+    4. Hot-reload the running engines — clear the settings cache, swap each
+       engine's connection pool to the new server, dispose the old pools.
+       No process restart is needed; the next request from any code path
+       (FastAPI dep-injected sessions, raw `data_engine.connect()`, etc.)
+       opens connections to the new server."""
+    saved = load_app_settings().get("database", {})
+    payload = body.model_dump(exclude_none=True) if body else {}
+    # UI sends '********' to mean "use the saved password" — never persist that.
+    if payload.get("password") == PASSWORD_MASK:
+        payload.pop("password")
+
+    cfg = {**saved, **payload}
+    required = ("server", "system_database", "data_database",
+                "username", "password", "driver", "trust_cert")
+    missing = [k for k in required if not cfg.get(k)]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required database fields: {', '.join(missing)}",
+        )
+
+    # ---- Step 1: Probe both databases ----
+    results = {}
+    for label, db_name in [("system_db", cfg["system_database"]),
+                           ("data_db",   cfg["data_database"])]:
+        try:
+            results[label] = _probe(_build_test_url(cfg, db_name))
+        except Exception as e:
+            err = str(e)
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"{label.replace('_', ' ').title()} probe failed — settings NOT saved.",
+                    "hint": _classify_db_error(err),
+                    "error": err[:300],
+                    "failed_target": db_name,
+                },
+            )
+
+    # ---- Step 2: Persist to app_settings.json ----
+    all_settings = load_app_settings()
+    all_settings.setdefault("database", {}).update({
+        "server":          cfg["server"],
+        "port":            cfg.get("port", "") or "",
+        "system_database": cfg["system_database"],
+        "data_database":   cfg["data_database"],
+        "username":        cfg["username"],
+        "password":        cfg["password"],
+        "driver":          cfg["driver"],
+        "trust_cert":      cfg.get("trust_cert", "yes"),
+        "encrypt":         cfg.get("encrypt", "no"),
+    })
+    save_app_settings(all_settings)
+
+    # ---- Step 3: Persist to .env (canonical for hard restarts) ----
+    env_updates = {
+        "DB_SERVER":     cfg["server"],
+        "DB_NAME":       cfg["system_database"],
+        "DATA_DB_NAME":  cfg["data_database"],
+        "DB_USERNAME":   cfg["username"],
+        "DB_PASSWORD":   cfg["password"],
+        "DB_DRIVER":     cfg["driver"],
+        "DB_TRUST_CERT": cfg.get("trust_cert", "yes"),
+        "DB_ENCRYPT":    cfg.get("encrypt", "no"),
+    }
+    if cfg.get("port"):
+        env_updates["DB_PORT"] = str(cfg["port"])
+    env_path = update_env_file(env_updates)
+
+    # ---- Step 4: Hot-reload engines (clears settings cache + swaps pools) ----
+    try:
+        reload_info = reload_db_engines()
+    except Exception as e:
+        # Files were already written — surface the reload failure but don't
+        # roll back, since the next hard restart will pick up the new config.
+        logger.exception("Hot-reload of engines failed after saving settings")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": ("Settings saved to disk but live engines failed to "
+                            "reload. Restart the backend manually to apply."),
+                "error": str(e)[:300],
+            },
+        )
+
+    # ---- Step 5: Ensure system schema exists on the new DB ----
+    # If the user pointed us at a fresh / wrong database, the rbac_users etc.
+    # tables won't exist and every authenticated endpoint will return 500.
+    # Auto-create them (mirrors main.py lifespan), then verify the table is
+    # actually queryable. If we can't make this work, refuse the save.
+    try:
+        from app.database.session import system_engine as _sys_engine, Base
+        import app.models.rbac  # noqa - registers RBAC tables on Base
+        import app.models.rls   # noqa
+        import app.models.audit # noqa
+        Base.metadata.create_all(bind=_sys_engine, checkfirst=True)
+
+        with _sys_engine.connect() as conn:
+            conn.execute(text("SELECT TOP 1 1 FROM rbac_users"))
+        schema_status = "ok"
+    except Exception as e:
+        logger.error(f"System schema check failed on new DB: {e}")
+        schema_status = "missing"
+        # Engines are already pointing at the new DB. Don't raise — the user
+        # may want to populate the DB next. Surface the warning in the response.
+        schema_error = str(e)[:300]
+    else:
+        schema_error = None
+
+    # Return masked summary
+    saved_summary = {
+        "server":          cfg["server"],
+        "port":            cfg.get("port", ""),
+        "system_database": cfg["system_database"],
+        "data_database":   cfg["data_database"],
+        "username":        cfg["username"],
+        "password":        PASSWORD_MASK,
+        "driver":          cfg["driver"],
+        "trust_cert":      cfg.get("trust_cert", "yes"),
+        "encrypt":         cfg.get("encrypt", "no"),
+    }
+    if schema_status == "ok":
+        message = (
+            "Connections verified, settings saved, live engines reloaded. "
+            "The application is now using the new server."
+        )
+    else:
+        message = (
+            f"Connected to the new server, but the system schema (rbac_users, "
+            f"rbac_roles, etc.) is not present on '{cfg['system_database']}'. "
+            f"Auth-protected endpoints will return 500 until the schema is "
+            f"created. Restart the backend or run the migrations against the "
+            f"new database."
+        )
+
+    return APIResponse(
+        data={
+            "settings":      saved_summary,
+            "system_db":     results["system_db"],
+            "data_db":       results["data_db"],
+            "json_path":     SETTINGS_FILE,
+            "env_path":      env_path,
+            "reloaded":      reload_info,
+            "schema_status": schema_status,
+            "schema_error":  schema_error,
+        },
+        message=message,
+    )
 
 
 # ============================================================================

@@ -107,15 +107,34 @@ export default function SettingsPage() {
   const handleSave = async (category) => {
     setSaving(true)
     try {
-      const { data } = await settingsAPI.update(category, settings[category])
-      const requiresRestart = data?.data?.requires_restart
-      toast.success(data?.message || `${category} settings saved`,
-                    { duration: requiresRestart ? 8000 : 3000 })
-      if (requiresRestart) {
-        toast('Restart the backend (uvicorn) to apply the new database connection.',
-              { icon: 'i', duration: 8000 })
+      // Database tab uses the apply flow: test → save JSON + .env →
+      // hot-reload engines. No process restart.
+      if (category === 'database') {
+        const pending = toast.loading('Verifying connection and applying…')
+        try {
+          const { data } = await settingsAPI.applyDatabase(settings.database || {})
+          toast.dismiss(pending)
+          toast.success(
+            data?.message || 'Database settings applied. App is now using the new server.',
+            { duration: 5000 },
+          )
+          loadSettings()
+          loadSystemInfo()
+        } catch (e) {
+          toast.dismiss(pending)
+          const detail = e.response?.data?.detail
+          if (typeof detail === 'object' && detail?.message) {
+            toast.error(`${detail.message} ${detail.hint || ''}`.trim(), { duration: 10000 })
+          } else {
+            toast.error(detail || 'Failed to apply database settings')
+          }
+        }
+        return
       }
-      // Reload so masked password comes back from server
+
+      // All other categories: simple PUT.
+      const { data } = await settingsAPI.update(category, settings[category])
+      toast.success(data?.message || `${category} settings saved`)
       loadSettings()
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Failed to save settings')
@@ -302,10 +321,11 @@ export default function SettingsPage() {
               </div>
 
               <div className="text-xs text-gray-500 bg-amber-50 border border-amber-200 rounded p-3">
-                <strong>How it works:</strong> Values here are saved to <code>backend/app_settings.json</code>.
-                The application reads database connection from this file at startup.
-                After clicking <em>Save Changes</em>, restart the backend (uvicorn) to connect to the new server.
-                Use <em>Test Connection</em> first to verify the credentials before saving.
+                <strong>How it works:</strong> Click <em>Save Changes</em> to verify the connection,
+                write the new credentials to <code>backend/app_settings.json</code> and <code>backend/.env</code>,
+                and hot-reload the database engines so the running application connects to the new server
+                immediately — no process restart, no downtime. If the connection test fails, nothing is saved.
+                Use <em>Test Connection</em> first if you want to validate values without saving.
               </div>
 
               <div className="flex items-center gap-4 pt-4 border-t">
