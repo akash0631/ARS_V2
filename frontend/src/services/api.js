@@ -307,10 +307,13 @@ export const gridBuilderAPI = {
 // doesn't spam the user with timeout toasts.
 const _POLL = { quiet: true, timeout: 30000 }
 export const listingAPI = {
-  config:       ()       => api.get('/listing/config', _POLL),
+  // config / summary default to polling-friendly (quiet) but the caller can
+  // override with { quiet: false } when it's a foreground/user action that
+  // should surface the error toast.
+  config:       (opts={}) => api.get('/listing/config',  { ..._POLL, ...opts }),
   generate:     (data, opts) => api.post('/listing/generate', data, { timeout: 600000, ...opts }),
   preview:      (params) => api.get('/listing/preview', { params }),
-  summary:      ()       => api.get('/listing/summary', _POLL),
+  summary:      (opts={}) => api.get('/listing/summary', { ..._POLL, ...opts }),
   export:       (params) => api.get('/listing/export', { params, responseType: 'blob', timeout: 600000 }),
   createFinal:  (data)   => api.post('/listing/create-final', data || {}),
   storeRanking: (params) => api.get('/listing/store-ranking', { params }),
@@ -336,6 +339,8 @@ export const listingAPI = {
   sessions:      (params)    => api.get('/listing/sessions', { params }),
   session:       (sid)       => api.get(`/listing/sessions/${sid}`),
   sessionLog:    (sid, tail) => api.get(`/listing/sessions/${sid}/log`, { params: tail ? { tail } : {} }),
+  killSession:   (sid)       => api.post(`/listing/sessions/${sid}/kill`),
+  deleteSession: (sid)       => api.delete(`/listing/sessions/${sid}`),
 }
 
 // ============== Lookup Art Master (Data Preparation) ==============

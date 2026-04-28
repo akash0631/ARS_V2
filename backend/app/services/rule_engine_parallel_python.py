@@ -23,6 +23,7 @@ Returns the same result dict shape as rule_engine_new.run_listing_and_allocation
 plus extras (batch_id, failed list).
 """
 import os
+import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,6 +34,7 @@ from sqlalchemy import text
 
 from app.database.session import get_data_engine
 from app.services import rule_engine_new as rne
+from app.services import alloc_cancellation as ac
 from app.services.alloc_queue import (
     claim_next,
     get_done_summary,
@@ -45,9 +47,14 @@ from app.services.alloc_queue import (
 from app.utils.db_helpers import run_sql
 
 
-DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "8"))
+# Lowered from 8/16 to 4/8. With 8 ThreadPoolExecutor workers each running
+# CPU-heavy Python code in a single uvicorn process, the GIL gets saturated
+# and unrelated endpoints (auth/login, polling, navigation) hit the proxy's
+# 120s read-timeout. 4 workers keep CPU headroom available; bump higher
+# only when running uvicorn with --workers N (separate processes => own GIL).
+DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "4"))
 MIN_WORKERS = 2
-MAX_WORKERS = 16
+MAX_WORKERS = 8
 
 
 def run_listing_and_allocation_python_parallel(
@@ -164,74 +171,156 @@ def run_listing_and_allocation_python_parallel(
         # Each thread = own engine connection = own SQL Server session = own
         # #nre_pool. Pool is built once per worker covering all MAJ_CATs;
         # decrements happen only on rows in this worker's claimed MAJ_CATs.
+        # Re-establish loguru's session_id binding for this thread (contextvars
+        # don't propagate across ThreadPoolExecutor) so worker errors land in
+        # the per-session log file.
+        wlogger = logger.bind(session_id=batch_id)
+        spid = 0
         with engine.connect() as wconn:
+            # Capture this connection's SPID + register it with the cancel
+            # registry so /listing/cancel-batch can KILL the in-flight
+            # query when the user clicks Cancel Batch.
+            try:
+                spid = ac.get_current_spid(wconn)
+                if spid:
+                    ac.register_spid(batch_id, spid)
+                    wlogger.info(f"[C-py-W{worker_id}] spid={spid} registered for cancel")
+            except Exception:
+                pass
+
+            # Lower this session's deadlock priority so SQL Server picks it
+            # as the victim before any other connection. Combined with the
+            # WITH (ROWLOCK) hints inside _run_band_and_revalidate_batched
+            # and the retry-with-jitter loop below, the rare cross-page
+            # deadlock now resolves automatically instead of failing the
+            # whole MAJ_CAT.
+            try:
+                run_sql(wconn, "SET DEADLOCK_PRIORITY LOW")
+            except Exception as e:
+                wlogger.warning(f"[C-py-W{worker_id}] could not set deadlock priority: {e}")
+
             try:
                 rne._stage_c_build_pool(wconn, alloc_table)
             except Exception as e:
-                logger.error(f"[C-py-W{worker_id}] pool build failed: {e}")
+                wlogger.error(f"[C-py-W{worker_id}] pool build failed: {e}")
+                ac.unregister_spid(batch_id, spid)
                 return
 
-            while True:
-                # Short-lived claim conn so the long-running wconn doesn't
-                # hold the queue page-lock across the entire MAJ_CAT.
-                with engine.connect() as claim_conn:
-                    mc = claim_next(claim_conn, batch_id, worker_id)
-                if mc is None:
-                    return  # queue exhausted
-
-                t_mc = time.time()
-                try:
-                    _run_one_majcat(
-                        wconn, working_table, alloc_table, mc, grids,
-                        pri_ct_check_rl=pri_ct_check_rl,
-                        pri_ct_check_tbc=pri_ct_check_tbc,
-                    )
-                    s = wconn.execute(text(f"""
-                        SELECT ISNULL(SUM(SHIP_QTY),0),
-                               ISNULL(SUM(HOLD_QTY),0),
-                               COUNT(*)
-                        FROM [{alloc_table}] WHERE MAJ_CAT = :mc
-                    """), {"mc": mc}).fetchone()
-                    ship_mc = float(s[0] or 0)
-                    hold_mc = float(s[1] or 0)
-                    rows_mc = int(s[2] or 0)
-                    dur = time.time() - t_mc
-
-                    with engine.connect() as upd_conn:
-                        mark_done(upd_conn, batch_id, mc,
-                                  ship_mc, hold_mc, rows_mc, dur)
-                        prog = get_progress(upd_conn, batch_id)
-
-                    logger.info(
-                        f"[C-py-W{worker_id}] {prog['done']}/{prog['total']} "
-                        f"({prog['pct']}%) — MAJ_CAT={mc} "
-                        f"ship={ship_mc:.0f} hold={hold_mc:.0f} "
-                        f"rows={rows_mc} in {dur:.1f}s"
-                    )
-                except Exception as e:
-                    err = str(e)[:2000]
-                    dur = time.time() - t_mc
-                    logger.error(
-                        f"[C-py-W{worker_id}] MAJ_CAT={mc} FAILED in "
-                        f"{dur:.1f}s: {err}"
-                    )
-                    try:
-                        with engine.connect() as upd_conn:
-                            mark_failed(upd_conn, batch_id, mc, err, dur)
-                    except Exception as e2:
-                        logger.error(
-                            f"[C-py-W{worker_id}] mark_failed itself failed "
-                            f"for MAJ_CAT={mc}: {e2}"
+            try:
+                while True:
+                    # Cooperative cancel: if the user clicked Cancel Batch,
+                    # exit before pulling another MAJ_CAT.
+                    if ac.is_cancelled(batch_id):
+                        wlogger.warning(
+                            f"[C-py-W{worker_id}] cancel detected — exiting cleanly"
                         )
-                    with state_lock:
-                        result["errors"].append({"maj_cat": mc, "error": err})
-                    # continue the loop — pick next MAJ_CAT
+                        return
+                    # Short-lived claim conn so the long-running wconn doesn't
+                    # hold the queue page-lock across the entire MAJ_CAT.
+                    with engine.connect() as claim_conn:
+                        mc = claim_next(claim_conn, batch_id, worker_id)
+                    if mc is None:
+                        return  # queue exhausted
+
+                    t_mc = time.time()
+                    try:
+                        # Deadlock-tolerant retry. With 8 workers all hitting
+                        # the same alloc_table, SQL Server can pick any of them
+                        # as the deadlock victim (state 40001 / err 1205). Retry
+                        # the WHOLE MAJ_CAT a few times with backoff + jitter
+                        # before giving up — much cheaper than failing the row
+                        # and using the 2-attempt queue retry budget.
+                        _DEADLOCK_TOKENS = ("40001", "1205", "deadlock")
+                        last_exc = None
+                        for retry in range(4):  # 1 initial + 3 retries
+                            # Bail out of the retry loop the moment cancel
+                            # is requested — don't burn the budget retrying
+                            # a doomed MAJ_CAT.
+                            if ac.is_cancelled(batch_id):
+                                wlogger.warning(
+                                    f"[C-py-W{worker_id}] MAJ_CAT={mc} "
+                                    f"cancelled mid-retry"
+                                )
+                                raise RuntimeError("cancelled by user")
+                            try:
+                                _run_one_majcat(
+                                    wconn, working_table, alloc_table, mc, grids,
+                                    pri_ct_check_rl=pri_ct_check_rl,
+                                    pri_ct_check_tbc=pri_ct_check_tbc,
+                                )
+                                last_exc = None
+                                break
+                            except Exception as exc:
+                                es = str(exc)
+                                if any(t in es for t in _DEADLOCK_TOKENS):
+                                    last_exc = exc
+                                    # Roll the wconn transaction back so the
+                                    # next attempt starts from a clean slate.
+                                    try: wconn.rollback()
+                                    except Exception: pass
+                                    wait = 0.4 * (2 ** retry) + random.uniform(0, 0.4)
+                                    wlogger.warning(
+                                        f"[C-py-W{worker_id}] MAJ_CAT={mc} "
+                                        f"deadlock — retry {retry+1}/3 in {wait:.1f}s"
+                                    )
+                                    time.sleep(wait)
+                                    continue
+                                raise  # non-retryable
+                        if last_exc is not None:
+                            raise last_exc
+                        s = wconn.execute(text(f"""
+                            SELECT ISNULL(SUM(SHIP_QTY),0),
+                                   ISNULL(SUM(HOLD_QTY),0),
+                                   COUNT(*)
+                            FROM [{alloc_table}] WHERE MAJ_CAT = :mc
+                        """), {"mc": mc}).fetchone()
+                        ship_mc = float(s[0] or 0)
+                        hold_mc = float(s[1] or 0)
+                        rows_mc = int(s[2] or 0)
+                        dur = time.time() - t_mc
+
+                        with engine.connect() as upd_conn:
+                            mark_done(upd_conn, batch_id, mc,
+                                      ship_mc, hold_mc, rows_mc, dur)
+                            prog = get_progress(upd_conn, batch_id)
+
+                        wlogger.info(
+                            f"[C-py-W{worker_id}] {prog['done']}/{prog['total']} "
+                            f"({prog['pct']}%) — MAJ_CAT={mc} "
+                            f"ship={ship_mc:.0f} hold={hold_mc:.0f} "
+                            f"rows={rows_mc} in {dur:.1f}s"
+                        )
+                    except Exception as e:
+                        err = str(e)[:2000]
+                        dur = time.time() - t_mc
+                        wlogger.error(
+                            f"[C-py-W{worker_id}] MAJ_CAT={mc} FAILED in "
+                            f"{dur:.1f}s: {err}"
+                        )
+                        try:
+                            with engine.connect() as upd_conn:
+                                mark_failed(upd_conn, batch_id, mc, err, dur)
+                        except Exception as e2:
+                            wlogger.error(
+                                f"[C-py-W{worker_id}] mark_failed itself failed "
+                                f"for MAJ_CAT={mc}: {e2}"
+                            )
+                        with state_lock:
+                            result["errors"].append({"maj_cat": mc, "error": err})
+                        # continue the loop — pick next MAJ_CAT
+            finally:
+                # Always unregister this SPID so KILL won't target a
+                # connection that's already returned to the pool.
+                ac.unregister_spid(batch_id, spid)
 
     with ThreadPoolExecutor(max_workers=n_workers,
                             thread_name_prefix="ars-alloc") as ex:
         futures = [ex.submit(worker, i) for i in range(n_workers)]
         for f in as_completed(futures):
             f.result()  # propagate unexpected exceptions
+
+    # All workers done — drop the cancel registry for this batch_id.
+    ac.cleanup(batch_id)
 
     # ── Finalise on main thread (verbatim from rule_engine_new._stage_c_waterfall) ──
     with engine.connect() as conn:

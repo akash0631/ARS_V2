@@ -319,32 +319,108 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     """Build ARS_LISTING = Grid data + MSA missing options.
 
     run_mode: "listing" = generate listing only, "full" = MSA calc → Grid build → Listing
+
+    Runs ASYNCHRONOUSLY: a background thread does the actual work; this
+    endpoint returns within milliseconds so reverse proxies (Cloudflare's
+    100s edge timeout in particular) never see a hung connection. The UI
+    follows progress via:
+      - GET /listing/sessions/{session_id}      (overall status)
+      - GET /listing/alloc-progress?batch_id=…  (per-MAJ_CAT, parallel modes)
     """
-    # ── Session capture: every loguru event during this request is mirrored
-    # to logs/listing_sessions/<session_id>.log; the DB row in
-    # ARS_LISTING_SESSIONS lets the UI list past runs and surface errors.
+    import threading
+
     from app.services.listing_sessions import (
-        end_session, make_session_id, start_session,
+        make_session_id, start_session,
     )
+
     session_id = make_session_id()
+    user_name  = getattr(current_user, "username", None)
+    req_dict   = req.dict() if hasattr(req, "dict") else dict(req.__dict__)
+    mode       = (req_dict.get("allocation_mode") or "python_parallel").lower()
+    # For parallel modes the batch_id == session_id so the UI can poll
+    # /alloc-progress with the same id it gets back here, and the queue
+    # table rows line up with the session row.
+    alloc_batch_id = session_id if mode != "sequential" else None
+
+    # Insert the RUNNING row + attach the per-session loguru sink BEFORE
+    # the thread starts so the very first log line ('=== SESSION START …')
+    # lands in the file and the UI can show the session immediately.
+    start_session(session_id, user_name, req_dict)
+
+    # Fire the actual work in a daemon thread. SQLAlchemy connections are
+    # thread-safe (each thread checks out its own from the pool), so this
+    # is safe. The thread terminates naturally when the work finishes.
+    threading.Thread(
+        target=_run_generate_in_thread,
+        args=(req_dict, user_name, session_id, alloc_batch_id),
+        daemon=True,
+        name=f"listing-gen-{session_id}",
+    ).start()
+
+    # Return immediately — UI takes over via polling.
+    return {
+        "success": True,
+        "message": (f"Listing generation started in background "
+                    f"(mode={mode}, session={session_id}). "
+                    f"Watch the progress panel below."),
+        "data": {
+            "session_id":      session_id,
+            "alloc_batch_id":  alloc_batch_id,
+            "allocation_mode": mode,
+            "parallel_workers": req_dict.get("parallel_workers"),
+            "status":          "RUNNING",
+        },
+    }
+
+
+def _run_generate_in_thread(req_dict: dict, user_name, session_id: str,
+                              alloc_batch_id: Optional[str]):
+    """
+    Background-thread entry point. Reconstructs GenerateRequest from the
+    dict (FastAPI request objects can't cross thread boundaries safely)
+    and runs the existing _generate_listing_impl, then closes the session.
+    """
+    from app.services.listing_sessions import end_session
     summary: dict = {}
-    start_session(
-        session_id,
-        getattr(current_user, "username", None),
-        req.dict() if hasattr(req, "dict") else dict(req.__dict__),
-    )
-    # All work runs inside contextualize() so the per-session loguru sink
-    # (which filters by record["extra"]["session_id"]) catches the events.
     try:
         with logger.contextualize(session_id=session_id):
             try:
-                return _generate_listing_impl(
-                    req, current_user, session_id, summary
+                # Rebuild the Pydantic model from the dict snapshot so the
+                # impl sees req.* the same way as before.
+                req = GenerateRequest(**req_dict)
+                _generate_listing_impl(
+                    req,
+                    current_user=None,           # not used inside the impl
+                    session_id=session_id,
+                    summary=summary,
+                    preset_batch_id=alloc_batch_id,
                 )
             except Exception as e:
                 summary["error"] = str(e)
-                raise
+                logger.exception(f"[generate] background thread failed: {e}")
     finally:
+        # If the run errored out and we'd reserved a batch_id, mark any
+        # PENDING/IN_PROGRESS rows for it as FAILED. Otherwise the queue
+        # leaks an orphan and /listing/active-job keeps reporting it as
+        # running forever.
+        if summary.get("error") and alloc_batch_id:
+            try:
+                from app.services.alloc_queue import QUEUE_TABLE
+                de = get_data_engine()
+                with de.connect() as conn:
+                    conn.execute(text(f"""
+                        UPDATE {QUEUE_TABLE}
+                           SET STATUS       = 'FAILED',
+                               COMPLETED_AT = GETDATE(),
+                               ERROR_MSG    = LEFT(ISNULL(ERROR_MSG, '') +
+                                                   ' [generate-thread aborted]', 2000)
+                         WHERE BATCH_ID = :b
+                           AND STATUS IN ('PENDING','IN_PROGRESS')
+                    """), {"b": alloc_batch_id})
+                    conn.commit()
+            except Exception:
+                logger.warning("[generate] cleanup of orphan queue rows failed",
+                               exc_info=True)
         try:
             end_session(
                 session_id,
@@ -356,9 +432,13 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
 
 
 def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
-                            summary: dict):
+                            summary: dict, preset_batch_id: Optional[str] = None):
     """Original /generate body — unchanged behaviour, just hoisted into a
-    helper so the public endpoint can wrap it with session capture."""
+    helper so the public endpoint can wrap it with session capture.
+
+    preset_batch_id: if set, parallel orchestrators reuse this id (so it
+    matches the session_id returned to the UI). Sequential mode ignores it.
+    """
     start = time.time()
     de = get_data_engine()
 
@@ -1792,7 +1872,9 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     alloc_batch_id = None
     alloc_failed_count = 0
     mode = (req.allocation_mode or "python_parallel").lower()
-    n_workers = max(2, min(16, int(req.parallel_workers or 8)))
+    # Cap at 8 (was 16). Higher counts saturate the GIL in a single-process
+    # uvicorn and freeze auth / poll endpoints — see the orchestrator headers.
+    n_workers = max(2, min(8, int(req.parallel_workers or 4)))
     try:
         if mode == "python_parallel":
             from app.services.rule_engine_parallel_python import (
@@ -1803,6 +1885,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 listed_table="ARS_LISTED_OPT",
                 alloc_table=ALLOC_TABLE,
                 n_workers=n_workers,
+                batch_id=preset_batch_id,
                 size_threshold=req.stock_threshold_pct,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
@@ -1817,6 +1900,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 listed_table="ARS_LISTED_OPT",
                 alloc_table=ALLOC_TABLE,
                 n_workers=n_workers,
+                batch_id=preset_batch_id,
                 size_threshold=req.stock_threshold_pct,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
@@ -1831,6 +1915,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 listed_table="ARS_LISTED_OPT",
                 alloc_table=ALLOC_TABLE,
                 n_workers=n_workers,
+                batch_id=preset_batch_id,
                 size_threshold=req.stock_threshold_pct,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
@@ -2114,7 +2199,7 @@ def retry_failed(req: RetryFailedRequest,
         failed_mcs = [f["maj_cat"] for f in failed]
         reset_failed_for_retry(conn, req.batch_id)
 
-    n_workers = max(2, min(16, int(req.parallel_workers or 8)))
+    n_workers = max(2, min(8, int(req.parallel_workers or 4)))
     mode = (req.allocation_mode or "python_parallel").lower()
     if mode == "sql_parallel":
         from app.services.rule_engine_parallel_sql import (
@@ -2216,6 +2301,44 @@ def get_listing_session_log(session_id: str,
     }
 
 
+@router.post("/sessions/{session_id}/kill")
+def kill_listing_session(session_id: str,
+                         current_user: User = Depends(get_current_user)):
+    """
+    Force-terminate a RUNNING session: marks the session row FAILED and
+    cancels any PENDING/IN_PROGRESS queue rows linked to its batch_id.
+    Use when a run has hung or you want to stop it from the Logs page.
+    """
+    from app.services.listing_sessions import kill_session
+    try:
+        result = kill_session(
+            session_id,
+            reason=f"killed by {getattr(current_user, 'username', 'user')}",
+        )
+    except Exception as e:
+        raise HTTPException(500, f"kill failed: {e}")
+    return {"success": True, **result}
+
+
+@router.delete("/sessions/{session_id}")
+def delete_listing_session(session_id: str,
+                           current_user: User = Depends(get_current_user)):
+    """
+    Permanently delete a finished session header row and its log file.
+    Refuses to delete a session whose status is still RUNNING — kill it
+    via POST /sessions/{id}/kill first.
+    """
+    from app.services.listing_sessions import delete_session
+    try:
+        result = delete_session(session_id)
+    except RuntimeError as e:
+        # Most common case: trying to delete a still-running session.
+        raise HTTPException(409, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"delete failed: {e}")
+    return {"success": True, **result}
+
+
 class CancelBatchRequest(BaseModel):
     batch_id: str
 
@@ -2224,27 +2347,71 @@ class CancelBatchRequest(BaseModel):
 def cancel_batch(req: CancelBatchRequest,
                  current_user: User = Depends(get_current_user)):
     """
-    Force-cancel a stuck allocation batch. Moves every PENDING / IN_PROGRESS
-    row in the queue to FAILED with ERROR_MSG='cancelled by user', so the
-    batch is no longer reported as active by /listing/active-job.
+    HARD-cancel a running allocation batch. Four-step kill:
 
-    Doesn't touch DONE rows — partial results stay intact.
+      1. Set the in-process cancel event so worker threads exit before
+         claiming any new MAJ_CAT.
+      2. KILL each worker's SQL Server SPID so any in-flight UPDATE
+         terminates immediately (best-effort: needs ALTER ANY CONNECTION
+         on the app login).
+      3. Mark every PENDING / IN_PROGRESS queue row as FAILED with
+         ERROR_MSG='cancelled by <user>'.
+      4. Mark the matching ARS_LISTING_SESSIONS row as FAILED if it's
+         still RUNNING.
+
+    DONE rows are untouched — partial results stay intact.
     """
+    from app.services import alloc_cancellation as ac
     from app.services.alloc_queue import QUEUE_TABLE
+    from app.services.listing_sessions import SESSIONS_TABLE
+
+    user = getattr(current_user, "username", "user")
+
+    # Step 1+2: signal the threads + KILL their SQL sessions.
+    cancel_info = ac.hard_cancel(req.batch_id)
+
     de = get_data_engine()
     with de.connect() as conn:
+        # Step 3: mark queue rows
         res = conn.execute(text(f"""
             UPDATE {QUEUE_TABLE}
                SET STATUS       = 'FAILED',
                    COMPLETED_AT = GETDATE(),
-                   ERROR_MSG    = 'cancelled by user'
+                   ERROR_MSG    = :msg
              WHERE BATCH_ID = :b
                AND STATUS IN ('PENDING','IN_PROGRESS')
-        """), {"b": req.batch_id})
-        conn.commit()
+        """), {"b": req.batch_id, "msg": f"cancelled by {user}"})
         cancelled = int(res.rowcount or 0)
-    logger.info(f"[cancel-batch] batch_id={req.batch_id} cancelled_rows={cancelled}")
-    return {"success": True, "batch_id": req.batch_id, "cancelled": cancelled}
+
+        # Step 4: mark session row (batch_id == session_id in async path).
+        try:
+            conn.execute(text(f"""
+                UPDATE {SESSIONS_TABLE}
+                   SET STATUS       = 'FAILED',
+                       COMPLETED_AT = GETDATE(),
+                       ERROR_MSG    = :msg
+                 WHERE SESSION_ID = :sid
+                   AND STATUS = 'RUNNING'
+            """), {"sid": req.batch_id, "msg": f"cancelled by {user}"})
+        except Exception as e:
+            logger.warning(f"[cancel-batch] session update skipped: {e}")
+        conn.commit()
+
+    logger.warning(
+        f"[cancel-batch] batch={req.batch_id} cancelled_by={user} "
+        f"queue_rows={cancelled} kill_attempted={cancel_info['kill_attempted']} "
+        f"killed={cancel_info.get('killed')} "
+        f"kill_failed={len(cancel_info.get('kill_failed', []))}"
+    )
+    return {
+        "success":         True,
+        "batch_id":        req.batch_id,
+        "cancelled":       cancelled,
+        "kill_attempted":  cancel_info["kill_attempted"],
+        "killed":          cancel_info.get("killed", []),
+        "kill_failed":     cancel_info.get("kill_failed", []),
+        "event_set":       cancel_info.get("event_set"),
+    }
 
 
 @router.get("/active-job")
@@ -2265,6 +2432,16 @@ def active_job(current_user: User = Depends(get_current_user)):
     from app.services.alloc_queue import (
         QUEUE_TABLE, get_progress, get_failed_list, get_done_summary,
     )
+    # Stale-batch thresholds (in minutes).
+    #   STALE_MIN: how long a PENDING/IN_PROGRESS row may sit without ANY
+    #     queue activity (PICKED_AT update) before it's treated as abandoned.
+    #     Workers usually claim within seconds, so 10 min is generous.
+    #   ORPHAN_PEND_MIN: a queue with NO PICKED_AT at all (workers never
+    #     started) is considered an orphan after this much time. Lower
+    #     because Stage A/B normally take a few minutes max before workers
+    #     begin Stage C.
+    STALE_MIN = 10
+    ORPHAN_PEND_MIN = 5
     de = get_data_engine()
     with de.connect() as conn:
         # Skip if queue table doesn't exist yet (first-ever install).
@@ -2273,6 +2450,42 @@ def active_job(current_user: User = Depends(get_current_user)):
         ), {"t": QUEUE_TABLE}).fetchone()
         if not exists:
             return {"success": True, "active": None, "last": None}
+
+        # ── Auto-fail abandoned rows so this endpoint stops reporting them.
+        # Two cases:
+        #   1. IN_PROGRESS with no PICKED_AT update in STALE_MIN min — the
+        #      worker probably crashed / connection dropped.
+        #   2. PENDING in a batch that has NEVER been claimed (no row has
+        #      PICKED_AT) and was created > ORPHAN_PEND_MIN min ago — the
+        #      caller (e.g. the synchronous /listing/generate request)
+        #      errored before workers could start Stage C.
+        try:
+            conn.execute(text(f"""
+                UPDATE {QUEUE_TABLE}
+                   SET STATUS       = 'FAILED',
+                       COMPLETED_AT = GETDATE(),
+                       ERROR_MSG    = 'auto-cancelled (stale, no worker activity)'
+                 WHERE STATUS = 'IN_PROGRESS'
+                   AND DATEDIFF(MINUTE, ISNULL(PICKED_AT, CREATED_AT), GETDATE()) > :stale
+            """), {"stale": STALE_MIN})
+            conn.execute(text(f"""
+                UPDATE q
+                   SET STATUS       = 'FAILED',
+                       COMPLETED_AT = GETDATE(),
+                       ERROR_MSG    = 'auto-cancelled (orphan, never claimed)'
+                  FROM {QUEUE_TABLE} q
+                  JOIN (
+                       SELECT BATCH_ID
+                         FROM {QUEUE_TABLE}
+                        GROUP BY BATCH_ID
+                        HAVING MAX(PICKED_AT) IS NULL
+                           AND DATEDIFF(MINUTE, MIN(CREATED_AT), GETDATE()) > :orphan
+                       ) o ON o.BATCH_ID = q.BATCH_ID
+                 WHERE q.STATUS = 'PENDING'
+            """), {"orphan": ORPHAN_PEND_MIN})
+            conn.commit()
+        except Exception as exc:
+            logger.warning(f"[active-job] stale-batch sweep failed: {exc}")
 
         # 1) Try to find a batch with open work (most recent first).
         row = conn.execute(text(f"""
@@ -2327,7 +2540,7 @@ def active_job(current_user: User = Depends(get_current_user)):
             from datetime import datetime as _dt
             try:
                 ref = completed_at or _dt.now()
-                elapsed = (ref - started_at).total_seconds()
+                elapsed = max(0.0, (ref - started_at).total_seconds())
             except Exception:
                 elapsed = None
 

@@ -869,7 +869,7 @@ def _run_band_and_revalidate_batched(
                 W.[{req_rem}] = CASE
                     WHEN ISNULL(W.[{req_rem}], 0) - G.grid_take < 0 THEN 0
                     ELSE ISNULL(W.[{req_rem}], 0) - G.grid_take END
-            FROM [{working_table}] W
+            FROM [{working_table}] W WITH (ROWLOCK)
             INNER JOIN GridTake_{req_col} G ON {join_cond};
         """)
 
@@ -891,8 +891,10 @@ def _run_band_and_revalidate_batched(
 
     h_rem_sql = ""
     if h_rem_sets:
+        # ROWLOCK hint on UPDATE-target table — concurrent workers updating
+        # different MAJ_CATs (= different rows) won't escalate to page locks.
         h_rem_sql = f"""
-            UPDATE [{working_table}] SET {', '.join(h_rem_sets)}
+            UPDATE [{working_table}] WITH (ROWLOCK) SET {', '.join(h_rem_sets)}
             WHERE MAJ_CAT = :mc;
         """
 
@@ -901,7 +903,7 @@ def _run_band_and_revalidate_batched(
         h_sum  = " + ".join(f"ISNULL([{c}],0)" for c in pri_h)
         gh_sum = " + ".join(f"ISNULL([{c}],0)" for c in pri_gh)
         pri_ct_sql = f"""
-            UPDATE [{working_table}] SET
+            UPDATE [{working_table}] WITH (ROWLOCK) SET
                 PRI_CT_REM = CASE
                     WHEN ({gh_sum}) = 0 THEN 0
                     ELSE ROUND(CAST(({h_sum}) AS FLOAT) / ({gh_sum}) * 100, 1) END
@@ -917,7 +919,7 @@ def _run_band_and_revalidate_batched(
     store_broken_sql = ""
     if ENABLE_STORE_BROKEN and "MJ_REQ_REM" in work_cols:
         store_broken_sql = f"""
-            UPDATE [{working_table}] SET
+            UPDATE [{working_table}] WITH (ROWLOCK) SET
                 ALLOC_STATUS = 'SKIPPED',
                 ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'') + ' SKIP_STORE_BROKEN;'
             WHERE LISTED_FLAG = 1
@@ -1016,7 +1018,7 @@ def _run_band_and_revalidate_batched(
                              ELSE 0 END
                      THEN 'ALLOCATED'
                 ELSE 'PARTIAL' END
-        FROM [{alloc_table}] A
+        FROM [{alloc_table}] A WITH (ROWLOCK)
         INNER JOIN Take X
             ON A.WERKS = X.WERKS AND A.RDC = X.RDC
            AND A.MAJ_CAT = X.MAJ_CAT AND A.GEN_ART_NUMBER = X.GEN_ART_NUMBER
@@ -1066,7 +1068,7 @@ def _run_band_and_revalidate_batched(
                 W.MSA_FNL_Q_REM = CASE
                     WHEN ISNULL(W.MSA_FNL_Q_REM, 0) - O.take_total < 0 THEN 0
                     ELSE ISNULL(W.MSA_FNL_Q_REM, 0) - O.take_total END
-            FROM [{working_table}] W
+            FROM [{working_table}] W WITH (ROWLOCK)
             INNER JOIN OptTake O
                 ON W.WERKS=O.WERKS AND W.MAJ_CAT=O.MAJ_CAT
                AND W.GEN_ART_NUMBER=O.GEN_ART_NUMBER
@@ -1082,7 +1084,7 @@ def _run_band_and_revalidate_batched(
             {pri_ct_sql}
 
             -- (5) Skip rules on remaining OPTs (rank > current)
-            UPDATE [{working_table}] SET
+            UPDATE [{working_table}] WITH (ROWLOCK) SET
                 ALLOC_STATUS = CASE
                     WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0 THEN 'SKIPPED'
                     WHEN ISNULL(PRI_CT_REM, 0)    < 100
@@ -1110,7 +1112,7 @@ def _run_band_and_revalidate_batched(
                     WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
                         THEN 'REVALIDATION_SKIP'
                     ELSE A.SKIP_REASON END
-            FROM [{alloc_table}] A
+            FROM [{alloc_table}] A WITH (ROWLOCK)
             INNER JOIN [{working_table}] W
                 ON A.WERKS=W.WERKS AND A.MAJ_CAT=W.MAJ_CAT
                AND A.GEN_ART_NUMBER=W.GEN_ART_NUMBER
