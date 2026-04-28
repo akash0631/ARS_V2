@@ -45,9 +45,18 @@ from app.services.alloc_queue import (
 from app.utils.db_helpers import run_sql
 
 
-DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "8"))
+# Default 4 (was 8). Pandas operations are CPU-bound and hold Python's GIL,
+# so spawning 8 ThreadPoolExecutor workers in a single uvicorn process
+# saturates the GIL — /auth/login, /listing/active-job and any other
+# unrelated endpoint sharing this process get starved and the upstream
+# proxy hits its 120s read-timeout window before the response makes it
+# back. With 4 workers the process retains CPU headroom for foreground
+# requests. Override with the ARS_PARALLEL_WORKERS env var if you're
+# running uvicorn with --workers N (each uvicorn worker is a separate
+# process => own GIL => safe to fan out wider per process).
+DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "4"))
 MIN_WORKERS = 2
-MAX_WORKERS = 16
+MAX_WORKERS = 8   # was 16; capped lower for the same GIL-saturation reason
 
 OPT_TYPE_ORDER = ["RL", "TBC", "TBL"]
 POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]

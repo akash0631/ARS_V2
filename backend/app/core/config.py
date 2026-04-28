@@ -13,10 +13,11 @@ from pydantic_settings import BaseSettings
 
 # ---------------------------------------------------------------------------
 # UI-managed database overrides — must point at the same file the Settings
-# endpoint writes to: backend/app/app_settings.json
+# endpoint writes to: backend/app_settings.json
 # ---------------------------------------------------------------------------
+# __file__ = backend/app/core/config.py → ../.. = backend/
 APP_SETTINGS_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),  # backend/app
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),  # backend/
     "app_settings.json",
 )
 

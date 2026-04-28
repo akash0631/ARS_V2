@@ -382,6 +382,12 @@ export default function ListingPage() {
   const [allocFailed, setAllocFailed] = useState([])
   const [retryingFailed, setRetryingFailed] = useState(false)
   const allocPollRef = useRef(null)
+  // Async-mode tracking: /listing/generate now returns immediately with a
+  // session_id and the real work runs in a background thread. We poll the
+  // session row to know when it flips from RUNNING to SUCCESS/FAILED.
+  const [activeSessionId, setActiveSessionId] = useState(null)
+  const [activeSession, setActiveSession] = useState(null)
+  const sessionPollRef = useRef(null)
 
   // Top-N chart selectors (top vs bottom + count) for stores & maj_cats
   const [storeRankDir, setStoreRankDir] = useState('top')      // 'top' | 'bottom'
@@ -404,9 +410,14 @@ export default function ListingPage() {
 
   // (Async/job/cancel facility removed — listing runs synchronously again)
 
-  const loadConfig = useCallback(async () => {
+  // loadConfig({ quiet: true }) suppresses the "Failed to load config" toast
+  // — for background polls (active-job watcher, post-generate refresh) where
+  // a transient backend timeout shouldn't spam the user. Only the initial
+  // page-load call and explicit user refreshes pass quiet=false.
+  const loadConfig = useCallback(async (opts = {}) => {
+    const { quiet = false } = opts
     try {
-      const { data } = await listingAPI.config()
+      const { data } = await listingAPI.config({ quiet })
       setConfig(data.data)
       // Restore saved settings from DB
       const s = data.data?.settings
@@ -431,12 +442,17 @@ export default function ListingPage() {
         if (s.pri_ct_check_tbc !== undefined)
           setPriCheckTBC(s.pri_ct_check_tbc === 'true' || s.pri_ct_check_tbc === true)
       }
-    } catch { toast.error('Failed to load config') }
+    } catch {
+      // Only toast for foreground (user-initiated) calls — the api.js
+      // interceptor has already suppressed its own toast when quiet=true.
+      if (!quiet) toast.error('Failed to load config')
+    }
   }, [])
 
-  const loadSummary = useCallback(async () => {
+  const loadSummary = useCallback(async (opts = {}) => {
+    const { quiet = false } = opts
     try {
-      const { data } = await listingAPI.summary()
+      const { data } = await listingAPI.summary({ quiet })
       setSummary(data.data)
     } catch {}
   }, [])
@@ -499,30 +515,35 @@ export default function ListingPage() {
       }
       // Reset previous batch state so the progress panel doesn't show stale data.
       setAllocBatchId(null); setAllocProgress(null); setAllocFailed([])
+      // Async: backend returns {session_id, alloc_batch_id, status:'RUNNING'}
+      // within milliseconds and runs the actual work in a thread. We then
+      // poll /listing/sessions/{id} for overall status and (for parallel
+      // modes) /listing/alloc-progress for per-MAJ_CAT progress.
       const { data } = await listingAPI.generate(payload, { signal: controller.signal })
-      toast.success(data.message || 'Listing generated')
-      const newBatchId = data?.data?.alloc_batch_id || null
+      const newSessionId = data?.data?.session_id || null
+      const newBatchId   = data?.data?.alloc_batch_id || null
+      toast.success(data.message || 'Generation started in background')
+      if (newSessionId) setActiveSessionId(newSessionId)
+      if (newBatchId)   setAllocBatchId(newBatchId)
+      // Immediate first fetches so panels populate without waiting 3s.
       if (newBatchId) {
-        setAllocBatchId(newBatchId)
-        // One immediate fetch so the panel populates without waiting on the poll.
         try {
           const { data: pd } = await listingAPI.allocProgress(newBatchId)
           setAllocProgress(pd?.progress || null)
           setAllocFailed(pd?.failed || [])
         } catch { /* ignore */ }
       }
-      loadConfig(); loadSummary(); setColFilters({}); loadPreview(1, {})
     } catch (e) {
       if (e.name === 'CanceledError' || e.code === 'ERR_CANCELED') {
         // Force stop — already handled in handleForceStop
       } else {
         toast.error(e.response?.data?.detail || 'Generate failed')
       }
-    } finally {
-      abortRef.current = null
       setGenerating(false)
-      setPaused(false)
     }
+    // Note: we do NOT setGenerating(false) on success — the background
+    // job is still running. The session-status poll below clears it
+    // when the row flips from RUNNING to SUCCESS/FAILED.
   }
 
   // ── Live progress polling for the current allocation batch ──────────
@@ -558,6 +579,49 @@ export default function ListingPage() {
       }
     }
   }, [allocBatchId, generating])
+
+  // ── Session-status polling (async generate flow) ─────────────────────
+  // /listing/generate now returns immediately and the real work runs in a
+  // background thread. Poll the session row every 3s. When STATUS flips
+  // out of RUNNING (SUCCESS or FAILED), clear the in-flight UI state and
+  // refresh the page-level data.
+  useEffect(() => {
+    if (!activeSessionId) return
+    const tick = async () => {
+      try {
+        const { data } = await listingAPI.session(activeSessionId)
+        const sess = data?.session || null
+        setActiveSession(sess)
+        if (sess && sess.status && sess.status !== 'RUNNING') {
+          if (sessionPollRef.current) {
+            clearInterval(sessionPollRef.current)
+            sessionPollRef.current = null
+          }
+          setGenerating(false)
+          setPaused(false)
+          if (sess.status === 'SUCCESS') {
+            toast.success(
+              `Listing complete: ${(sess.alloc_rows || 0).toLocaleString()} rows in ${
+                sess.duration_sec != null ? sess.duration_sec.toFixed(1) + 's' : '—'
+              }`
+            )
+            // Refresh page data now that work is done.
+            loadConfig(); loadSummary(); setColFilters({}); loadPreview(1, {})
+          } else {
+            toast.error(`Listing FAILED: ${sess.error_msg || 'unknown error'}`)
+          }
+        }
+      } catch { /* keep polling */ }
+    }
+    tick()
+    sessionPollRef.current = setInterval(tick, 3000)
+    return () => {
+      if (sessionPollRef.current) {
+        clearInterval(sessionPollRef.current)
+        sessionPollRef.current = null
+      }
+    }
+  }, [activeSessionId])
 
   // ── Detect any Python job already running on the server ────────────
   // Calls /listing/active-job on mount and every 5s. If the server reports
@@ -596,13 +660,15 @@ export default function ListingPage() {
   // Keeps Total Alloc Qty / Total Hold Qty / KPI tiles ticking forward in
   // step with allocations as MAJ_CATs complete. Faster cadence while a job
   // is in flight so the user sees progress; slower cadence when idle.
+  // Both polls run in quiet mode — transient timeouts mid-Generate must
+  // not toast "Failed to load config" at the user every 8 seconds.
   const summaryPollRef = useRef(null)
   useEffect(() => {
     const isLive = generating || !!activeJob
                 || (allocProgress && (allocProgress.pending > 0 || allocProgress.in_progress > 0))
     const tick = () => {
-      loadSummary()
-      loadConfig()
+      loadSummary({ quiet: true })
+      loadConfig({ quiet: true })
     }
     summaryPollRef.current = setInterval(tick, isLive ? 8000 : 30000)
     return () => {
@@ -865,8 +931,11 @@ export default function ListingPage() {
                 </select>
                 {allocationMode !== 'sequential' && (
                   <>
-                    <span style={{ fontSize: 10, color: C.textMuted }}>workers</span>
-                    <input type="number" min={2} max={16}
+                    <span style={{ fontSize: 10, color: C.textMuted }}
+                      title="Number of parallel worker threads. Capped at 8 — more would saturate the Python GIL in this uvicorn process and freeze unrelated requests like /auth/login.">
+                      workers
+                    </span>
+                    <input type="number" min={2} max={8}
                       value={parallelWorkers}
                       onChange={(e) => setParallelWorkers(e.target.value)}
                       style={{ width: 48, height: 26, fontSize: 11,
@@ -1080,12 +1149,8 @@ export default function ListingPage() {
               <div style={{ display: 'flex', gap: 4, marginTop: 8, alignItems: 'center' }}>
                 {STAGES.map((st) => {
                   const stIdx = groupOrder[st.group] ?? 0
-                  // Reached: this stage's group is at or before the current server stage.
                   const reached = stIdx < sgIdx
-                  // Current: this stage belongs to the in-flight server group AND
-                  // server is not at 'complete' yet.
                   const current = stIdx === sgIdx && serverStage !== 'complete'
-                  // Server says complete → mark every pill green/done
                   const allDone = serverStage === 'complete'
                   const isDone = allDone || reached
                   return (
@@ -1142,14 +1207,19 @@ export default function ListingPage() {
                     fontSize: 13, fontWeight: 900, color: '#dc2626',
                     letterSpacing: '.04em',
                     textShadow: '0 0 4px rgba(255,255,255,0.9), 0 0 2px rgba(255,255,255,0.9)' }}>
-                    {totalUnits > 0 ? `${combinedPct}%` : (generating ? 'preparing…' : '')}
+                    {totalUnits > 0
+                      ? `${combinedPct}%`
+                      : (generating ? 'preparing…'
+                        : (isComplete ? 'no MAJ_CATs queued' : ''))}
                   </div>
                 </div>
               </div>
             )
           })()}
-          {/* Counts row — single line */}
-          {allocProgress ? (
+          {/* Counts row — only show when the queue was actually seeded
+              (i.e. an allocation run, not listing-only). For listing-only
+              runs we show a one-line explainer instead of all-zeros counts. */}
+          {allocProgress && allocProgress.total > 0 ? (
             <div style={{ display: 'flex', gap: 14, marginTop: 6, fontSize: 11, flexWrap: 'wrap' }}>
               <span style={{ color: C.textMuted }}>
                 Pending <strong style={{ color: C.text }}>{allocProgress.pending}</strong>
@@ -1168,6 +1238,12 @@ export default function ListingPage() {
                   Elapsed <strong style={{ color: C.text }}>{Math.round(allocProgress.elapsed_sec)}s</strong>
                 </span>
               )}
+            </div>
+          ) : isComplete && allocProgress && allocProgress.total === 0 ? (
+            <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted,
+              display: 'flex', alignItems: 'center', gap: 6 }}>
+              <List size={11} color={m.color}/>
+              No MAJ_CATs were queued — Stage B produced 0 alloc rows (check filters or sequential mode)
             </div>
           ) : generating && (
             <div style={{ marginTop: 6, fontSize: 11, color: C.textMuted, display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -1243,8 +1319,8 @@ export default function ListingPage() {
           </div>
           <div style={{ fontSize: 9, color: C.textMuted, marginTop: 5 }}>
             {runMode === 'full'
-              ? 'Listing → Working → Allocation in one pass'
-              : 'Build listing only (no allocation)'}
+              ? 'MSA Stock Calc → Grid Build → Listing → Allocation (one click)'
+              : 'Listing → Allocation (skip MSA & Grid)'}
           </div>
         </div>
       </div>

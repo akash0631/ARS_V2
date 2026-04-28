@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { listingAPI } from '@/services/api'
 import toast from 'react-hot-toast'
-import { ChevronLeft, RefreshCw, FileText, Activity, Search, Filter } from 'lucide-react'
+import { ChevronLeft, RefreshCw, FileText, Activity, Search, Filter, Square, Trash2 } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import { C } from '@/theme/colors'
 
@@ -95,6 +95,42 @@ export default function ListingLogsPage() {
 
   // Re-fetch the log when user toggles tail mode and a session is selected.
   useEffect(() => { if (selectedId) loadSelected(selectedId) }, [tailMode])
+
+  const [busyId, setBusyId] = useState(null)
+
+  const handleKill = async (sid, e) => {
+    e?.stopPropagation()
+    if (!window.confirm(`Kill session ${sid}?\n\nThis marks the session FAILED and cancels its in-flight allocation queue rows. The Python thread itself can't be preempted but its bookkeeping will be closed.`)) return
+    setBusyId(sid)
+    try {
+      const { data } = await listingAPI.killSession(sid)
+      toast.success(`Killed · ${data.queue_rows_cancelled || 0} queue rows cancelled`)
+      await loadSessions()
+      if (selectedId === sid) await loadSelected(sid)
+    } catch (e2) {
+      toast.error(e2.response?.data?.detail || 'Kill failed')
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const handleDelete = async (sid, e) => {
+    e?.stopPropagation()
+    if (!window.confirm(`Permanently delete session ${sid}?\n\nThis removes the session row and its log file. Cannot be undone.`)) return
+    setBusyId(sid)
+    try {
+      await listingAPI.deleteSession(sid)
+      toast.success('Session deleted')
+      if (selectedId === sid) {
+        setSelectedId(null); setSelectedMeta(null); setLogText('')
+      }
+      await loadSessions()
+    } catch (e2) {
+      toast.error(e2.response?.data?.detail || 'Delete failed')
+    } finally {
+      setBusyId(null)
+    }
+  }
 
   return (
     <div style={{ color: C.text, fontFamily: 'inherit', display: 'flex',
@@ -253,6 +289,41 @@ export default function ListingLogsPage() {
                     {s.error_msg}
                   </div>
                 )}
+                {/* Row actions: Kill (if RUNNING) or Delete (if finished) */}
+                <div style={{ display: 'flex', gap: 4, marginTop: 6 }}>
+                  {s.status === 'RUNNING' ? (
+                    <button onClick={(e) => handleKill(s.session_id, e)}
+                      disabled={busyId === s.session_id}
+                      title="Force-terminate this RUNNING session"
+                      style={{
+                        height: 22, padding: '0 8px', borderRadius: 4,
+                        fontSize: 9, fontWeight: 700, color: '#fff',
+                        border: 'none',
+                        cursor: busyId === s.session_id ? 'not-allowed' : 'pointer',
+                        background: busyId === s.session_id
+                          ? '#94a3b8'
+                          : 'linear-gradient(135deg, #dc2626, #b91c1c)',
+                        display: 'inline-flex', alignItems: 'center', gap: 3,
+                      }}>
+                      <Square size={9}/> Kill
+                    </button>
+                  ) : (
+                    <button onClick={(e) => handleDelete(s.session_id, e)}
+                      disabled={busyId === s.session_id}
+                      title="Permanently delete this session and its log file"
+                      style={{
+                        height: 22, padding: '0 8px', borderRadius: 4,
+                        fontSize: 9, fontWeight: 700,
+                        color: busyId === s.session_id ? '#94a3b8' : '#b91c1c',
+                        background: '#fff',
+                        border: `1px solid ${busyId === s.session_id ? '#e2e8f0' : '#fecaca'}`,
+                        cursor: busyId === s.session_id ? 'not-allowed' : 'pointer',
+                        display: 'inline-flex', alignItems: 'center', gap: 3,
+                      }}>
+                      <Trash2 size={9}/> Delete
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>

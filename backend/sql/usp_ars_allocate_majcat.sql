@@ -288,143 +288,132 @@ CREATE PROCEDURE dbo._usp_ars_alloc_band_one
     @opt_type     NVARCHAR(10),
     @round_r      INT,
     @rank         INT,
-    @alloc_table  SYSNAME = N'ARS_ALLOC_WORKING'
+    @alloc_table  SYSNAME = N'ARS_ALLOC_WORKING'  -- legacy param, ignored;
+                                                   -- table is hardcoded to
+                                                   -- dbo.ARS_ALLOC_WORKING
 AS
 BEGIN
     SET NOCOUNT ON;
-    DECLARE @sql NVARCHAR(MAX);
+
+    -- Static T-SQL (no sp_executesql).  Earlier dynamic-SQL versions of
+    -- this body raised msg 4145 inside Azure SQL's dynamic-SQL parser.
+    -- The exact same statements run cleanly as static SQL — same way the
+    -- Python sequential / python_parallel paths use them via SQLAlchemy.
 
     -- Step 1 — cumulative-window pool take
-    --
-    -- Note on structure: every per-row condition (need_pool, need_ship,
-    -- lifetime_target, ship_take, hold_take) is precomputed as a column in
-    -- the CTEs.  The final UPDATE then does only column-vs-column compares
-    -- (no nested CASE in assignments).  This keeps the dynamic SQL parser
-    -- happy on Azure SQL — earlier the multi-line `WHEN ... >= CASE ... END
-    -- THEN 'ALLOCATED'` form raised err 4145 ("non-boolean expression").
-    SET @sql = N'
-        ;WITH Target AS (
-            SELECT A.WERKS, A.RDC, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
-                   A.VAR_ART, A.SZ, A.OPT_PRIORITY_RANK, A.ST_RANK, A.IS_NEW,
-                   ISNULL(A.POOL_CONSUMED, 0) AS prev_pool,
-                   ISNULL(A.SHIP_QTY,      0) AS prev_ship,
-                   ISNULL(A.HOLD_QTY,      0) AS prev_hold,
-                   CASE WHEN (@r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0))
-                           > ISNULL(A.POOL_CONSUMED,0)
-                        THEN (@r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0))
-                              - ISNULL(A.POOL_CONSUMED,0)
-                        ELSE 0 END AS need_pool,
-                   CASE WHEN (@r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0))
-                           > ISNULL(A.SHIP_QTY,0)
-                        THEN (@r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0))
-                              - ISNULL(A.SHIP_QTY,0)
-                        ELSE 0 END AS need_ship,
-                   CASE WHEN (ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
-                              - ISNULL(A.SZ_STK,0)) > 0
-                        THEN (ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
-                              - ISNULL(A.SZ_STK,0))
-                        ELSE 0 END AS lifetime_target
-              FROM [' + @alloc_table + N'] A
-             WHERE A.OPT_TYPE = @ot
-               AND A.OPT_PRIORITY_RANK = @rk
-               AND ISNULL(A.ALLOC_STATUS,''PENDING'') NOT IN (''SKIPPED'',''INELIGIBLE'')
-               AND ISNULL(A.I_ROD,1) >= @r
-               AND A.MAJ_CAT = @mc
-        ),
-        Ranked AS (
-            SELECT T.*, P.FNL_Q_REM,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY T.RDC, T.MAJ_CAT, T.GEN_ART_NUMBER, T.CLR, T.VAR_ART, T.SZ
-                     ORDER BY T.OPT_PRIORITY_RANK ASC, ISNULL(T.ST_RANK, 999999) ASC
-                   ) AS ord
-              FROM Target T
-              INNER JOIN #nre_pool P
-                 ON P.RDC = T.RDC AND P.MAJ_CAT = T.MAJ_CAT
-                AND P.GEN_ART_NUMBER = T.GEN_ART_NUMBER
-                AND ISNULL(P.CLR,'''') = ISNULL(T.CLR,'''')
-                AND P.VAR_ART = T.VAR_ART AND P.SZ = T.SZ
-             WHERE T.need_pool > 0 AND P.FNL_Q_REM > 0
-        ),
-        Cum AS (
-            SELECT *,
-                   SUM(need_pool) OVER (
-                     PARTITION BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ
-                     ORDER BY ord ROWS UNBOUNDED PRECEDING
-                   ) AS cum_demand
-              FROM Ranked
-        ),
-        Take AS (
-            SELECT *,
-                   CASE
-                     WHEN (FNL_Q_REM - (cum_demand - need_pool)) <= 0 THEN 0
-                     WHEN (FNL_Q_REM - (cum_demand - need_pool)) >= need_pool THEN need_pool
-                     ELSE (FNL_Q_REM - (cum_demand - need_pool))
-                   END AS take_pool
-              FROM Cum
-        ),
-        Final AS (
-            -- Resolve every per-row decision here so the UPDATE assignment
-            -- reads as plain column copies + scalar arithmetic only.
-            SELECT *,
-                   CASE WHEN IS_NEW = 1 AND take_pool < need_ship
-                        THEN take_pool
-                        WHEN IS_NEW = 1
-                        THEN need_ship
-                        ELSE take_pool END                     AS ship_take,
-                   CASE WHEN IS_NEW = 1 AND take_pool < need_ship
-                        THEN 0
-                        WHEN IS_NEW = 1
-                        THEN take_pool - need_ship
-                        ELSE 0 END                             AS hold_take
-              FROM Take
-        )
-        UPDATE A SET
-            A.POOL_CONSUMED = X.prev_pool + X.take_pool,
-            A.ROUND_SHIP    = X.ship_take,
-            A.ROUND_HOLD    = X.hold_take,
-            A.SHIP_QTY      = X.prev_ship + X.ship_take,
-            A.HOLD_QTY      = X.prev_hold + X.hold_take,
-            A.ALLOC_WAVE    = CONCAT(@ot, ''_R'', @r),
-            A.ALLOC_ROUND   = @r,
-            A.ALLOC_STATUS  = CASE
-                WHEN (X.prev_pool + X.take_pool) >= X.lifetime_target
-                THEN ''ALLOCATED''
-                ELSE ''PARTIAL''
-            END
-        FROM [' + @alloc_table + N'] A
-        INNER JOIN Final X
-            ON A.WERKS = X.WERKS AND A.RDC = X.RDC
-           AND A.MAJ_CAT = X.MAJ_CAT AND A.GEN_ART_NUMBER = X.GEN_ART_NUMBER
-           AND ISNULL(A.CLR,'''') = ISNULL(X.CLR,'''')
-           AND A.VAR_ART = X.VAR_ART AND A.SZ = X.SZ
-        WHERE X.take_pool > 0';
-    EXEC sp_executesql @sql,
-        N'@ot NVARCHAR(10), @rk INT, @r INT, @mc NVARCHAR(50)',
-        @ot = @opt_type, @rk = @rank, @r = @round_r, @mc = @maj_cat;
+    ;WITH Target AS (
+        SELECT A.WERKS, A.RDC, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
+               A.VAR_ART, A.SZ, A.OPT_PRIORITY_RANK, A.ST_RANK, A.IS_NEW,
+               ISNULL(A.POOL_CONSUMED, 0) AS prev_pool,
+               ISNULL(A.SHIP_QTY,      0) AS prev_ship,
+               ISNULL(A.HOLD_QTY,      0) AS prev_hold,
+               CASE WHEN @round_r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0)
+                       > ISNULL(A.POOL_CONSUMED,0)
+                    THEN @round_r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0)
+                       - ISNULL(A.POOL_CONSUMED,0)
+                    ELSE 0 END AS need_pool,
+               CASE WHEN @round_r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                       > ISNULL(A.SHIP_QTY,0)
+                    THEN @round_r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                       - ISNULL(A.SHIP_QTY,0)
+                    ELSE 0 END AS need_ship,
+               CASE WHEN ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
+                       - ISNULL(A.SZ_STK,0) > 0
+                    THEN ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
+                       - ISNULL(A.SZ_STK,0)
+                    ELSE 0 END AS lifetime_target
+        FROM dbo.ARS_ALLOC_WORKING A
+        WHERE A.OPT_TYPE = @opt_type
+          AND A.OPT_PRIORITY_RANK = @rank
+          AND ISNULL(A.ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','INELIGIBLE')
+          AND ISNULL(A.I_ROD,1) >= @round_r
+          AND A.MAJ_CAT = @maj_cat
+    ),
+    Ranked AS (
+        SELECT T.*, P.FNL_Q_REM,
+               ROW_NUMBER() OVER (
+                 PARTITION BY T.RDC, T.MAJ_CAT, T.GEN_ART_NUMBER, T.CLR, T.VAR_ART, T.SZ
+                 ORDER BY T.OPT_PRIORITY_RANK ASC, ISNULL(T.ST_RANK, 999999) ASC
+               ) AS ord
+        FROM Target T
+        INNER JOIN #nre_pool P
+            ON P.RDC = T.RDC AND P.MAJ_CAT = T.MAJ_CAT
+           AND P.GEN_ART_NUMBER = T.GEN_ART_NUMBER
+           AND ISNULL(P.CLR,'') = ISNULL(T.CLR,'')
+           AND P.VAR_ART = T.VAR_ART AND P.SZ = T.SZ
+        WHERE T.need_pool > 0 AND P.FNL_Q_REM > 0
+    ),
+    Cum AS (
+        SELECT *,
+               SUM(need_pool) OVER (
+                 PARTITION BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ
+                 ORDER BY ord ROWS UNBOUNDED PRECEDING
+               ) AS cum_demand
+        FROM Ranked
+    ),
+    Take AS (
+        SELECT *,
+               CASE
+                 WHEN FNL_Q_REM - (cum_demand - need_pool) <= 0 THEN 0
+                 WHEN FNL_Q_REM - (cum_demand - need_pool) >= need_pool THEN need_pool
+                 ELSE FNL_Q_REM - (cum_demand - need_pool)
+               END AS take_pool
+        FROM Cum
+    )
+    UPDATE A SET
+        A.POOL_CONSUMED = ISNULL(A.POOL_CONSUMED,0) + X.take_pool,
+        A.ROUND_SHIP    = CASE WHEN A.IS_NEW = 1
+                               THEN CASE WHEN X.take_pool < X.need_ship
+                                         THEN X.take_pool ELSE X.need_ship END
+                               ELSE X.take_pool END,
+        A.ROUND_HOLD    = CASE WHEN A.IS_NEW = 1
+                               THEN X.take_pool - CASE WHEN X.take_pool < X.need_ship
+                                                       THEN X.take_pool ELSE X.need_ship END
+                               ELSE 0 END,
+        A.SHIP_QTY      = ISNULL(A.SHIP_QTY,0) +
+                          CASE WHEN A.IS_NEW = 1
+                               THEN CASE WHEN X.take_pool < X.need_ship
+                                         THEN X.take_pool ELSE X.need_ship END
+                               ELSE X.take_pool END,
+        A.HOLD_QTY      = ISNULL(A.HOLD_QTY,0) +
+                          CASE WHEN A.IS_NEW = 1
+                               THEN X.take_pool - CASE WHEN X.take_pool < X.need_ship
+                                                       THEN X.take_pool ELSE X.need_ship END
+                               ELSE 0 END,
+        A.ALLOC_WAVE    = CONCAT(@opt_type, '_R', @round_r),
+        A.ALLOC_ROUND   = @round_r,
+        A.ALLOC_STATUS  = CASE
+            WHEN ISNULL(A.POOL_CONSUMED,0) + X.take_pool >= X.lifetime_target
+            THEN 'ALLOCATED'
+            ELSE 'PARTIAL'
+        END
+    FROM dbo.ARS_ALLOC_WORKING A
+    INNER JOIN Take X
+        ON A.WERKS = X.WERKS AND A.RDC = X.RDC
+       AND A.MAJ_CAT = X.MAJ_CAT AND A.GEN_ART_NUMBER = X.GEN_ART_NUMBER
+       AND ISNULL(A.CLR,'') = ISNULL(X.CLR,'')
+       AND A.VAR_ART = X.VAR_ART AND A.SZ = X.SZ
+    WHERE X.take_pool > 0;
 
     -- Step 2 — decrement pool
-    SET @sql = N'
-        ;WITH S AS (
-            SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
-                   SUM(ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0)) AS taken
-              FROM [' + @alloc_table + N']
-             WHERE OPT_TYPE = @ot
-               AND OPT_PRIORITY_RANK = @rk
-               AND ALLOC_ROUND = @r
-               AND MAJ_CAT = @mc
-             GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ
-            HAVING SUM(ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0)) > 0
-        )
-        UPDATE P SET P.FNL_Q_REM = P.FNL_Q_REM - S.taken
-          FROM #nre_pool P
-          INNER JOIN S
-             ON P.RDC = S.RDC AND P.MAJ_CAT = S.MAJ_CAT
-            AND P.GEN_ART_NUMBER = S.GEN_ART_NUMBER
-            AND ISNULL(P.CLR,'''') = ISNULL(S.CLR,'''')
-            AND P.VAR_ART = S.VAR_ART AND P.SZ = S.SZ';
-    EXEC sp_executesql @sql,
-        N'@ot NVARCHAR(10), @rk INT, @r INT, @mc NVARCHAR(50)',
-        @ot = @opt_type, @rk = @rank, @r = @round_r, @mc = @maj_cat;
+    ;WITH S AS (
+        SELECT RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ,
+               SUM(ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0)) AS taken
+        FROM dbo.ARS_ALLOC_WORKING
+        WHERE OPT_TYPE = @opt_type
+          AND OPT_PRIORITY_RANK = @rank
+          AND ALLOC_ROUND = @round_r
+          AND MAJ_CAT = @maj_cat
+        GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ
+        HAVING SUM(ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0)) > 0
+    )
+    UPDATE P SET P.FNL_Q_REM = P.FNL_Q_REM - S.taken
+    FROM #nre_pool P
+    INNER JOIN S
+        ON P.RDC = S.RDC AND P.MAJ_CAT = S.MAJ_CAT
+       AND P.GEN_ART_NUMBER = S.GEN_ART_NUMBER
+       AND ISNULL(P.CLR,'') = ISNULL(S.CLR,'')
+       AND P.VAR_ART = S.VAR_ART AND P.SZ = S.SZ;
 END
 GO
 

@@ -122,7 +122,7 @@ function UserModal({ user, roles, onClose, onSaved }) {
     email: user?.email || '',
     mobile_no: user?.mobile_no || '',
     password: '',
-    role_ids: user?.roles?.map(r => r.id || r) || [],
+    role_ids: roles.filter(r => (user?.roles || []).includes(r.role_code)).map(r => r.id),
     is_active: user?.is_active ?? true,
   })
   const [saving, setSaving] = useState(false)
@@ -150,7 +150,7 @@ function UserModal({ user, roles, onClose, onSaved }) {
         toast.success('User created')
       }
       onSaved()
-    } catch {} finally { setSaving(false) }
+    } catch (e) { toast.error(e.response?.data?.detail || 'Save failed') } finally { setSaving(false) }
   }
 
   return (

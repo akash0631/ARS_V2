@@ -51,9 +51,13 @@ from app.services.alloc_queue import (
 from app.utils.db_helpers import run_sql
 
 
-DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "8"))
+# Lowered from 8/16 to 4/8 — same rationale as the pandas/python_parallel
+# orchestrators: 8 worker threads in a single uvicorn process saturate the
+# Python GIL and starve unrelated endpoints (auth/login etc.). Bump higher
+# only when running uvicorn with --workers N in production.
+DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "4"))
 MIN_WORKERS = 2
-MAX_WORKERS = 16
+MAX_WORKERS = 8
 
 # Path to the .sql file that defines the three stored procs. The orchestrator
 # auto-deploys these on first use if the main proc isn't found in dbo.
@@ -325,6 +329,12 @@ def run_listing_and_allocation_sql_parallel(
     state_lock = threading.Lock()
 
     def worker(worker_id: int):
+        # Re-establish loguru's session_id context inside this thread —
+        # contextvars don't propagate across ThreadPoolExecutor boundaries,
+        # so without this every worker's logger.error() event would be
+        # filtered out by the per-session sink (which keys on session_id).
+        # Using batch_id == session_id (set by the async generate handler).
+        wlogger = logger.bind(session_id=batch_id)
         with engine.connect() as wconn:
             while True:
                 with engine.connect() as claim_conn:
@@ -369,7 +379,7 @@ def run_listing_and_allocation_sql_parallel(
                                   ship_mc, hold_mc, rows_mc, dur)
                         prog = get_progress(upd_conn, batch_id)
 
-                    logger.info(
+                    wlogger.info(
                         f"[C-sql-W{worker_id}] {prog['done']}/{prog['total']} "
                         f"({prog['pct']}%) — MAJ_CAT={mc} "
                         f"ship={ship_mc:.0f} hold={hold_mc:.0f} "
@@ -378,7 +388,7 @@ def run_listing_and_allocation_sql_parallel(
                 except Exception as e:
                     err = str(e)[:2000]
                     dur = time.time() - t_mc
-                    logger.error(
+                    wlogger.error(
                         f"[C-sql-W{worker_id}] MAJ_CAT={mc} FAILED in "
                         f"{dur:.1f}s: {err}"
                     )
@@ -386,7 +396,7 @@ def run_listing_and_allocation_sql_parallel(
                         with engine.connect() as upd_conn:
                             mark_failed(upd_conn, batch_id, mc, err, dur)
                     except Exception as e2:
-                        logger.error(
+                        wlogger.error(
                             f"[C-sql-W{worker_id}] mark_failed itself failed "
                             f"for MAJ_CAT={mc}: {e2}"
                         )
@@ -441,6 +451,26 @@ def run_listing_and_allocation_sql_parallel(
         result["queue_summary"] = summary
 
     result["duration_sec"] = round(time.time() - t0, 1)
+
+    # Belt & braces: if any worker failed, log every error message on the
+    # main thread (which has session_id in its loguru context, so the
+    # per-session sink keeps these). Also pull error_msg from the queue
+    # table so we surface anything mark_failed wrote even if the worker's
+    # in-thread log got lost for any reason.
+    if result.get("failed", 0):
+        with engine.connect() as conn:
+            failed_rows = conn.execute(text(f"""
+                SELECT MAJ_CAT, ATTEMPTS, ERROR_MSG
+                FROM ARS_ALLOC_MAJCAT_QUEUE
+                WHERE BATCH_ID = :b AND STATUS = 'FAILED'
+                ORDER BY MAJ_CAT
+            """), {"b": batch_id}).fetchall()
+        for r in failed_rows:
+            logger.error(
+                f"[C-sql] worker error: MAJ_CAT={r[0]} "
+                f"attempts={r[1]} error={r[2]}"
+            )
+
     logger.info(
         f"[C-sql] DONE batch={batch_id} listed={result['listed_opts']} "
         f"alloc_rows={result['alloc_rows']} ship={result['ship_qty_total']:.0f} "

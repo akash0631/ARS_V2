@@ -342,6 +342,99 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+def kill_session(session_id: str, reason: str = "killed by user") -> Dict[str, Any]:
+    """
+    Force-terminate a RUNNING session row + cancel its in-flight queue
+    rows. Doesn't actually preempt the Python thread (we have no handle
+    to it), but marks the bookkeeping closed so:
+      - /listing/active-job stops surfacing its batch as RUNNING
+      - the UI moves on
+      - the next /listing/generate can start cleanly
+    Useful when a session hangs or the user wants to free up the slot.
+    """
+    from app.services.alloc_queue import QUEUE_TABLE
+    engine = get_data_engine()
+    cancelled_queue_rows = 0
+    sess_row_updated = False
+    with engine.connect() as conn:
+        ensure_sessions_table(conn)
+        # 1) Mark the session row FAILED so the listing-sessions UI shows
+        #    it ended (only if still RUNNING — a no-op otherwise).
+        res = conn.execute(text(f"""
+            UPDATE {SESSIONS_TABLE}
+               SET STATUS       = 'FAILED',
+                   COMPLETED_AT = GETDATE(),
+                   ERROR_MSG    = LEFT(ISNULL(ERROR_MSG,'') + :why, 2000)
+             WHERE SESSION_ID = :sid AND STATUS = 'RUNNING'
+        """), {"sid": session_id, "why": f" [{reason}]"})
+        sess_row_updated = bool(res.rowcount)
+        # 2) Cancel the linked alloc-queue rows (batch_id == session_id for
+        #    parallel modes — no-op for sequential, which doesn't seed a queue).
+        try:
+            res2 = conn.execute(text(f"""
+                UPDATE {QUEUE_TABLE}
+                   SET STATUS       = 'FAILED',
+                       COMPLETED_AT = GETDATE(),
+                       ERROR_MSG    = LEFT(ISNULL(ERROR_MSG,'') + :why, 2000)
+                 WHERE BATCH_ID = :sid
+                   AND STATUS IN ('PENDING','IN_PROGRESS')
+            """), {"sid": session_id, "why": f" [{reason}]"})
+            cancelled_queue_rows = int(res2.rowcount or 0)
+        except Exception as e:
+            logger.warning(f"[sessions] queue cancel failed for {session_id}: {e}")
+        conn.commit()
+    # Detach the loguru sink if it's still attached
+    with _LOCK:
+        sink_id = _ACTIVE_SINKS.pop(session_id, None)
+    if sink_id is not None:
+        try: logger.remove(sink_id)
+        except Exception: pass
+    return {
+        "session_id": session_id,
+        "session_row_updated": sess_row_updated,
+        "queue_rows_cancelled": cancelled_queue_rows,
+    }
+
+
+def delete_session(session_id: str) -> Dict[str, Any]:
+    """
+    Permanently remove a session header row + its log file. Allowed only
+    for sessions that have already ended (SUCCESS/FAILED) — never for a
+    RUNNING session, since deleting that would orphan its log sink.
+    """
+    engine = get_data_engine()
+    deleted_db = 0
+    deleted_log = False
+    with engine.connect() as conn:
+        ensure_sessions_table(conn)
+        # Refuse to delete a still-running session — caller should kill first.
+        running = conn.execute(text(
+            f"SELECT 1 FROM {SESSIONS_TABLE} "
+            f"WHERE SESSION_ID = :sid AND STATUS = 'RUNNING'"
+        ), {"sid": session_id}).fetchone()
+        if running:
+            raise RuntimeError(
+                f"session {session_id} is still RUNNING — kill it first")
+        res = conn.execute(text(
+            f"DELETE FROM {SESSIONS_TABLE} WHERE SESSION_ID = :sid"
+        ), {"sid": session_id})
+        deleted_db = int(res.rowcount or 0)
+        conn.commit()
+    # Best-effort log file cleanup — never fatal.
+    log_path = os.path.join(LOG_DIR, f"{session_id}.log")
+    if os.path.exists(log_path):
+        try:
+            os.remove(log_path)
+            deleted_log = True
+        except Exception as e:
+            logger.warning(f"[sessions] log file delete failed for {session_id}: {e}")
+    return {
+        "session_id": session_id,
+        "deleted_db_row": deleted_db,
+        "deleted_log_file": deleted_log,
+    }
+
+
 def get_session_log(session_id: str,
                     tail_lines: Optional[int] = None) -> Optional[str]:
     """
