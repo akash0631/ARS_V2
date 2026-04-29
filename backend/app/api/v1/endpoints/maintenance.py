@@ -490,6 +490,97 @@ def db_shrink_log(
                 pass
 
 
+@router.post("/db/{db_name}/clear-log-backup-wait", summary="Auto-clear LOG_BACKUP wait")
+def db_clear_log_backup_wait(
+    db_name: str,
+    target_mb: int = Query(4096, ge=64, le=131072,
+                           description="Target log size after shrink"),
+    _user=Depends(_require_superadmin),
+):
+    """
+    One-shot resolver for `log_reuse_wait_desc = LOG_BACKUP`. Switches the DB to
+    SIMPLE recovery (so the log auto-truncates on every CHECKPOINT), forces a
+    CHECKPOINT, then SHRINKFILE the log to `target_mb`.
+
+    The DB is left in SIMPLE — that's the entire point: no more LOG_BACKUP
+    waits, no recurring space pressure. Point-in-time recovery between full
+    backups is given up in exchange.
+    """
+    db_name = _validate_db(db_name)
+    engine = get_data_engine()
+    shrink_fairy = None
+    try:
+        shrink_fairy = engine.raw_connection()
+        pyodbc_conn = shrink_fairy.driver_connection
+        pyodbc_conn.autocommit = True
+        cur = pyodbc_conn.cursor()
+
+        cur.execute(
+            "SELECT recovery_model_desc, log_reuse_wait_desc "
+            "FROM sys.databases WHERE name = ?", db_name,
+        )
+        row = cur.fetchone() or (None, None)
+        recovery_before, wait_before = row[0], row[1]
+
+        cur.execute(f"USE [{db_name}]")
+        cur.execute("""
+            SELECT name, size * 8.0 / 1024 FROM sys.database_files
+            WHERE type_desc = 'LOG'
+        """)
+        log_files = cur.fetchall()
+        if not log_files:
+            raise HTTPException(status_code=500, detail="No log file found")
+        log_name, before_mb = log_files[0][0], float(log_files[0][1] or 0)
+
+        # 1. SIMPLE recovery — required to make the log self-truncating
+        if recovery_before != "SIMPLE":
+            cur.execute(f"ALTER DATABASE [{db_name}] SET RECOVERY SIMPLE")
+            logger.warning(
+                f"clear-log-backup-wait: {db_name} switched FULL→SIMPLE by admin"
+            )
+
+        # 2. CHECKPOINT marks the active VLF inactive so SHRINK can release it
+        cur.execute("CHECKPOINT")
+
+        # 3. Up to 3 SHRINK passes — first pass usually only reorganises,
+        #    the follow-ups release the now-inactive VLFs.
+        current_mb = before_mb
+        for _ in range(3):
+            cur.execute("CHECKPOINT")
+            cur.execute(f"DBCC SHRINKFILE (N'{log_name}', {int(target_mb)}) WITH NO_INFOMSGS")
+            cur.execute(
+                "SELECT size * 8.0 / 1024 FROM sys.database_files WHERE name = ?",
+                log_name,
+            )
+            new_mb = float(cur.fetchone()[0] or 0)
+            if new_mb <= target_mb + 16 or new_mb >= current_mb:
+                current_mb = new_mb
+                break
+            current_mb = new_mb
+
+        return {
+            "success":         True,
+            "db_name":         db_name,
+            "recovery_before": recovery_before,
+            "recovery_after":  "SIMPLE",
+            "wait_before":     wait_before,
+            "before_mb":       before_mb,
+            "after_mb":        current_mb,
+            "freed_mb":        before_mb - current_mb,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"clear-log-backup-wait on {db_name} failed: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        if shrink_fairy:
+            try:
+                shrink_fairy.invalidate()
+            except Exception:
+                pass
+
+
 @router.post("/db/{db_name}/recovery", summary="Set recovery model")
 def db_set_recovery(
     db_name: str,
@@ -743,10 +834,12 @@ def reclaim_all(_user=Depends(_require_superadmin)):
     byte back ASAP.
     """
     target_log_mb = getattr(settings, "AUTO_FREE_LOG_TARGET_MB", 4096)
+    auto_resolve = getattr(settings, "AUTO_RESOLVE_LOG_BACKUP_WAIT", True)
     summary = {
         "checkpointed":      [],
         "log_shrunk":        [],
         "log_skipped":       [],
+        "auto_simpled":      [],   # DBs we flipped FULL→SIMPLE to clear LOG_BACKUP wait
         "tempdb_freed_mb":   0.0,
         "orphans_dropped":   0,
         "errors":            [],
@@ -780,11 +873,31 @@ def reclaim_all(_user=Depends(_require_superadmin)):
                 for log_name, before_mb in logs:
                     before_mb = float(before_mb or 0)
                     if rec != "SIMPLE" and wait == "LOG_BACKUP":
-                        summary["log_skipped"].append({
-                            "db": db, "file": log_name,
-                            "reason": f"recovery={rec}, log_reuse_wait={wait}",
-                        })
-                        continue
+                        if auto_resolve:
+                            # Flip to SIMPLE so the log self-truncates from now on,
+                            # eliminating the LOG_BACKUP wait entirely.
+                            try:
+                                cur.execute(f"ALTER DATABASE [{db}] SET RECOVERY SIMPLE")
+                                cur.execute(f"USE [{db}]")
+                                cur.execute("CHECKPOINT")
+                                summary["auto_simpled"].append({"db": db, "from": rec})
+                                logger.warning(
+                                    f"reclaim-all: {db} switched {rec}→SIMPLE to clear LOG_BACKUP wait"
+                                )
+                                rec = "SIMPLE"
+                                wait = None
+                            except Exception as exc:
+                                summary["log_skipped"].append({
+                                    "db": db, "file": log_name,
+                                    "reason": f"auto-SIMPLE failed: {exc}",
+                                })
+                                continue
+                        else:
+                            summary["log_skipped"].append({
+                                "db": db, "file": log_name,
+                                "reason": f"recovery={rec}, log_reuse_wait={wait}",
+                            })
+                            continue
                     try:
                         # Up to 3 CHECKPOINT+SHRINK passes
                         current_mb = before_mb

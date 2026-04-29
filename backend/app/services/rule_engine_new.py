@@ -269,29 +269,33 @@ def _stage_a_assign_tier(conn, working_table):
 
 def _stage_a_assign_rank(conn, working_table):
     """
-    Global rank (no PARTITION). TIER sits on top inside each opt_type;
-    store is then picked by ST_RANK (per-MAJ_CAT rank) before other tie-breakers.
+    Per-(store, opt_type) rank. Each store gets its own 1..N priority list
+    inside each opt_type bucket (RL, TBC, TBL). NOT a global rank — store
+    HB05's rank=1 is independent of HB07's rank=1; they tie at the pool
+    and the waterfall's WERKS tie-break decides who ships first.
 
-        OPT_TYPE (RL→1, TBC→2, TBL→3) ASC,
+    Within each (WERKS, OPT_TYPE) partition:
         OPT_PRIORITY_TIER (1=focus-uncapped, 2=focus-capped, 3=regular) ASC,
-        ST_RANK ASC,                              ← store select (per MAJ_CAT)
-        SEC_CT% DESC, MAX_DAILY_SALE DESC, OPT_REQ_WH DESC
+        SEC_CT% DESC,         (higher contribution % first)
+        MAX_DAILY_SALE DESC,  (higher sales velocity first)
+        OPT_REQ_WH DESC,      (more required first)
+        GEN_ART_NUMBER, CLR   (stable final tie-breakers)
+
+    ST_RANK is NOT used here — it's a store-level rank, constant within a
+    single (WERKS, OPT_TYPE) partition, so it can't influence the order.
     """
     _run(conn, f"""
         ;WITH R AS (
             SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
                    ROW_NUMBER() OVER (
+                       PARTITION BY [WERKS], ISNULL([OPT_TYPE],'')
                        ORDER BY
-                         CASE ISNULL([OPT_TYPE],'')
-                             WHEN 'RL'  THEN 1
-                             WHEN 'TBC' THEN 2
-                             WHEN 'TBL' THEN 3
-                             ELSE 4 END,
                          ISNULL([OPT_PRIORITY_TIER], 3) ASC,
-                         ISNULL([ST_RANK], 999999) ASC,
                          ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0) DESC,
                          ISNULL([MAX_DAILY_SALE], 0) DESC,
-                         ISNULL([OPT_REQ_WH], 0) DESC
+                         ISNULL([OPT_REQ_WH], 0) DESC,
+                         ISNULL(TRY_CAST([GEN_ART_NUMBER] AS BIGINT), 0) ASC,
+                         ISNULL([CLR],'') ASC
                    ) AS rk
             FROM [{working_table}]
             WHERE LISTED_FLAG = 1
@@ -462,6 +466,16 @@ def _stage_b_indexes(conn, alloc_table):
             CREATE NONCLUSTERED INDEX IX_{alloc_table}_pool ON [{alloc_table}]
               (RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ)
               INCLUDE (WERKS, SHIP_QTY, HOLD_QTY, FNL_Q_REM)
+        """)
+    except Exception:
+        pass
+    # Slim MAJ_CAT-leading index — keeps seed_queue's GROUP BY MAJ_CAT (and
+    # any per-MAJ_CAT lookups) on a narrow stream-aggregate scan instead of
+    # walking the much wider clustered/pool indexes.
+    try:
+        _run(conn, f"""
+            CREATE NONCLUSTERED INDEX IX_{alloc_table}_majcat ON [{alloc_table}]
+              (MAJ_CAT)
         """)
     except Exception:
         pass

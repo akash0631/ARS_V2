@@ -268,6 +268,29 @@ export default function TempDBAdminPage() {
     }
   }
 
+  const dbClearLogBackupWait = async (dbName) => {
+    const ok = window.confirm(
+      `Clear LOG_BACKUP wait on ${dbName}?\n\n` +
+      `This will:\n` +
+      `  1. Switch ${dbName} to SIMPLE recovery (permanent)\n` +
+      `  2. CHECKPOINT + SHRINK the log\n\n` +
+      `Trade-off: you lose point-in-time recovery between full backups,\n` +
+      `but the log will never fill the disk again.`
+    )
+    if (!ok) return
+    setRunning(true)
+    try {
+      const { data } = await maintenanceAPI.dbClearLogBackupWait(dbName)
+      const freed = Math.round(data.freed_mb || 0)
+      toast.success(`${dbName}: ${data.recovery_before}→SIMPLE, freed ${freed} MB`)
+      await loadAll(true)
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Clear LOG_BACKUP failed')
+    } finally {
+      setRunning(false)
+    }
+  }
+
   const dbBackupLog = async (dbName) => {
     const path = window.prompt(
       `Backup log path for ${dbName}\n` +
@@ -580,6 +603,16 @@ export default function TempDBAdminPage() {
                         >
                           <Gauge size={11} /> Cap MAXSIZE
                         </button>
+                        {d.recovery_model !== 'SIMPLE' && d.log_reuse_wait === 'LOG_BACKUP' && (
+                          <button
+                            onClick={() => dbClearLogBackupWait(d.db_name)}
+                            disabled={running}
+                            title="Switch to SIMPLE + CHECKPOINT + SHRINK in one shot — clears LOG_BACKUP wait permanently"
+                            className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] bg-rose-600 text-white rounded hover:bg-rose-700 disabled:opacity-50"
+                          >
+                            <Trash2 size={11} /> Clear LOG_BACKUP
+                          </button>
+                        )}
                         {d.recovery_model !== 'SIMPLE' && (
                           <>
                             <button

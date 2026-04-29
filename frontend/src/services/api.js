@@ -466,6 +466,7 @@ export const maintenanceAPI = {
   dbShrinkData:      (db, fileName, targetMb)   => api.post(`/maintenance/db/${encodeURIComponent(db)}/shrink-data`, null, { params: { file_name: fileName, target_mb: targetMb }, timeout: 900000 }),
   dbSetRecovery:     (db, model, confirm=true)  => api.post(`/maintenance/db/${encodeURIComponent(db)}/recovery`, null, { params: { model, confirm } }),
   dbBackupLog:       (db, backupPath)           => api.post(`/maintenance/db/${encodeURIComponent(db)}/backup-log`, null, { params: { backup_path: backupPath }, timeout: 600000 }),
+  dbClearLogBackupWait: (db, targetMb=4096)     => api.post(`/maintenance/db/${encodeURIComponent(db)}/clear-log-backup-wait`, null, { params: { target_mb: targetMb }, timeout: 600000 }),
   dbSetLogMaxsize:   (db, maxMb)                => api.post(`/maintenance/db/${encodeURIComponent(db)}/set-log-maxsize`, null, { params: { max_mb: maxMb } }),
   diskSpace:         ()                         => api.get('/maintenance/disk'),
   reclaimAll:        ()                         => api.post('/maintenance/reclaim-all', null, { timeout: 900000 }),

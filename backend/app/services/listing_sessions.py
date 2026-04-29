@@ -344,15 +344,22 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
 
 def kill_session(session_id: str, reason: str = "killed by user") -> Dict[str, Any]:
     """
-    Force-terminate a RUNNING session row + cancel its in-flight queue
-    rows. Doesn't actually preempt the Python thread (we have no handle
-    to it), but marks the bookkeeping closed so:
-      - /listing/active-job stops surfacing its batch as RUNNING
-      - the UI moves on
-      - the next /listing/generate can start cleanly
-    Useful when a session hangs or the user wants to free up the slot.
+    Force-terminate a RUNNING session: sets the cooperative cancel event so
+    worker threads exit, KILLs every SQL Server SPID registered with this
+    batch_id (so in-flight queries die immediately), marks the session row
+    FAILED, and cancels its alloc-queue rows.
+
+    `session_id` IS the `batch_id` for parallel modes, so this drives the
+    same cancel infrastructure as POST /cancel-batch.
     """
     from app.services.alloc_queue import QUEUE_TABLE
+    from app.services import alloc_cancellation as ac
+
+    # Step 0: signal the workers + KILL their SPIDs. No-op if nobody
+    # registered (e.g. sequential mode mid-Stage-A) — the bookkeeping
+    # update below still closes the session.
+    cancel_info = ac.hard_cancel(session_id)
+
     engine = get_data_engine()
     cancelled_queue_rows = 0
     sess_row_updated = False
@@ -393,6 +400,10 @@ def kill_session(session_id: str, reason: str = "killed by user") -> Dict[str, A
         "session_id": session_id,
         "session_row_updated": sess_row_updated,
         "queue_rows_cancelled": cancelled_queue_rows,
+        "kill_attempted": cancel_info.get("kill_attempted", 0),
+        "killed":         cancel_info.get("killed", []),
+        "kill_failed":    cancel_info.get("kill_failed", []),
+        "event_set":      cancel_info.get("event_set", False),
     }
 
 

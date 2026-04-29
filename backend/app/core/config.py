@@ -102,6 +102,12 @@ class Settings(BaseSettings):
     AUTO_FREE_LOG_MAX_MB: int = 8192        # trigger at 8 GB
     AUTO_FREE_LOG_TARGET_MB: int = 4096     # shrink back to 4 GB
 
+    # When True, reclaim-all and post-job cleanup auto-flip FULL→SIMPLE on
+    # any DB whose log_reuse_wait is LOG_BACKUP (then CHECKPOINT + SHRINK).
+    # Trades point-in-time recovery for the operational guarantee that the
+    # log will never fill the disk because nobody scheduled log backups.
+    AUTO_RESOLVE_LOG_BACKUP_WAIT: bool = True
+
     # Working Database (Business data, dynamic tables, allocations)
     DATA_DB_NAME: str = "Rep_data"
 
@@ -121,6 +127,18 @@ class Settings(BaseSettings):
     MAX_UPLOAD_SIZE_MB: int = 100
     UPLOAD_CHUNK_SIZE: int = 10000
     ALLOWED_EXTENSIONS: str = ".csv,.xlsx,.xls"
+
+    # Grid Builder log-pressure controls.
+    # Azure SQL DB has a per-tier transaction-log size cap. Each grid run does
+    # a multi-million-row INSERT; running several in parallel into one log
+    # produced error 9002 ("transaction log is full due to LOG_BACKUP").
+    # Sequential runs + chunked INSERTs keep the active log small enough that
+    # the platform's auto-backup can clear space between batches.
+    GRID_RUN_PARALLELISM: int = 4            # workers in "Run All Active" (was 1; safe now that LOG_BACKUP auto-resolves)
+    GRID_RUN_PARALLELISM_MAX: int = 16       # hard cap, even if /run-all?parallelism=N requests more
+    GRID_INSERT_CHUNK_SIZE: int = 250000     # rows per INSERT batch within a grid
+    GRID_LOG_FULL_RETRY_DELAY_SEC: int = 60  # wait before retrying after 9002
+    GRID_LOG_FULL_RETRY_COUNT: int = 1       # one retry, then surface error
     USE_BLOB_STORAGE: bool = False           # True in production (Azure Blob)
     AZURE_STORAGE_CONNECTION_STRING: str = ""
     AZURE_STORAGE_CONTAINER: str = "ars-files"

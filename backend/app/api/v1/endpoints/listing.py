@@ -429,6 +429,12 @@ def _run_generate_in_thread(req_dict: dict, user_name, session_id: str,
             )
         except Exception:
             pass
+        # Drop any cancel-event / SPID registry entries we accumulated.
+        try:
+            from app.services import alloc_cancellation as ac
+            ac.cleanup(alloc_batch_id or session_id)
+        except Exception:
+            pass
 
 
 def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
@@ -441,6 +447,20 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     """
     start = time.time()
     de = get_data_engine()
+
+    # Cancel-check helper. Stage A/B can run for many minutes; without these
+    # checkpoints the thread keeps grinding even after kill_session sets the
+    # cancel event. We probe between heavy stages so the worst case is one
+    # in-flight statement (which kill_session will KILL on the SPID anyway).
+    # NOTE: do NOT alias this module to `ac` — several `with de.connect() as ac:`
+    # blocks later in this function would shadow it and break _check_cancel.
+    from app.services import alloc_cancellation as _cancel_svc
+    _cancel_key = preset_batch_id or session_id
+
+    def _check_cancel(stage: str = "") -> None:
+        if _cancel_key and _cancel_svc.is_cancelled(_cancel_key):
+            logger.warning(f"[generate] cancel detected at stage={stage} — aborting")
+            raise InterruptedError(f"cancelled by user (stage={stage})")
 
     # Auto-save current variables to DB for next session
     try:
@@ -502,15 +522,30 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             logger.error(f"Full pipeline error: {e}")
             pipeline_msg = f"Pipeline partial (error: {str(e)[:80]}) | "
 
-    # Step timing collector
+    # Step timing collector — also probes the cancel flag at every step
+    # boundary so a Stage A/B run aborts at the next gap when the user
+    # clicks Stop, even before any in-flight statement is KILL'd.
     step_timings = []
     def _time_step(label, t0):
         dt = round(time.time() - t0, 1)
         step_timings.append({"step": label, "seconds": dt})
         logger.info(f"⏱ {label}: {dt}s")
+        _check_cancel(label)
         return time.time()
 
     with de.connect() as conn:
+        # Register this long-lived connection's SPID with the cancel registry
+        # so kill_session(session_id) issues KILL on the in-flight statement
+        # (Stage A/B INSERTs can run for minutes — without this, KILL has no
+        # SPID to target and the Python thread keeps grinding). The SPID
+        # becomes invalid when the connection closes at the end of this
+        # with-block; cleanup(batch_id) at the end of the run scrubs it.
+        _stage_ab_spid = _cancel_svc.get_current_spid(conn)
+        if _cancel_key and _stage_ab_spid:
+            _cancel_svc.register_spid(_cancel_key, _stage_ab_spid)
+            logger.info(f"[generate] Stage A/B spid={_stage_ab_spid} registered for cancel")
+        _check_cancel("stage_ab_start")
+
         for tbl in [req.msa_table, req.grid_table, req.st_master_table]:
             if not _table_exists(conn, tbl):
                 raise HTTPException(400, f"Table '{tbl}' not found")
@@ -1624,12 +1659,21 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             rank_rows = rc.execute(text(f"SELECT COUNT(*) FROM [{RANK_TABLE}]")).scalar()
             logger.info(f"{RANK_TABLE}: {rank_rows} rows (req_wt={rw}, fill_wt={fw})")
 
-            # Populate ST_RANK back into ARS_LISTING for working table
+            # Populate ST_RANK on ARS_LISTING. ST_RANK is the per-MAJ_CAT
+            # store rank computed above (REQ × FILL weighted score). It is
+            # NOT used by _stage_a_assign_rank anymore (that's now partitioned
+            # per (WERKS, OPT_TYPE), so a per-store rank inside it would be
+            # constant). It IS still needed downstream:
+            #   • _stage_a_materialize_listed selects [ST_RANK] from the
+            #     working table — without this column the query 500s.
+            #   • The allocation waterfall uses it as a tiebreaker so two
+            #     options with the same OPT_PRIORITY_RANK ship in store-rank
+            #     order across MAJ_CATs.
             try:
                 rc.execute(text(f"ALTER TABLE [{LISTING_TABLE}] ADD [ST_RANK] INT NULL"))
                 rc.commit()
             except Exception:
-                pass
+                pass  # column may already exist from a prior run
             _run(rc, f"""
                 UPDATE L SET L.[ST_RANK] = R.[ST_RANK]
                 FROM [{LISTING_TABLE}] L
@@ -2066,8 +2110,39 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 WHERE T.[IS_CLOSED] = 0
             """)
 
-            # STEP B — insert new rows for NL/TBL SKUs first appearing in this run.
-            # Source: ALLOC_TABLE (size grain) joined to FINAL_TABLE (for OPT_STATUS).
+            # STEP A.5 — refresh HOLD_QTY_INITIAL / HOLD_REM for SKUs that were
+            # already tracked (still open) AND show up again in this run with
+            # a NEW hold qty. Without this, re-running with a different stock
+            # situation would leave HOLD_QTY_INITIAL frozen at the original
+            # value and SUM(HOLD_REM) would drift away from the dashboard.
+            _run(ac, f"""
+                ;WITH RunHold AS (
+                    SELECT A.[WERKS],
+                           TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
+                           A.[SZ],
+                           SUM(ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0)) AS hold_qty
+                    FROM [{ALLOC_TABLE}] A
+                    WHERE ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
+                    GROUP BY A.[WERKS], TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
+                )
+                UPDATE T SET
+                    T.[HOLD_QTY_INITIAL] = R.hold_qty,
+                    T.[HOLD_REM]         = R.hold_qty,
+                    T.[LAST_UPDATED]     = GETDATE(),
+                    T.[IS_CLOSED]        = 0,
+                    T.[CLOSED_DATE]      = NULL
+                FROM [ARS_NL_TBL_HOLD_TRACKING] T
+                INNER JOIN RunHold R
+                    ON  T.[WERKS]   = R.[WERKS]
+                    AND T.[VAR_ART] = R.[VAR_ART]
+                    AND T.[SZ]      = R.[SZ]
+            """)
+
+            # STEP B — insert new rows for NL/TBL SKUs first appearing in this
+            # run. The criterion is HOLD_QTY > 0 (this row has hold qty worth
+            # tracking), NOT ALLOC_QTY > 0 — the previous filter dropped every
+            # size row whose pool went entirely to HOLD with nothing shipped,
+            # which is exactly the case that needs to carry forward.
             _run(ac, f"""
                 INSERT INTO [ARS_NL_TBL_HOLD_TRACKING]
                     ([WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR], [VAR_ART], [SZ],
@@ -2086,13 +2161,13 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     ON  W.[WERKS]          = A.[WERKS]
                     AND W.[MAJ_CAT]        = A.[MAJ_CAT]
                     AND W.[GEN_ART_NUMBER] = A.[GEN_ART_NUMBER]
-                    AND W.[CLR]            = A.[CLR]
+                    AND ISNULL(W.[CLR],'') = ISNULL(A.[CLR],'')
                 LEFT JOIN [ARS_NL_TBL_HOLD_TRACKING] T
                     ON  T.[WERKS]   = A.[WERKS]
                     AND T.[VAR_ART] = TRY_CAST(A.[VAR_ART] AS BIGINT)
                     AND T.[SZ]      = A.[SZ]
                 WHERE W.[OPT_STATUS] IN ('NL', 'TBL')
-                  AND ISNULL(TRY_CAST(A.[ALLOC_QTY] AS FLOAT), 0) > 0
+                  AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
                   AND T.[WERKS] IS NULL
             """)
     except Exception as e:
@@ -2949,22 +3024,53 @@ def _compute_listing_summary(conn):
 
     summary["by_rdc"] = sorted(by_rdc.values(), key=lambda x: x["rdc"])
 
-    # by_maj_cat: SUM(ALLOC_QTY) from ARS_LISTING_WORKING (actual allocated qty, not row count)
+    # by_maj_cat: SUM(ALLOC_QTY) from ARS_LISTING_WORKING — every MAJ_CAT that
+    # contributed to the allocation, so the modal total reconciles with the
+    # TOTAL ALLOC QTY tile. The chart only renders top/bottom N anyway.
+    # Also enrich each row with msa_qty = SUM(<MSA qty col>) FROM ARS_MSA_GEN_ART
+    # for the same MAJ_CAT so the modal can show ALLOC vs MSA side-by-side.
+    by_maj_cat: List[Dict[str, Any]] = []
     if _table_exists(conn, WORKING_TABLE):
         wk_cols = _get_columns(conn, WORKING_TABLE)
         if "ALLOC_QTY" in wk_cols and "MAJ_CAT" in wk_cols:
             rows = conn.execute(text(f"""
-                SELECT TOP 20 [MAJ_CAT],
+                SELECT [MAJ_CAT],
                        ROUND(ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0), 0) AS aq
                 FROM [{WORKING_TABLE}]
+                WHERE [MAJ_CAT] IS NOT NULL
                 GROUP BY [MAJ_CAT]
+                HAVING ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0) > 0
                 ORDER BY aq DESC
             """)).fetchall()
-            summary["by_maj_cat"] = [{"maj_cat": r[0], "alloc_qty": round(r[1] or 0)} for r in rows]
-        else:
-            summary["by_maj_cat"] = []
-    else:
-        summary["by_maj_cat"] = []
+            by_maj_cat = [
+                {"maj_cat": r[0], "alloc_qty": round(r[1] or 0), "msa_qty": 0}
+                for r in rows
+            ]
+
+    # Lookup MSA stock per MAJ_CAT and merge into by_maj_cat. Done as a
+    # separate query (not a JOIN) because the MSA table may have MAJ_CATs
+    # that aren't in this listing run, and vice versa — keeping them
+    # decoupled is cheaper than a full outer join.
+    if by_maj_cat and _table_exists(conn, "ARS_MSA_GEN_ART"):
+        mc = _get_columns(conn, "ARS_MSA_GEN_ART")
+        qty_col = next((c for c in ("FNL_Q", "MSA_FNL_Q", "QTY") if c in mc), None)
+        if qty_col and "MAJ_CAT" in mc:
+            try:
+                msa_rows = conn.execute(text(f"""
+                    SELECT [MAJ_CAT],
+                           ROUND(ISNULL(SUM(TRY_CAST([{qty_col}] AS FLOAT)), 0), 0) AS mq
+                    FROM [ARS_MSA_GEN_ART]
+                    WHERE [MAJ_CAT] IS NOT NULL
+                    GROUP BY [MAJ_CAT]
+                """)).fetchall()
+                msa_map = {r[0]: round(r[1] or 0) for r in msa_rows}
+                for row in by_maj_cat:
+                    row["msa_qty"] = msa_map.get(row["maj_cat"], 0)
+            except Exception:
+                # Leave msa_qty=0 on any error — modal still functions
+                pass
+
+    summary["by_maj_cat"] = by_maj_cat
 
     # GEN_ART_NUMBER is BIGINT — must CAST for string concatenation
     opt_key = "ISNULL([MAJ_CAT],'') + '|' + ISNULL(CAST([GEN_ART_NUMBER] AS NVARCHAR(50)),'') + '|' + ISNULL([CLR],'')"

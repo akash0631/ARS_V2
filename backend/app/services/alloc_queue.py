@@ -98,7 +98,20 @@ def seed_queue(conn, batch_id: str, alloc_table: str,
     only_majcats=[...]    -> seed only the given list (used by retry endpoint).
 
     Returns the number of rows inserted.
+
+    Performance notes:
+    - GROUP BY uses the narrow IX_<alloc_table>_majcat index (added in
+      _stage_b_indexes), so this is a stream aggregate over a slim scan.
+    - NOLOCK on the source: seed runs right after Stage B finished writing
+      to alloc_table on the same connection, so there's nothing live to
+      block against — but a future caller might run it cross-session, and
+      NOLOCK keeps us off any leftover IX/SCH-S waits either way.
+    - OPTION (MAXDOP 4) lets SQL Server parallelise the aggregate when the
+      table is large; it's a no-op on small/medium tables.
+    - We use @@ROWCOUNT instead of a follow-up SELECT COUNT(*) to avoid a
+      second full scan of the queue table.
     """
+    import time as _time
     ensure_queue_table(conn)
 
     where_mc = ""
@@ -109,21 +122,24 @@ def seed_queue(conn, batch_id: str, alloc_table: str,
         for i, mc in enumerate(only_majcats):
             params[f"mc_{i}"] = mc
 
-    conn.execute(text(f"""
+    t0 = _time.time()
+    res = conn.execute(text(f"""
         INSERT INTO {QUEUE_TABLE}
             (BATCH_ID, MAJ_CAT, OPT_COUNT, STATUS, ALLOCATION_MODE)
-        SELECT :batch_id, MAJ_CAT, COUNT(*), 'PENDING', :mode
-        FROM [{alloc_table}]
+        SELECT :batch_id, MAJ_CAT, COUNT_BIG(*), 'PENDING', :mode
+        FROM [{alloc_table}] WITH (NOLOCK)
         WHERE MAJ_CAT IS NOT NULL {where_mc}
         GROUP BY MAJ_CAT
+        OPTION (MAXDOP 4)
     """), params)
     conn.commit()
+    n = int(res.rowcount or 0)
 
-    n = conn.execute(text(
-        f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE BATCH_ID = :b"
-    ), {"b": batch_id}).scalar() or 0
-    logger.info(f"[queue] seeded {n} MAJ_CATs for batch_id={batch_id}")
-    return int(n)
+    logger.info(
+        f"[queue] seeded {n} MAJ_CATs for batch_id={batch_id} "
+        f"in {_time.time() - t0:.1f}s"
+    )
+    return n
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +177,25 @@ def claim_next(conn, batch_id: str, worker_id: int) -> Optional[str]:
     }).fetchone()
     conn.commit()
     return row[0] if row else None
+
+
+def mark_in_progress(conn, batch_id: str, mc: str, worker_id: int) -> None:
+    """
+    Stamp a single MAJ_CAT row as IN_PROGRESS. Used by the ProcessPool path
+    where each worker already has its target MAJ_CAT (no claim race) but
+    we still want the dashboard to show the live `In progress` count.
+    Idempotent — safe to call again on retry.
+    """
+    conn.execute(text(f"""
+        UPDATE {QUEUE_TABLE}
+           SET STATUS    = 'IN_PROGRESS',
+               WORKER_ID = :wid,
+               PICKED_AT = GETDATE(),
+               ATTEMPTS  = ISNULL(ATTEMPTS, 0) + 1
+         WHERE BATCH_ID = :b AND MAJ_CAT = :mc
+           AND STATUS IN ('PENDING','FAILED')
+    """), {"b": batch_id, "mc": mc, "wid": int(worker_id)})
+    conn.commit()
 
 
 def mark_done(conn, batch_id: str, mc: str,

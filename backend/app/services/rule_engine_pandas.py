@@ -21,10 +21,9 @@ reproduces SQL ROW_NUMBER() tie-breaking on (OPT_PRIORITY_RANK, ST_RANK).
 from __future__ import annotations
 
 import os
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,6 +31,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.database.session import get_data_engine
+from app.services import alloc_cancellation as ac
 from app.services import rule_engine_new as rne
 from app.services.alloc_queue import (
     claim_next,
@@ -40,6 +40,7 @@ from app.services.alloc_queue import (
     make_batch_id,
     mark_done,
     mark_failed,
+    mark_in_progress,
     seed_queue,
 )
 from app.utils.db_helpers import run_sql
@@ -58,9 +59,95 @@ DEFAULT_WORKERS = int(os.getenv("ARS_PARALLEL_WORKERS", "4"))
 MIN_WORKERS = 2
 MAX_WORKERS = 8   # was 16; capped lower for the same GIL-saturation reason
 
+# Below this many MAJ_CATs we don't bother spawning a process pool — the
+# subprocess startup cost (~1–2s per child on Windows spawn) dwarfs the
+# work itself. Tiny inputs run inline on a single thread.
+PROCESS_POOL_MIN_MAJCATS = 3
+
 OPT_TYPE_ORDER = ["RL", "TBC", "TBL"]
 POOL_KEYS = ["RDC", "MAJ_CAT", "GEN_ART_NUMBER", "CLR", "VAR_ART", "SZ"]
 OPT_KEYS  = ["WERKS", "MAJ_CAT", "GEN_ART_NUMBER", "CLR"]
+
+
+# ---------------------------------------------------------------------------
+# Per-MAJ_CAT worker — top-level so ProcessPoolExecutor can pickle it
+# ---------------------------------------------------------------------------
+def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
+    """
+    One MAJ_CAT, one process. Runs the in-memory waterfall, writes results
+    back, marks the queue row DONE. Returns a small dict the parent uses
+    for progress logging.
+
+    Pickleable contract: every argument and the return value must be
+    picklable so the pool can ship them across the process boundary.
+    DataFrames are picklable; the slices we pass are typically a few MB.
+    """
+    (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
+     pri_ct_check_rl, pri_ct_check_tbc) = args
+
+    t_mc = time.time()
+    worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
+
+    # Stamp the row IN_PROGRESS so /listing/alloc-progress reflects active
+    # workers in real time. Best-effort — if this fails the run still works,
+    # just won't show in the live counter.
+    try:
+        eng = get_data_engine()
+        with eng.connect() as upd:
+            mark_in_progress(upd, batch_id, mc, worker_id)
+    except Exception:
+        pass
+
+    try:
+        # Empty slice — mark done and bail.
+        if a_slice is None or a_slice.empty:
+            try:
+                eng = get_data_engine()
+                with eng.connect() as upd:
+                    mark_done(upd, batch_id, mc, 0.0, 0.0, 0, time.time() - t_mc)
+            except Exception:
+                pass
+            return {"mc": mc, "ship": 0.0, "hold": 0.0, "rows": 0,
+                    "dur": time.time() - t_mc, "wb_secs": 0.0}
+
+        a_in = a_slice.copy()
+        w_in = w_slice.copy() if w_slice is not None else pd.DataFrame()
+
+        a_out, w_out = _run_majcat_waterfall(
+            a_in, w_in, grids,
+            pri_ct_check_rl=pri_ct_check_rl,
+            pri_ct_check_tbc=pri_ct_check_tbc,
+        )
+        ship_mc = float(a_out['SHIP_QTY'].fillna(0).sum())
+        hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
+        rows_mc = int(len(a_out))
+
+        # Live write-back for THIS MAJ_CAT — disjoint slices, safe to run
+        # concurrently across processes (different rows in alloc/working).
+        eng = get_data_engine()
+        t_wb = time.time()
+        _write_back_alloc(eng, alloc_table, a_out)
+        if not w_out.empty:
+            _write_back_working(eng, working_table, w_out, grids)
+        wb_secs = time.time() - t_wb
+
+        dur = time.time() - t_mc
+        with eng.connect() as upd:
+            mark_done(upd, batch_id, mc, ship_mc, hold_mc, rows_mc, dur)
+
+        return {"mc": mc, "ship": ship_mc, "hold": hold_mc, "rows": rows_mc,
+                "dur": dur, "wb_secs": wb_secs}
+
+    except Exception as e:
+        err = str(e)[:2000]
+        dur = time.time() - t_mc
+        try:
+            eng = get_data_engine()
+            with eng.connect() as upd:
+                mark_failed(upd, batch_id, mc, err, dur)
+        except Exception:
+            pass
+        return {"mc": mc, "error": err, "dur": dur}
 
 
 # ---------------------------------------------------------------------------
@@ -176,92 +263,90 @@ def run_listing_and_allocation_pandas(
     alloc_groups   = {mc: g for mc, g in alloc_df.groupby('MAJ_CAT', sort=False)}
     working_groups = {mc: g for mc, g in working_df.groupby('MAJ_CAT', sort=False)}
 
-    # ── Stage C — thread-fanned by MAJ_CAT ──
-    state_lock = threading.Lock()
-    updated_alloc:   List[pd.DataFrame] = []
-    updated_working: List[pd.DataFrame] = []
+    # ── Stage C — process-fanned by MAJ_CAT ──
+    # Each MAJ_CAT runs in its own subprocess (ProcessPoolExecutor). The
+    # in-memory waterfall is pandas/numpy → almost entirely GIL-bound, so
+    # threads serialise (8 threads = 1 effective worker). Subprocesses each
+    # have their own GIL → real parallelism. Each worker writes its own
+    # MAJ_CAT slice back the moment the waterfall finishes, so the dashboard
+    # ticks up live as MAJ_CATs complete.
+    wb_total_secs = 0.0
 
-    def worker(worker_id: int):
-        while True:
-            with engine.connect() as claim_conn:
-                mc = claim_next(claim_conn, batch_id, worker_id)
-            if mc is None:
-                return  # queue exhausted
+    pool_args = [
+        (
+            mc,
+            alloc_groups[mc],
+            working_groups.get(mc, pd.DataFrame()),
+            grids,
+            batch_id,
+            alloc_table,
+            working_table,
+            bool(pri_ct_check_rl),
+            bool(pri_ct_check_tbc),
+        )
+        for mc in alloc_groups
+    ]
 
-            t_mc = time.time()
-            try:
-                a_slice = alloc_groups.get(mc)
-                if a_slice is None or a_slice.empty:
-                    with engine.connect() as upd_conn:
-                        mark_done(upd_conn, batch_id, mc, 0.0, 0.0, 0,
-                                  time.time() - t_mc)
+    use_pool = (len(pool_args) >= PROCESS_POOL_MIN_MAJCATS and n_workers > 1)
+
+    if use_pool:
+        logger.info(
+            f"[C-pd] dispatching {len(pool_args)} MAJ_CATs to "
+            f"ProcessPoolExecutor(max_workers={n_workers})"
+        )
+        # max_workers can't exceed the # of tasks meaningfully — clamp it.
+        actual_workers = min(n_workers, len(pool_args))
+        with ProcessPoolExecutor(max_workers=actual_workers) as ex:
+            futures = {ex.submit(_pandas_run_one_majcat, args): args[0]
+                       for args in pool_args}
+            for f in as_completed(futures):
+                mc = futures[f]
+                try:
+                    r = f.result()
+                except Exception as e:
+                    err = str(e)[:2000]
+                    logger.error(f"[C-pd-pool] MAJ_CAT={mc} subprocess raised: {err}")
+                    result["errors"].append({"maj_cat": mc, "error": err})
                     continue
 
-                a_in = a_slice.copy()
-                w_in = working_groups.get(mc, pd.DataFrame()).copy()
-
-                a_out, w_out = _run_majcat_waterfall(
-                    a_in, w_in, grids,
-                    pri_ct_check_rl=pri_ct_check_rl,
-                    pri_ct_check_tbc=pri_ct_check_tbc,
-                )
-
-                ship_mc = float(a_out['SHIP_QTY'].fillna(0).sum())
-                hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
-                rows_mc = int(len(a_out))
-                dur = time.time() - t_mc
-
-                with state_lock:
-                    updated_alloc.append(a_out)
-                    if not w_out.empty:
-                        updated_working.append(w_out)
-
-                with engine.connect() as upd_conn:
-                    mark_done(upd_conn, batch_id, mc,
-                              ship_mc, hold_mc, rows_mc, dur)
-                    prog = get_progress(upd_conn, batch_id)
-
-                logger.info(
-                    f"[C-pd-W{worker_id}] {prog['done']}/{prog['total']} "
-                    f"({prog['pct']}%) — MAJ_CAT={mc} "
-                    f"ship={ship_mc:.0f} hold={hold_mc:.0f} "
-                    f"rows={rows_mc} in {dur:.1f}s"
-                )
-            except Exception as e:
-                err = str(e)[:2000]
-                dur = time.time() - t_mc
-                logger.error(
-                    f"[C-pd-W{worker_id}] MAJ_CAT={mc} FAILED in "
-                    f"{dur:.1f}s: {err}"
-                )
-                try:
-                    with engine.connect() as upd_conn:
-                        mark_failed(upd_conn, batch_id, mc, err, dur)
-                except Exception as e2:
+                if r.get("error"):
+                    result["errors"].append({"maj_cat": mc, "error": r["error"]})
                     logger.error(
-                        f"[C-pd-W{worker_id}] mark_failed itself failed "
-                        f"for MAJ_CAT={mc}: {e2}"
+                        f"[C-pd-pool] MAJ_CAT={mc} FAILED in {r.get('dur', 0):.1f}s: "
+                        f"{r['error']}"
                     )
-                with state_lock:
-                    result["errors"].append({"maj_cat": mc, "error": err})
+                else:
+                    wb_total_secs += float(r.get("wb_secs", 0.0))
+                    # Cheap progress query — one row from the queue table.
+                    try:
+                        with engine.connect() as conn:
+                            prog = get_progress(conn, batch_id)
+                        prog_str = f"{prog['done']}/{prog['total']} ({prog['pct']}%)"
+                    except Exception:
+                        prog_str = "?"
+                    logger.info(
+                        f"[C-pd-pool] {prog_str} — MAJ_CAT={mc} "
+                        f"ship={r.get('ship', 0):.0f} hold={r.get('hold', 0):.0f} "
+                        f"rows={r.get('rows', 0)} in {r.get('dur', 0):.1f}s "
+                        f"(wb={r.get('wb_secs', 0):.1f}s)"
+                    )
+    else:
+        # Inline fallback: tiny inputs (or n_workers=1) skip subprocess overhead.
+        logger.info(
+            f"[C-pd] inline run for {len(pool_args)} MAJ_CAT(s) "
+            f"(below process-pool threshold or single worker)"
+        )
+        for args in pool_args:
+            mc = args[0]
+            r = _pandas_run_one_majcat(args)
+            if r.get("error"):
+                result["errors"].append({"maj_cat": mc, "error": r["error"]})
+            else:
+                wb_total_secs += float(r.get("wb_secs", 0.0))
 
-    with ThreadPoolExecutor(max_workers=n_workers,
-                            thread_name_prefix="ars-pd") as ex:
-        futures = [ex.submit(worker, i) for i in range(n_workers)]
-        for f in as_completed(futures):
-            f.result()
-
-    # ── Bulk write-back ──
-    t_wb = time.time()
-    if updated_alloc:
-        a_combined = pd.concat(updated_alloc, ignore_index=True)
-        _write_back_alloc(engine, alloc_table, a_combined)
-    if updated_working:
-        w_combined = pd.concat(updated_working, ignore_index=True)
-        _write_back_working(engine, working_table, w_combined, grids)
     logger.info(
-        f"[C-pd] write-back ({len(updated_alloc)} maj_cats) "
-        f"in {time.time()-t_wb:.1f}s"
+        f"[C-pd] live write-back done — total wb time across workers "
+        f"{wb_total_secs:.1f}s"
     )
 
     # ── Finalise + Stage D (SQL) ──
@@ -334,12 +419,24 @@ def _load_tables(engine, alloc_table, working_table, grids, only_majcats):
     with engine.connect() as conn:
         working_cols = _select_working_cols(conn, working_table, grids)
         col_sql = ", ".join(f"[{c}]" for c in working_cols)
+        # Deterministic ORDER BY — without this, SQL Server can return rows in
+        # any order (especially under parallel scan), which makes mergesort's
+        # tie-break in _run_band non-deterministic and gives slightly different
+        # alloc/hold totals from run to run on the same input.
+        alloc_order = (
+            "ORDER BY [MAJ_CAT], [RDC], [GEN_ART_NUMBER], "
+            "ISNULL([CLR],''), [VAR_ART], [SZ], "
+            "[OPT_PRIORITY_RANK], ISNULL([ST_RANK], 999999), [WERKS]"
+        )
+        working_order = (
+            "ORDER BY [MAJ_CAT], [WERKS], [GEN_ART_NUMBER], ISNULL([CLR],'')"
+        )
         alloc_df = pd.read_sql(
-            text(f"SELECT * FROM [{alloc_table}] {where_a}"),
+            text(f"SELECT * FROM [{alloc_table}] {where_a} {alloc_order}"),
             conn, params=params,
         )
         working_df = pd.read_sql(
-            text(f"SELECT {col_sql} FROM [{working_table}] {where_w}"),
+            text(f"SELECT {col_sql} FROM [{working_table}] {where_w} {working_order}"),
             conn, params=params,
         )
 
@@ -560,11 +657,16 @@ def _run_band(
     if sub.empty:
         return
 
-    # 3) Stable sort within pool key by (OPT_PRIORITY_RANK, ST_RANK)
-    #    — matches SQL ROW_NUMBER() OVER (PARTITION BY pool_key ORDER BY ...).
+    # 3) Stable sort within pool key by (OPT_PRIORITY_RANK, ST_RANK, WERKS).
+    #    The SQL equivalent is ROW_NUMBER() OVER (PARTITION BY pool_key
+    #    ORDER BY OPT_PRIORITY_RANK, ST_RANK, WERKS). WERKS is the final
+    #    tiebreaker — without it, two stores with identical OPT_PRIORITY_RANK
+    #    and ST_RANK would race for the pool in whatever order pandas saw
+    #    them, which in turn depends on SQL Server's row order. Adding
+    #    WERKS makes the allocation reproducible run-to-run on the same data.
     sub['_st_rank_fill'] = sub['ST_RANK'].fillna(999999).astype('float64')
     sub.sort_values(
-        POOL_KEYS + ['OPT_PRIORITY_RANK', '_st_rank_fill'],
+        POOL_KEYS + ['OPT_PRIORITY_RANK', '_st_rank_fill', 'WERKS'],
         kind='mergesort',
         inplace=True,
     )

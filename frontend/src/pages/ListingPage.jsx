@@ -202,13 +202,19 @@ function SearchSelect({ label, items, selected, setSelected, placeholder }) {
 }
 
 /* ── Presentational helpers (defined once, outside the page component) ───── */
-function KpiTile({ icon: Icon, label, value, accent, sub }) {
+function KpiTile({ icon: Icon, label, value, accent, sub, onClick }) {
+  const clickable = typeof onClick === 'function'
   return (
-    <div style={{
-      background: '#fff', border: '1px solid #e2e8f0', borderRadius: 7,
-      padding: '5px 8px 5px 11px', display: 'flex', alignItems: 'center', gap: 6,
-      boxShadow: '0 1px 2px rgba(0,0,0,0.03)', position: 'relative', overflow: 'hidden', minHeight: 40,
-    }}>
+    <div onClick={onClick} title={clickable ? 'Click for details' : undefined}
+      style={{
+        background: '#fff', border: '1px solid #e2e8f0', borderRadius: 7,
+        padding: '5px 8px 5px 11px', display: 'flex', alignItems: 'center', gap: 6,
+        boxShadow: '0 1px 2px rgba(0,0,0,0.03)', position: 'relative', overflow: 'hidden', minHeight: 40,
+        cursor: clickable ? 'pointer' : 'default',
+        transition: 'box-shadow .15s, transform .1s',
+      }}
+      onMouseEnter={clickable ? (e) => { e.currentTarget.style.boxShadow = '0 2px 6px rgba(0,0,0,0.08)' } : undefined}
+      onMouseLeave={clickable ? (e) => { e.currentTarget.style.boxShadow = '0 1px 2px rgba(0,0,0,0.03)' } : undefined}>
       <div style={{ position: 'absolute', top: 0, left: 0, width: 3, bottom: 0, background: accent }}/>
       {Icon && <Icon size={13} color={accent} style={{ flexShrink: 0 }}/>}
       <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, lineHeight: 1.15 }}>
@@ -370,9 +376,11 @@ export default function ListingPage() {
   const [minSizeCount, setMinSizeCount] = useState(3)             // Min sizes for TBL listing
   // PRI_CT%>=100 gate applied per opt_type (TBL always on). Off = allow
   // RL/TBC to list/allocate even if primary grid coverage is below 100%.
-  const [priCheckRL, setPriCheckRL]   = useState(true)
-  const [priCheckTBC, setPriCheckTBC] = useState(true)
+  const [priCheckRL, setPriCheckRL]   = useState(false)
+  const [priCheckTBC, setPriCheckTBC] = useState(false)
   const [previewExpanded, setPreviewExpanded] = useState(false)
+  const [majCatModalOpen, setMajCatModalOpen] = useState(false)
+  const [storeModalOpen, setStoreModalOpen] = useState(false)
 
   // ── Parallel allocation (Part 8) ─────────────────────────────────────
   const [allocationMode, setAllocationMode] = useState('python_parallel') // 'sequential' | 'python_parallel' | 'sql_parallel'
@@ -469,14 +477,59 @@ export default function ListingPage() {
     toast(paused ? 'Resumed' : 'Paused — click Resume to continue', { icon: paused ? '\u25b6' : '\u23f8' })
   }
 
-  const handleForceStop = () => {
+  const handleForceStop = async () => {
+    // 1. Abort the local in-flight HTTP request to /listing/generate.
+    //    Important: this only stops the browser\u2192server connection \u2014 the
+    //    backend already spawned a worker thread which keeps running
+    //    until we explicitly tell it to die.
     if (abortRef.current) {
       abortRef.current.abort()
       abortRef.current = null
     }
-    toast('Stopped', { icon: '\u23f9' })
+
+    // 2. Tell the backend to actually kill the running job.
+    //    - cancelBatch: hard-cancel \u2014 sets the in-process cancel event so
+    //      worker threads exit, KILLs each worker's SQL Server SPID, marks
+    //      PENDING/IN_PROGRESS queue rows FAILED. (Only useful once Stage
+    //      C has started; before that no alloc batch exists.)
+    //    - killSession: marks the session row FAILED. Works in any stage,
+    //      including Stage A/B "preparing..." where no batch exists yet.
+    const stops = []
+    if (allocBatchId)    stops.push(['batch',   listingAPI.cancelBatch(allocBatchId)])
+    if (activeSessionId) stops.push(['session', listingAPI.killSession(activeSessionId)])
+
+    // Fallback: if neither id is set locally (e.g. user reloaded the page
+    // mid-run), discover the active session via /active-job and kill that.
+    if (stops.length === 0) {
+      try {
+        const { data } = await listingAPI.activeJob()
+        const sid = data?.session_id || data?.data?.session_id
+        if (sid) stops.push(['session', listingAPI.killSession(sid)])
+      } catch { /* no active job \u2014 local-only stop */ }
+    }
+
+    if (stops.length > 0) {
+      const results = await Promise.allSettled(stops.map(([, p]) => p))
+      const failed  = results.filter(r => r.status === 'rejected')
+      if (failed.length === stops.length) {
+        toast.error(failed[0].reason?.response?.data?.detail || 'Stop failed')
+      } else if (failed.length) {
+        toast(`Stopped \u2014 ${stops.length - failed.length}/${stops.length} kill calls succeeded`, { icon: '\u26a0' })
+      } else {
+        toast.success('Stopped \u2014 backend job killed', { icon: '\u23f9' })
+      }
+    } else {
+      toast('Stopped (local only \u2014 no active backend job)', { icon: '\u23f9' })
+    }
+
     setGenerating(false)
     setPaused(false)
+    setActiveJob(null)
+    // Refresh active-job poll so the banner clears immediately
+    try {
+      const { data } = await listingAPI.activeJob()
+      setActiveJob(data?.data || data)
+    } catch { /* ignore */ }
   }
 
   const handleGenerate = async () => {
@@ -976,9 +1029,14 @@ export default function ListingPage() {
       {/* ═══════════ KPI Tiles — top-line numbers ═══════════ */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 }}>
         <KpiTile icon={Database} label="MSA" value={config?.msa_gen_art_rows} accent="#0891b2"
-          sub={summary?.msa_qty != null
-            ? `${(summary.msa_qty || 0).toLocaleString()} qty · gen-art`
-            : 'gen-art rows'}/>
+          sub={(() => {
+            const mcCount = (summary?.by_maj_cat || []).length
+            const qtyPart = summary?.msa_qty != null
+              ? `${(summary.msa_qty || 0).toLocaleString()} qty · gen-art`
+              : 'gen-art rows'
+            return mcCount > 0 ? `${qtyPart} · ${mcCount} MAJ_CATs` : qtyPart
+          })()}
+          onClick={(summary?.by_maj_cat || []).length > 0 ? () => setMajCatModalOpen(true) : undefined}/>
         <KpiTile icon={Database} label="Grid" value={config?.grid_gen_art_rows} accent="#0891b2" sub="grid rows"/>
         {/* Stores: show "listed / active" — e.g. 5 / 346 active */}
         <KpiTile icon={List} label="Stores"
@@ -986,7 +1044,8 @@ export default function ListingPage() {
           accent={C.blue}
           sub={summary?.listed_store_count != null
             ? `${(summary.listed_store_count || 0).toLocaleString()} of ${(summary?.active_store_count ?? config?.store_count ?? 0).toLocaleString()} active`
-            : `${(config?.store_count || 0).toLocaleString()} active`}/>
+            : `${(config?.store_count || 0).toLocaleString()} active`}
+          onClick={(summary?.by_store || []).length > 0 ? () => setStoreModalOpen(true) : undefined}/>
         <KpiTile icon={List} label="Listing"
           value={config?.listing_exists ? (config?.listing_rows || 0) : 0}
           accent={config?.listing_exists ? C.green : C.textMuted}
@@ -1858,6 +1917,177 @@ export default function ListingPage() {
           </div>
         )}
       </div>
+
+      {/* ═══════════ MAJ_CAT modal — list of MAJ_CATs that ran ═══════════ */}
+      {majCatModalOpen && (() => {
+        const items = [...(summary?.by_maj_cat || [])]
+          .sort((a, b) => (b.alloc_qty || 0) - (a.alloc_qty || 0))
+        const totalQty = items.reduce((s, r) => s + (r.alloc_qty || 0), 0)
+        const totalMsa = items.reduce((s, r) => s + (r.msa_qty || 0), 0)
+        return (
+          <div onClick={() => setMajCatModalOpen(false)}
+            style={{
+              position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              zIndex: 1000,
+            }}>
+            <div onClick={(e) => e.stopPropagation()}
+              style={{
+                background: '#fff', borderRadius: 10, width: 640, maxWidth: '92vw',
+                maxHeight: '82vh', display: 'flex', flexDirection: 'column',
+                boxShadow: '0 12px 40px rgba(0,0,0,0.18)',
+              }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '12px 16px', borderBottom: '1px solid #e2e8f0',
+              }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
+                    MAJ_CATs that ran ({items.length})
+                  </div>
+                  <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
+                    Sorted by allocated qty · MSA total {totalMsa.toLocaleString()} · ALLOC total {totalQty.toLocaleString()}
+                  </div>
+                </div>
+                <button onClick={() => setMajCatModalOpen(false)}
+                  style={{
+                    background: 'transparent', border: 'none', cursor: 'pointer',
+                    padding: 4, color: C.textSub,
+                  }}>
+                  <X size={16}/>
+                </button>
+              </div>
+              <div style={{ overflow: 'auto', padding: '4px 0' }}>
+                {items.length === 0 ? (
+                  <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: C.textMuted }}>
+                    No MAJ_CATs have run yet.
+                  </div>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                    <thead style={{ position: 'sticky', top: 0, background: '#f8fafc' }}>
+                      <tr style={{ color: C.textSub, fontSize: 9, letterSpacing: '.04em' }}>
+                        <th style={{ padding: '6px 14px', textAlign: 'left', width: 36 }}>#</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'left' }}>MAJ_CAT</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right' }}>MSA STOCK</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right' }}>ALLOC QTY</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right', width: 60 }}>SHARE</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {items.map((r, i) => {
+                        const pct = totalQty > 0 ? ((r.alloc_qty || 0) / totalQty * 100) : 0
+                        return (
+                          <tr key={r.maj_cat} style={{ borderTop: '1px solid #f1f5f9' }}>
+                            <td style={{ padding: '6px 14px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i + 1}</td>
+                            <td style={{ padding: '6px 14px', fontWeight: 600, color: C.text }}>{r.maj_cat}</td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>
+                              {(r.msa_qty || 0).toLocaleString()}
+                            </td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                              {(r.alloc_qty || 0).toLocaleString()}
+                            </td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>
+                              {pct.toFixed(1)}%
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* ═══════════ Store modal — per-store allocation breakdown ═══════════ */}
+      {storeModalOpen && (() => {
+        const items = [...(summary?.by_store || [])]
+          .sort((a, b) => (b.alloc_qty || 0) - (a.alloc_qty || 0))
+        const totalAlloc = items.reduce((s, r) => s + (r.alloc_qty || 0), 0)
+        const totalHold  = items.reduce((s, r) => s + (r.hold_qty  || 0), 0)
+        return (
+          <div onClick={() => setStoreModalOpen(false)}
+            style={{
+              position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              zIndex: 1000,
+            }}>
+            <div onClick={(e) => e.stopPropagation()}
+              style={{
+                background: '#fff', borderRadius: 10, width: 640, maxWidth: '92vw',
+                maxHeight: '82vh', display: 'flex', flexDirection: 'column',
+                boxShadow: '0 12px 40px rgba(0,0,0,0.18)',
+              }}>
+              <div style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '12px 16px', borderBottom: '1px solid #e2e8f0',
+              }}>
+                <div>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: C.text }}>
+                    Stores that received allocation ({items.length})
+                  </div>
+                  <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>
+                    Sorted by alloc qty · ALLOC total {totalAlloc.toLocaleString()}
+                    {totalHold > 0 ? ` · HOLD total ${totalHold.toLocaleString()}` : ''}
+                  </div>
+                </div>
+                <button onClick={() => setStoreModalOpen(false)}
+                  style={{
+                    background: 'transparent', border: 'none', cursor: 'pointer',
+                    padding: 4, color: C.textSub,
+                  }}>
+                  <X size={16}/>
+                </button>
+              </div>
+              <div style={{ overflow: 'auto', padding: '4px 0' }}>
+                {items.length === 0 ? (
+                  <div style={{ padding: 24, textAlign: 'center', fontSize: 11, color: C.textMuted }}>
+                    No stores have received allocation yet.
+                  </div>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+                    <thead style={{ position: 'sticky', top: 0, background: '#f8fafc' }}>
+                      <tr style={{ color: C.textSub, fontSize: 9, letterSpacing: '.04em' }}>
+                        <th style={{ padding: '6px 14px', textAlign: 'left', width: 36 }}>#</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'left' }}>STORE</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right' }}>ALLOC QTY</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right' }}>HOLD QTY</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right' }}>ROWS</th>
+                        <th style={{ padding: '6px 14px', textAlign: 'right', width: 60 }}>SHARE</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {items.map((r, i) => {
+                        const pct = totalAlloc > 0 ? ((r.alloc_qty || 0) / totalAlloc * 100) : 0
+                        return (
+                          <tr key={r.werks} style={{ borderTop: '1px solid #f1f5f9' }}>
+                            <td style={{ padding: '6px 14px', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>{i + 1}</td>
+                            <td style={{ padding: '6px 14px', fontWeight: 600, color: C.text }}>{r.werks}</td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>
+                              {(r.alloc_qty || 0).toLocaleString()}
+                            </td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textSub, fontVariantNumeric: 'tabular-nums' }}>
+                              {(r.hold_qty || 0).toLocaleString()}
+                            </td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>
+                              {(r.rows || 0).toLocaleString()}
+                            </td>
+                            <td style={{ padding: '6px 14px', textAlign: 'right', color: C.textMuted, fontVariantNumeric: 'tabular-nums' }}>
+                              {pct.toFixed(1)}%
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

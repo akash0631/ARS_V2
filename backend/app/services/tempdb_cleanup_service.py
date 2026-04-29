@@ -603,6 +603,27 @@ class TempDBCleanupService:
                 if logs:
                     log_name, log_mb = logs[0][0], float(logs[0][1] or 0)
                     result["log_before_mb"] = log_mb
+                    auto_resolve = getattr(settings, "AUTO_RESOLVE_LOG_BACKUP_WAIT", True)
+
+                    # Auto-flip FULL→SIMPLE when log is large AND held by LOG_BACKUP.
+                    # Eliminates the recurring "log fills the disk" failure mode
+                    # without anyone having to schedule log backups.
+                    if (auto_resolve and recovery != "SIMPLE"
+                            and wait == "LOG_BACKUP" and log_mb > log_max):
+                        try:
+                            cur.execute(f"ALTER DATABASE [{target_db}] SET RECOVERY SIMPLE")
+                            cur.execute(f"USE [{target_db}]")
+                            cur.execute("CHECKPOINT")
+                            logger.warning(
+                                f"post_job_cleanup({reason}): {target_db} switched "
+                                f"{recovery}→SIMPLE to clear LOG_BACKUP wait"
+                            )
+                            recovery = "SIMPLE"
+                            result["auto_simpled"] = True
+                        except Exception as exc:
+                            result["errors"].append({
+                                "step": "auto_simple", "error": str(exc),
+                            })
 
                     should_shrink = (
                         recovery == "SIMPLE"
@@ -623,7 +644,7 @@ class TempDBCleanupService:
                             f"{log_mb:.0f}→{result['log_after_mb']:.0f} MB"
                         )
                     elif recovery != "SIMPLE" and log_mb > log_max:
-                        # Surface this once — admin needs to act
+                        # Surface this once — admin needs to act (auto-resolve disabled)
                         result["errors"].append({
                             "step": "log_shrink_skipped",
                             "error": f"log is {log_mb:.0f} MB but recovery={recovery}, "

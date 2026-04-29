@@ -18,13 +18,14 @@ Endpoints:
 
 import json
 import time
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, validator
 from sqlalchemy import text
 from loguru import logger
 
+from app.core.config import get_settings
 from app.database.session import get_data_engine
 from app.schemas.common import APIResponse
 from app.security.dependencies import get_current_user
@@ -33,6 +34,8 @@ from app.models.rbac import User
 from app.utils.db_helpers import (
     run_sql, get_columns as _db_get_columns, column_exists, ensure_column, get_col_type_sql,
 )
+
+_settings = get_settings()
 
 router      = APIRouter(prefix="/grid-builder", tags=["Grid Builder"])
 GRID_TABLE  = "ARS_GRID_BUILDER"
@@ -114,6 +117,47 @@ def _shrink_db_files(engine):
             logger.info(f"SHRINKFILE completed for {len(files)} file(s)")
     except Exception as e:
         logger.warning(f"SHRINKFILE failed: {e}")
+
+
+T = TypeVar("T")
+
+
+def _is_log_full_error(exc: BaseException) -> bool:
+    """SQL Server 9002 — 'transaction log for database X is full'.
+    pyodbc surfaces it as ProgrammingError SQLSTATE '42000' with '9002' in
+    the message. SQLAlchemy wraps that in DBAPIError, so we walk the chain."""
+    cur = exc
+    while cur is not None:
+        msg = str(cur)
+        if "9002" in msg and ("transaction log" in msg.lower() or "log is full" in msg.lower()):
+            return True
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "orig", None)
+        # avoid infinite loops if an exception references itself
+        if cur is exc:
+            break
+    return False
+
+
+def _retry_on_log_full(label: str, fn: Callable[[], T]) -> T:
+    """Run fn(); if Azure SQL signals 9002 (log full), wait and retry once.
+    Azure SQL DB auto-runs log backups every few minutes, so the typical
+    window between hitting 9002 and the platform clearing space is short.
+    Configurable via settings.GRID_LOG_FULL_RETRY_COUNT / _DELAY_SEC."""
+    delay = max(1, int(_settings.GRID_LOG_FULL_RETRY_DELAY_SEC))
+    max_retries = max(0, int(_settings.GRID_LOG_FULL_RETRY_COUNT))
+    attempt = 0
+    while True:
+        try:
+            return fn()
+        except Exception as e:
+            if not _is_log_full_error(e) or attempt >= max_retries:
+                raise
+            attempt += 1
+            logger.warning(
+                f"[grid] {label}: SQL 9002 log-full hit (attempt {attempt}/{max_retries}). "
+                f"Sleeping {delay}s for Azure SQL to back up the log, then retrying."
+            )
+            time.sleep(delay)
 
 
 def _ensure_grid_table(engine):
@@ -949,7 +993,28 @@ def _build_and_run_grid(engine, grid: dict) -> dict:
     LEFT JOIN dbo.vw_master_product MP2 ON CAST(PA.MATNR AS NVARCHAR(50)) = MP2.ARTICLE_NUMBER
 """
 
-        insert_sql = f""";
+        # ── Staged + chunked INSERT (avoids Azure SQL 9002 log-full) ────
+        # The original code did a single `INSERT … SELECT … PIVOT` of up to
+        # 9.85M rows, which was logged in one transaction in Rep_Data and
+        # filled the per-tier log cap before COMMIT could free space.
+        #
+        # New flow:
+        #   1. SELECT … PIVOT INTO #stage  — runs against tempdb, whose log
+        #      is always SIMPLE recovery and doesn't count against Rep_Data.
+        #   2. INSERT … SELECT FROM #stage WHERE __rn BETWEEN lo AND hi —
+        #      committed every CHUNK_SIZE rows so the platform's auto-backup
+        #      can clear log between batches.
+        #   3. DROP #stage (auto-cleaned on session close anyway).
+        # Each chunked INSERT goes through _retry_on_log_full so a transient
+        # 9002 is recovered automatically without restarting the whole grid.
+
+        chunk_size = max(10000, int(getattr(_settings, "GRID_INSERT_CHUNK_SIZE", 250000)))
+        hier_cols_sql = ", ".join(f"[{c}]" for c in hier_cols)
+        # Local temp table — bound to this session, auto-dropped at session end
+        # if the explicit DROP below fails to run for any reason.
+        stage_table = "#grid_stage_pivot"
+
+        stage_sql = f""";
 WITH Stock_CTE AS (
     SELECT
         {hier_select},
@@ -962,20 +1027,78 @@ WITH Stock_CTE AS (
       AND STK.WERKS IS NOT NULL AND STK.WERKS <> ''
     {pend_union}
 )
-INSERT INTO [{out_table}] ({all_cols})
 SELECT
-    {', '.join(f'[{c}]' for c in hier_cols)},
+    ROW_NUMBER() OVER (ORDER BY {hier_cols_sql}) AS __rn,
+    {hier_cols_sql},
     {isnull_cols},
     {sum_expr} AS STK_TTL
+INTO {stage_table}
 FROM Stock_CTE
 PIVOT (
     SUM(PARTICULARS_VALUE)
     FOR SLOC IN ({q_slocs})
-) AS P
-ORDER BY {', '.join(f'[{c}]' for c in hier_cols)};
+) AS P;
 """
-        conn.execute(text(insert_sql))
+
+        t_stage_start = time.time()
+        conn.execute(text(stage_sql))
         conn.commit()
+        total_staged = conn.execute(
+            text(f"SELECT COUNT(*) FROM {stage_table}")
+        ).scalar() or 0
+        logger.info(
+            f"[grid {grid.get('id')}] staged {total_staged} rows into {stage_table} "
+            f"in {time.time() - t_stage_start:.1f}s; chunking into {out_table} "
+            f"at {chunk_size}/chunk"
+        )
+
+        try:
+            stage_select_cols = f"{hier_cols_sql}, {q_slocs}, [STK_TTL]"
+            inserted_so_far = 0
+            chunk_idx = 0
+            lo = 1
+            while lo <= total_staged:
+                hi = lo + chunk_size - 1
+                chunk_idx += 1
+                chunk_sql = (
+                    f"INSERT INTO [{out_table}] ({all_cols}) "
+                    f"SELECT {stage_select_cols} "
+                    f"FROM {stage_table} "
+                    f"WHERE __rn BETWEEN :lo AND :hi"
+                )
+                # Capture lo/hi by value for the closure
+                _lo, _hi = lo, hi
+
+                def _do_chunk():
+                    # Explicit rollback first: if a previous attempt raised,
+                    # SQLAlchemy 2.x leaves the connection in an aborted txn
+                    # state and the next execute() would fail with
+                    # "PendingRollbackError". Idempotent on a clean conn.
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    conn.execute(text(chunk_sql), {"lo": _lo, "hi": _hi})
+                    conn.commit()
+
+                _retry_on_log_full(
+                    f"insert chunk={chunk_idx} grid={grid.get('id')} rows={_lo}-{_hi}",
+                    _do_chunk,
+                )
+                inserted_so_far += min(chunk_size, total_staged - lo + 1)
+                if chunk_idx == 1 or chunk_idx % 10 == 0 or hi >= total_staged:
+                    logger.info(
+                        f"[grid {grid.get('id')}] chunk {chunk_idx}: "
+                        f"{inserted_so_far}/{total_staged} rows committed"
+                    )
+                lo += chunk_size
+        finally:
+            # Best-effort cleanup; SQL Server auto-drops on session close anyway.
+            try:
+                conn.execute(text(f"IF OBJECT_ID('tempdb..{stage_table}') IS NOT NULL DROP TABLE {stage_table}"))
+                conn.commit()
+            except Exception as e:
+                logger.warning(f"[grid {grid.get('id')}] could not drop {stage_table}: {e}")
 
         # ── 6. Post-pivot lookups & 7. MBQ/OPT_CNT ──────────────────────
         # GEN_ART and VAR_ART grids: skip CONT lookup + MBQ/OPT_CNT
@@ -1324,10 +1447,21 @@ def _run_single_grid(grid: dict) -> dict:
     de = get_data_engine()
     start = _time.time()
 
-    # Mark running
-    with de.connect() as conn:
-        _run(conn, f"UPDATE {GRID_TABLE} SET last_run_status='Running', updated_at=GETDATE() WHERE id=:id",
-             {"id": grid["id"]})
+    # Mark running. Retry on 9002 — losing this update would leave the grid
+    # stuck on whatever status it had before (often 'Running' from a prior
+    # crashed run), and the user would have no signal that work has begun.
+    def _mark_running():
+        with de.connect() as conn:
+            _run(conn, f"UPDATE {GRID_TABLE} SET last_run_status='Running', updated_at=GETDATE() WHERE id=:id",
+                 {"id": grid["id"]})
+    try:
+        _retry_on_log_full(f"mark-running grid={grid['id']}", _mark_running)
+    except Exception as e:
+        # If the status update can't land even after retry, log and proceed —
+        # the grid run itself may still succeed and the final-status UPDATE
+        # below has its own retry. We don't want a status-write failure to
+        # block doing the actual work.
+        logger.warning(f"Could not set Running status for grid {grid['id']}: {e}")
 
     try:
         result = _build_and_run_grid(de, grid)
@@ -1350,13 +1484,22 @@ def _run_single_grid(grid: dict) -> dict:
 
     duration = round(_time.time() - start, 1)
 
-    with de.connect() as conn:
-        _run(conn, f"""
-            UPDATE {GRID_TABLE}
-            SET last_run_at=GETDATE(), last_run_status=:status,
-                last_run_rows=:rows, last_run_error=:err, duration_sec=:dur, updated_at=GETDATE()
-            WHERE id=:id
-        """, {"status": status, "rows": n_rows, "err": stored_msg, "dur": duration, "id": grid["id"]})
+    # Final-status update — also retry on 9002. This is the write that was
+    # failing in the production incident: the heavy INSERT had completed,
+    # but the log filled before this tiny UPDATE could land, leaving every
+    # grid showing the failing UPDATE as its error message.
+    def _mark_final():
+        with de.connect() as conn:
+            _run(conn, f"""
+                UPDATE {GRID_TABLE}
+                SET last_run_at=GETDATE(), last_run_status=:status,
+                    last_run_rows=:rows, last_run_error=:err, duration_sec=:dur, updated_at=GETDATE()
+                WHERE id=:id
+            """, {"status": status, "rows": n_rows, "err": stored_msg, "dur": duration, "id": grid["id"]})
+    try:
+        _retry_on_log_full(f"final-status grid={grid['id']}", _mark_final)
+    except Exception as e:
+        logger.error(f"Could not write final status for grid {grid['id']}: {e}")
     logger.info(f"Grid '{grid['grid_name']}' completed in {duration}s")
 
     return {"grid_name": grid["grid_name"], "status": status,
@@ -1364,7 +1507,12 @@ def _run_single_grid(grid: dict) -> dict:
 
 
 @router.post("/run-all", response_model=APIResponse)
-def run_all_active(current_user: User = Depends(get_current_user)):
+def run_all_active(
+    parallelism: Optional[int] = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Run every active grid. `parallelism` query param (1..GRID_RUN_PARALLELISM_MAX)
+    overrides the configured default for this single invocation."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     de = get_data_engine()
@@ -1387,9 +1535,21 @@ def run_all_active(current_user: User = Depends(get_current_user)):
     calc_warns, calc_duration = _build_calc_table_once()
     logger.info(f"Calc table built once for {len(active_grids)} grids")
 
-    # Run all grids in parallel (max 4 threads)
+    # Parallelism. Each grid INSERTs into its own output table and reads with
+    # NOLOCK, so there is no row contention between threads. Earlier code
+    # forced 1 worker because LOG_BACKUP wait could fill the log on parallel
+    # heavy INSERTs — that's now auto-resolved by the post-job cleanup.
+    cfg_default = max(1, int(getattr(_settings, "GRID_RUN_PARALLELISM", 4)))
+    cap         = max(1, int(getattr(_settings, "GRID_RUN_PARALLELISM_MAX", 16)))
+    requested   = parallelism if parallelism is not None else cfg_default
+    workers = max(1, min(int(requested), cap, len(active_grids)))
+    logger.info(
+        f"Run All Active: {len(active_grids)} grids, parallelism={workers} "
+        f"(requested={requested}, default={cfg_default}, cap={cap})"
+    )
+
     results = []
-    with ThreadPoolExecutor(max_workers=min(4, len(active_grids))) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_run_single_grid, grid): grid for grid in active_grids}
         for future in as_completed(futures):
             try:
