@@ -105,14 +105,17 @@ export default function TableDataPage() {
       const headerW = Math.ceil(header.length * 7.5) + 30
       const baseMin = isNum ? 75 : isDate ? 110 : isText ? 120 : 90
       const width = Math.max(headerW, baseMin)
+      const restriction = restrictionMap[col.column_name]
+      const rlsReadOnly = restriction && restriction.is_visible && !restriction.can_edit
       return {
         field: col.column_name,
         headerName: header,
         sortable: true,
         filter: true,
         resizable: true,
-        editable: hasPermission('DATA_EDIT') && !col.is_primary_key,
-        cellClass: col.is_primary_key ? 'ag-cell-pk' : '',
+        editable: hasPermission('DATA_EDIT') && !col.is_primary_key && !rlsReadOnly,
+        cellClass: col.is_primary_key ? 'ag-cell-pk' : rlsReadOnly ? 'ag-cell-rls-readonly' : '',
+        headerClass: rlsReadOnly ? 'ag-header-rls-readonly' : '',
         width,
         minWidth: 70,
       }
@@ -343,7 +346,11 @@ export default function TableDataPage() {
   }, [])
 
   const exportCSV = () => {
-    const headers = schema?.columns?.map(c => c.column_name) || []
+    const restrictionMap = Object.fromEntries(colRestrictions.map(r => [r.column_name, r]))
+    const headers = (schema?.columns?.map(c => c.column_name) || []).filter(col => {
+      const r = restrictionMap[col]
+      return !r || (r.is_visible && !r.is_masked)
+    })
     const csv = [headers.join(','), ...rowData.map(r => headers.map(h => `"${r[h] ?? ''}"`).join(','))].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${tableName}.csv`; a.click()
@@ -419,6 +426,10 @@ export default function TableDataPage() {
             const colId = params.column?.getColId()
             if (colId && isCellSelected(params.rowIndex, colId)) {
               return { backgroundColor: '#bfdbfe', color: '#1e3a5f', fontWeight: 500 }
+            }
+            const r = colRestrictions.find(x => x.column_name === colId)
+            if (r && r.is_visible && !r.can_edit) {
+              return { backgroundColor: '#f3f4f6', color: '#6b7280' }
             }
             return null
           }}

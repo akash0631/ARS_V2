@@ -99,11 +99,14 @@
 }
 .ag-theme-alpine .ag-header-cell-label { font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; }
 .ag-theme-alpine .ag-header { border-bottom: 2px solid #e5e7eb; }
-.ag-theme-alpine .ag-cell { display: flex; align-items: center; font-size: 9px; font-weight: 400; }
+.ag-theme-alpine .ag-cell { display: flex; align-items: center; font-size: 9px; font-weight: 400; border-right: 1px solid #e5e7eb !important; border-bottom: 1px solid #e5e7eb !important; }
+.ag-theme-alpine .ag-row { border-bottom: none; }
 .ag-theme-alpine .ag-row-selected { background-color: #bfdbfe !important; }
 .ag-theme-alpine .ag-row-selected:hover { background-color: #93c5fd !important; }
 .ag-theme-alpine .ag-row-selected .ag-cell { color: #1e3a5f; font-weight: 500; }
 .ag-theme-alpine .ag-cell-pk { font-weight: 600; background: #f8fafc; }
+.ag-theme-alpine .ag-cell-rls-readonly { background-color: #f3f4f6 !important; color: #6b7280; }
+.ag-theme-alpine .ag-header-rls-readonly .ag-header-cell-label { color: #9ca3af; font-style: italic; }
 .ag-theme-alpine .ag-floating-filter-input { font-size: 9px !important; }
 .ag-theme-alpine .ag-paging-panel { font-size: 9px !important; height: 24px; }
 .ag-theme-alpine .ag-paging-page-size .ag-select { font-size: 9px !important; }
