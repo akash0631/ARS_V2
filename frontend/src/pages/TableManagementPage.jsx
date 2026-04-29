@@ -22,6 +22,11 @@ export default function TableManagementPage() {
   const [reordering, setReordering] = useState(false)
   const [dragIdx, setDragIdx] = useState(null)
 
+  // Truncate job progress (background job + polling)
+  const [truncateJob, setTruncateJob] = useState(null)
+  // truncateJob shape:
+  //   { jobId, table, status, phase, percent, processed, total, method?, error? }
+
   const suffixes = ['', 'MST', 'TXN', 'ALC', 'STK', 'RPT', 'TMP', 'LOG']
 
   useEffect(() => { fetchTables() }, [])
@@ -312,14 +317,128 @@ export default function TableManagementPage() {
           onClose={() => setShowTruncate(false)}
           onConfirm={async () => {
             try {
-              await tablesAPI.truncate(selectedTable)
-              toast.success('Table truncated')
+              const { data } = await tablesAPI.truncate(selectedTable)
+              const jobId = data?.data?.job_id
+              if (!jobId) throw new Error('Backend did not return a job id')
               setShowTruncate(false)
+              setTruncateJob({
+                jobId, table: selectedTable, status: 'queued',
+                phase: 'queued', percent: 0, processed: 0, total: 0,
+              })
+
+              // Poll until done/failed (or 5 minutes safety cap)
+              const deadline = Date.now() + 300000
+              while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 700))
+                try {
+                  const res = await tablesAPI.truncateProgress(jobId)
+                  const rec = res.data?.data || {}
+                  setTruncateJob({
+                    jobId,
+                    table: selectedTable,
+                    status: rec.status,
+                    phase: rec.phase,
+                    percent: rec.percent ?? 0,
+                    processed: rec.processed ?? 0,
+                    total: rec.total ?? 0,
+                    method: rec.method,
+                    rowsDeleted: rec.rows_deleted,
+                    error: rec.error,
+                  })
+                  if (rec.status === 'done') {
+                    toast.success(
+                      `Truncated ${rec.rows_deleted ?? 0} rows via ${rec.method || 'TRUNCATE'}`,
+                    )
+                    break
+                  }
+                  if (rec.status === 'failed') {
+                    toast.error(`Truncate failed: ${rec.error || 'unknown error'}`,
+                      { duration: 8000 })
+                    break
+                  }
+                } catch {
+                  // transient — keep polling
+                }
+              }
             } catch (err) {
-              toast.error(err.response?.data?.detail || 'Failed to truncate')
+              toast.error(err.response?.data?.detail || 'Failed to start truncate')
             }
           }}
         />
+      )}
+
+      {/* Truncate Progress Modal */}
+      {truncateJob && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center">
+          <div className="bg-white rounded-lg shadow-xl w-[420px] p-6 space-y-4">
+            <div className="flex items-center gap-2">
+              <RefreshCw size={18} className={
+                truncateJob.status === 'done' || truncateJob.status === 'failed'
+                  ? 'text-gray-400'
+                  : 'animate-spin text-orange-600'
+              } />
+              <h3 className="font-semibold text-gray-900">
+                Truncating {truncateJob.table}
+              </h3>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-gray-600 capitalize">
+                  {truncateJob.status === 'done'
+                    ? (truncateJob.method === 'truncate'
+                        ? 'TRUNCATE TABLE complete'
+                        : `Batched DELETE complete`)
+                    : truncateJob.status === 'failed'
+                      ? 'Failed'
+                      : (truncateJob.phase || 'starting…')}
+                </span>
+                <span className="font-semibold text-gray-900 tabular-nums">
+                  {truncateJob.percent}%
+                </span>
+              </div>
+              <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all ${
+                    truncateJob.status === 'failed'
+                      ? 'bg-red-500'
+                      : truncateJob.status === 'done'
+                        ? 'bg-green-500'
+                        : 'bg-orange-500'
+                  }`}
+                  style={{ width: `${truncateJob.percent}%` }}
+                />
+              </div>
+              {truncateJob.total > 0 && (
+                <div className="text-xs text-gray-500 tabular-nums">
+                  {(truncateJob.processed ?? 0).toLocaleString()} / {truncateJob.total.toLocaleString()} rows
+                </div>
+              )}
+              {truncateJob.error && (
+                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">
+                  {truncateJob.error}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end pt-2">
+              <button
+                disabled={truncateJob.status !== 'done' && truncateJob.status !== 'failed'}
+                onClick={() => {
+                  setTruncateJob(null)
+                  if (selectedTable) fetchSchema(selectedTable)
+                }}
+                className={`px-4 py-2 rounded-lg text-sm font-medium ${
+                  truncateJob.status === 'done' || truncateJob.status === 'failed'
+                    ? 'bg-gray-100 hover:bg-gray-200 text-gray-700'
+                    : 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                }`}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Drop Table Confirm Modal */}

@@ -4,6 +4,16 @@ import { Upload, FileSpreadsheet, Eye, ArrowRight, Check, AlertCircle, Download,
 import { uploadAPI, tablesAPI, checklistAPI } from '@/services/api'
 import toast from 'react-hot-toast'
 
+// Human-friendly duration: 950ms → "950ms", 57 154ms → "57.2s", 90 500ms → "1m 30s"
+function fmtDuration(ms) {
+  if (ms == null || isNaN(ms)) return '-'
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60_000)
+  const s = Math.round((ms % 60_000) / 1000)
+  return `${m}m ${s}s`
+}
+
 // Dropdown with search and keyboard navigation - Using input-based approach like DataEditorPage
 function SearchDropdown({ options, value, onChange, placeholder, icon: Icon }) {
   const [open, setOpen] = useState(false)
@@ -563,7 +573,7 @@ export default function UploadPage() {
                         <td className="py-2 text-right text-green-600">{j.inserted_rows?.toLocaleString() || 0}</td>
                         <td className="py-2 text-right text-blue-600">{j.updated_rows?.toLocaleString() || 0}</td>
                         <td className="py-2 text-right text-red-600">{j.error_rows?.toLocaleString() || 0}</td>
-                        <td className="py-2 text-right text-gray-500">{j.duration_ms ? `${(j.duration_ms / 1000).toFixed(1)}s` : '-'}</td>
+                        <td className="py-2 text-right text-gray-500">{fmtDuration(j.duration_ms)}</td>
                         <td className="py-2 text-gray-500 text-xs">{j.created_at ? new Date(j.created_at).toLocaleString() : '-'}</td>
                         <td className="py-2 text-center">
                           <div className="flex items-center justify-center gap-1">
@@ -854,7 +864,7 @@ export default function UploadPage() {
                 ))
               )}
             </div>
-            <div className="text-xs text-gray-500 mt-3">Batch: {result.batch_id} • Duration: {result.duration_ms || result.total_duration_ms}ms</div>
+            <div className="text-xs text-gray-500 mt-3">Batch: {result.batch_id} • Duration: {fmtDuration(result.duration_ms ?? result.total_duration_ms)}</div>
             
             {/* Error Details */}
             {result.error_details && result.error_details.length > 0 && (
@@ -959,7 +969,7 @@ export default function UploadPage() {
                   <div className="text-xs text-gray-500">Errors</div>
                 </div>
                 <div className="bg-gray-50 p-3 rounded-lg">
-                  <div className="text-2xl font-bold">{batchReport.duration_ms ? `${(batchReport.duration_ms / 1000).toFixed(1)}s` : '-'}</div>
+                  <div className="text-2xl font-bold">{fmtDuration(batchReport.duration_ms)}</div>
                   <div className="text-xs text-gray-500">Duration</div>
                 </div>
               </div>

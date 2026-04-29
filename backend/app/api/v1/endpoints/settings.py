@@ -471,14 +471,20 @@ async def apply_database_settings(
     # ---- Step 5: Ensure system schema exists on the new DB ----
     # If the user pointed us at a fresh / wrong database, the rbac_users etc.
     # tables won't exist and every authenticated endpoint will return 500.
-    # Auto-create them (mirrors main.py lifespan), then verify the table is
-    # actually queryable. If we can't make this work, refuse the save.
+    # Auto-create them (mirrors main.py lifespan), reconcile any columns the
+    # model has that the DB lacks, then verify the table is actually
+    # queryable. If we can't make this work, surface a warning.
     try:
-        from app.database.session import system_engine as _sys_engine, Base
+        from app.database.session import (
+            system_engine as _sys_engine, Base, reconcile_columns,
+        )
         import app.models.rbac  # noqa - registers RBAC tables on Base
         import app.models.rls   # noqa
         import app.models.audit # noqa
         Base.metadata.create_all(bind=_sys_engine, checkfirst=True)
+        added_cols = reconcile_columns(_sys_engine)
+        if added_cols:
+            logger.info(f"Schema reconcile (apply_database_settings): {added_cols}")
 
         with _sys_engine.connect() as conn:
             conn.execute(text("SELECT TOP 1 1 FROM rbac_users"))

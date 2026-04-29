@@ -119,7 +119,7 @@ class Settings(BaseSettings):
 
     # File Upload / Storage
     MAX_UPLOAD_SIZE_MB: int = 100
-    UPLOAD_CHUNK_SIZE: int = 2000
+    UPLOAD_CHUNK_SIZE: int = 10000
     ALLOWED_EXTENSIONS: str = ".csv,.xlsx,.xls"
     USE_BLOB_STORAGE: bool = False           # True in production (Azure Blob)
     AZURE_STORAGE_CONNECTION_STRING: str = ""
@@ -199,6 +199,14 @@ class Settings(BaseSettings):
             f"PWD={c['password']};"
             f"TrustServerCertificate={c['trust_cert']};"
             f"Encrypt={'yes' if str(c['encrypt']).lower() == 'yes' else 'no'};"
+            # Azure SQL transient-error resilience — driver retries the initial
+            # connect on errors like 40613 (DB unavailable), 40501 (service
+            # busy), 49918 (cannot process request), and serverless wake-up.
+            # Without these, the first request after auto-pause fails outright.
+            f"ConnectRetryCount=5;"
+            f"ConnectRetryInterval=10;"
+            # 60s allows a paused serverless DB to spin back up.
+            f"Connection Timeout=60;"
         )
         return f"mssql+pyodbc:///?odbc_connect={quote_plus(odbc)}"
 

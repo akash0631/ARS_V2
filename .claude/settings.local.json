@@ -34,7 +34,9 @@
       "Bash(wc -l /d/ars/frontend/src/pages/*.jsx)",
       "Bash(wc -l backend/app/api/v1/endpoints/*.py)",
       "Bash(python:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Bash(node --check ../frontend/src/pages/UploadPage.jsx)",
+      "mcp__claude_ai_sap_hht__ars_jobs"
     ]
   }
 }

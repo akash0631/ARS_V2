@@ -4,15 +4,19 @@ Dynamic Table Management API Endpoints
 import io
 import os
 import logging
+import threading
+import time
+import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Body
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-from app.database.session import get_db
+from app.database.session import get_db, SessionLocal
 from app.schemas.table_mgmt import CreateTableRequest, AlterTableRequest
 from app.schemas.common import APIResponse
 from app.services.table_mgmt_service import TableManagementService
@@ -20,6 +24,43 @@ from app.security.dependencies import get_current_user, RequirePermissions
 from app.models.rbac import User
 
 router = APIRouter(prefix="/tables", tags=["Table Management"])
+
+
+# ============================================================================
+# In-memory progress map for long-running truncate jobs.
+# We don't persist these — a backend restart cancels in-flight truncates,
+# but TRUNCATE TABLE itself is autocommit on the SQL side so the data is
+# already gone by the time the client polls.
+# ============================================================================
+_truncate_jobs: Dict[str, Dict[str, Any]] = {}
+_truncate_lock = threading.Lock()
+_TRUNCATE_TTL_SEC = 600  # forget completed/failed jobs after 10 min
+
+
+def _truncate_progress_set(job_id: str, **fields) -> None:
+    """Thread-safe update of an in-memory truncate-progress record."""
+    with _truncate_lock:
+        rec = _truncate_jobs.setdefault(job_id, {})
+        rec.update(fields)
+        rec["updated_at"] = time.time()
+
+
+def _truncate_progress_get(job_id: str) -> Optional[Dict[str, Any]]:
+    with _truncate_lock:
+        rec = _truncate_jobs.get(job_id)
+        return dict(rec) if rec else None
+
+
+def _truncate_progress_gc() -> None:
+    """Drop records that have been finished and idle for a while."""
+    now = time.time()
+    with _truncate_lock:
+        for jid in list(_truncate_jobs.keys()):
+            rec = _truncate_jobs[jid]
+            if rec.get("status") in ("done", "failed") and (
+                now - rec.get("updated_at", now) > _TRUNCATE_TTL_SEC
+            ):
+                _truncate_jobs.pop(jid, None)
 
 
 # ============================================================================
@@ -936,6 +977,54 @@ async def query_table_data(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _run_truncate_job(job_id: str, table_name: str, username: str) -> None:
+    """Background worker — runs truncate in its own DB session and reports
+    progress through the in-memory _truncate_jobs map."""
+    db = SessionLocal()
+    try:
+        _truncate_progress_set(
+            job_id, status="running", phase="connecting", processed=0, total=0,
+            started_at=datetime.utcnow().isoformat(),
+        )
+
+        def cb(processed: int, total: int, phase: str) -> None:
+            pct = 0
+            if total and total > 0:
+                pct = int(min(100, round(100.0 * processed / total)))
+            _truncate_progress_set(
+                job_id, processed=processed, total=total,
+                phase=phase, percent=pct,
+            )
+
+        service = TableManagementService(db)
+        result = service.truncate_table_data(
+            table_name, deleted_by=username, progress_cb=cb,
+        )
+        _truncate_progress_set(
+            job_id, status="done", phase="done", percent=100,
+            rows_deleted=result.get("rows_deleted", 0),
+            method=result.get("method"),
+            finished_at=datetime.utcnow().isoformat(),
+        )
+        logger.info(
+            f"[truncate {job_id}] done — {result.get('rows_deleted')} rows "
+            f"via {result.get('method')}"
+        )
+    except Exception as e:
+        logger.exception(f"[truncate {job_id}] failed")
+        _truncate_progress_set(
+            job_id, status="failed", phase="failed",
+            error=str(e)[:300],
+            finished_at=datetime.utcnow().isoformat(),
+        )
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+        _truncate_progress_gc()
+
+
 @router.delete(
     "/{table_name}/data",
     response_model=APIResponse,
@@ -944,15 +1033,57 @@ async def query_table_data(
 async def truncate_table_data(
     table_name: str,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
 ):
-    """Delete all data from a table (does NOT drop the table)."""
-    try:
-        service = TableManagementService(db)
-        result = service.truncate_table_data(table_name, deleted_by=current_user.username)
-        return APIResponse(data=result, message="Table data deleted")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Delete all data from a table (does NOT drop the table).
+
+    Runs as a background job so the HTTP request returns immediately with a
+    `job_id`. Poll `GET /tables/truncate/progress/{job_id}` to drive a
+    progress bar in the UI.
+
+    The service tries `TRUNCATE TABLE` first (milliseconds, minimally logged,
+    no escalated lock); if a foreign-key constraint blocks TRUNCATE it falls
+    back to batched `DELETE TOP (N)` with autocommit between batches so the
+    log can checkpoint and other queries can interleave.
+    """
+    job_id = f"TRUNC_{uuid.uuid4().hex[:10]}"
+    _truncate_progress_set(
+        job_id,
+        status="queued",
+        phase="queued",
+        table=table_name,
+        user=current_user.username,
+        percent=0,
+        processed=0,
+        total=0,
+        created_at=datetime.utcnow().isoformat(),
+    )
+    threading.Thread(
+        target=_run_truncate_job,
+        args=(job_id, table_name, current_user.username),
+        name=f"truncate-{job_id}",
+        daemon=True,
+    ).start()
+    return APIResponse(
+        data={"job_id": job_id, "status": "queued", "table": table_name},
+        message="Truncate started — poll /tables/truncate/progress/{job_id}",
+    )
+
+
+@router.get(
+    "/truncate/progress/{job_id}",
+    response_model=APIResponse,
+    dependencies=[Depends(RequirePermissions(["TABLE_DELETE"]))],
+)
+async def get_truncate_progress(
+    job_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Poll endpoint for the progress bar. Returns
+    `{status, phase, percent, processed, total, rows_deleted?, method?, error?}`."""
+    rec = _truncate_progress_get(job_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Unknown or expired truncate job")
+    return APIResponse(data=rec)
 
 
 # ============================================================================

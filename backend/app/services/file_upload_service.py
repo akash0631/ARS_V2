@@ -7,6 +7,7 @@ Supports 1M+ rows via chunked reading.
 import os
 import uuid
 import time
+import asyncio
 from typing import Optional, List, Dict, Any
 from io import BytesIO
 
@@ -86,9 +87,11 @@ class FileUploadService:
         with open(saved_path, "wb") as f:
             f.write(file_content)
 
-        # Read file into DataFrame
+        # Read file into DataFrame — off the event loop (pandas/openpyxl is sync & slow)
         try:
-            df = self._read_file(file_content, ext, skip_rows, sheet_name)
+            df = await asyncio.to_thread(
+                self._read_file, file_content, ext, skip_rows, sheet_name
+            )
         except Exception as e:
             raise ValueError(f"Failed to read file: {e}")
 
@@ -139,17 +142,23 @@ class FileUploadService:
                 logger.warning(f"[{batch_id}] Dropping {bad_pk.sum()} rows with blank/null PK '{pk}'")
                 df = df[~bad_pk]
 
-        # Pre-validate data types before upsert — gives users actionable error details
-        validation_errors = self.upsert_engine.validate_data_types(
-            table_name=table_name,
-            df=df,
-            max_errors=200,
+        # Pre-validate data types before upsert — gives users actionable error details.
+        # Off the event loop: vectorized pandas, but still seconds on wide frames.
+        validation_errors = await asyncio.to_thread(
+            self.upsert_engine.validate_data_types,
+            table_name,
+            df,
+            200,
         )
         if validation_errors:
             logger.warning(f"[{batch_id}] {len(validation_errors)} type validation errors found")
 
-        # Execute upsert (proceed even with warnings — TRY_CAST handles gracefully)
-        result = self.upsert_engine.upsert(
+        # Execute upsert (proceed even with warnings — TRY_CAST handles gracefully).
+        # CRITICAL: must run off the event loop. The upsert is sync pyodbc and
+        # holds the loop for minutes — every other API request (Data Checklist,
+        # health checks, dashboard, etc.) queues behind it until it returns.
+        result = await asyncio.to_thread(
+            self.upsert_engine.upsert,
             table_name=table_name,
             df=df,
             primary_key_columns=primary_key_columns,
@@ -263,9 +272,11 @@ class FileUploadService:
         with open(saved_path, "wb") as f:
             f.write(file_content)
 
-        # Read file into DataFrame
+        # Read file into DataFrame — off the event loop
         try:
-            df = self._read_file(file_content, ext, skip_rows, sheet_name)
+            df = await asyncio.to_thread(
+                self._read_file, file_content, ext, skip_rows, sheet_name
+            )
         except Exception as e:
             raise ValueError(f"Failed to read file: {e}")
 
@@ -299,77 +310,71 @@ class FileUploadService:
             logger.warning(f"[{batch_id}] Dropping {null_pk_count} rows with null PKs")
             df = df[~pk_null_mask]
 
-        # Process deletions
-        total = len(df)
-        deleted = 0
-        not_found = 0
-        errors = 0
-        error_details = []
-
-        # Import here to avoid circular imports
-        from app.models.audit import AuditLog
+        # Process deletions — entire loop runs off the event loop so concurrent
+        # API requests (Data Checklist, dashboards, etc.) stay responsive.
         from sqlalchemy import text as sa_text
-        from datetime import datetime
-        import json
+        from app.database.session import get_data_engine
+        data_engine = get_data_engine()
 
-        # Create engine for data database
-        from app.core.config import get_settings
-        from sqlalchemy import create_engine
-        settings = get_settings()
-        data_engine = create_engine(settings.DATA_DATABASE_URL)
+        def _run_deletes():
+            deleted_n = 0
+            not_found_n = 0
+            errors_n = 0
+            errs: List[str] = []
+            changes: List[Dict[str, Any]] = []
 
-        row_changes = []
-        for idx, row in df.iterrows():
-            try:
-                # Build WHERE clause
-                where_parts = []
-                params = {}
-                for pk in primary_key_columns:
-                    val = row[pk]
-                    if pd.isna(val):
+            for idx, row in df.iterrows():
+                try:
+                    where_parts = []
+                    params: Dict[str, Any] = {}
+                    for pk in primary_key_columns:
+                        val = row[pk]
+                        if pd.isna(val):
+                            continue
+                        param_name = f"pk_{pk}"
+                        where_parts.append(f"[{pk}] = :{param_name}")
+                        params[param_name] = val
+
+                    if not where_parts:
+                        not_found_n += 1
                         continue
-                    param_name = f"pk_{pk}"
-                    where_parts.append(f"[{pk}] = :{param_name}")
-                    params[param_name] = val
 
-                if not where_parts:
-                    not_found += 1
-                    continue
+                    where_clause = " AND ".join(where_parts)
 
-                where_clause = " AND ".join(where_parts)
+                    with data_engine.connect() as data_conn:
+                        existing_row = data_conn.execute(
+                            sa_text(f"SELECT * FROM [{table_name}] WHERE {where_clause}"),
+                            params,
+                        ).fetchone()
 
-                # First, fetch the existing record for audit log
-                select_sql = f"SELECT * FROM [{table_name}] WHERE {where_clause}"
-                with data_engine.connect() as data_conn:
-                    result = data_conn.execute(sa_text(select_sql), params)
-                    existing_row = result.fetchone()
+                        if not existing_row:
+                            not_found_n += 1
+                            continue
 
-                if not existing_row:
-                    not_found += 1
-                    continue
+                        data_conn.execute(
+                            sa_text(f"DELETE FROM [{table_name}] WHERE {where_clause}"),
+                            params,
+                        )
+                        data_conn.commit()
 
-                # Delete the row
-                delete_sql = f"DELETE FROM [{table_name}] WHERE {where_clause}"
-                with data_engine.connect() as data_conn:
-                    data_conn.execute(sa_text(delete_sql), params)
-                    data_conn.commit()
+                    pk_value = "|".join(str(row[pk]) for pk in primary_key_columns)
+                    old_data = {k: str(v) if v is not None else None for k, v in existing_row._mapping.items()}
+                    changes.append({
+                        "action_type": "DELETE",
+                        "record_key": pk_value,
+                        "changes": None,
+                        "old_data": old_data,
+                    })
+                    deleted_n += 1
+                except Exception as e:
+                    errors_n += 1
+                    errs.append(f"Row {idx + 1}: {str(e)}")
+                    logger.error(f"[{batch_id}] Error deleting row {idx + 1}: {e}")
 
-                # Log deletion to audit
-                pk_value = "|".join(str(row[pk]) for pk in primary_key_columns)
-                old_data = {k: str(v) if v is not None else None for k, v in existing_row._mapping.items()}
-                row_changes.append({
-                    "action_type": "DELETE",
-                    "record_key": pk_value,
-                    "changes": None,
-                    "old_data": old_data,
-                })
+            return deleted_n, not_found_n, errors_n, errs, changes
 
-                deleted += 1
-
-            except Exception as e:
-                errors += 1
-                error_details.append(f"Row {idx + 1}: {str(e)}")
-                logger.error(f"[{batch_id}] Error deleting row {idx + 1}: {e}")
+        total = len(df)
+        deleted, not_found, errors, error_details, row_changes = await asyncio.to_thread(_run_deletes)
 
         # Log DataChangeLog for batch details (delete)
         from app.services.audit_service import log_bulk_changes
