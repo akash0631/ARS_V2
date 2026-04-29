@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from app.core.config import get_settings
-from app.database.session import check_db_connection, check_data_db_connection, SessionLocal, enable_rcsi, Base, system_engine
+from app.database.session import check_db_connection, check_data_db_connection, SessionLocal, enable_rcsi, Base, system_engine, reconcile_columns
 from app.services.tempdb_cleanup_service import tempdb_cleaner
 from app.api.v1.router import api_router
 from app.middleware.exception_handler import global_exception_handler, request_logging_middleware, auto_free_space_middleware
@@ -70,6 +70,13 @@ async def lifespan(app: FastAPI):
         import app.models.audit # noqa
         Base.metadata.create_all(bind=system_engine, checkfirst=True)
         logger.info("System DB tables verified")
+        # create_all only handles MISSING TABLES — never adds new columns
+        # to existing ones. Run reconcile_columns to ALTER TABLE ADD any
+        # model columns that exist in code but not in the live DB
+        # (e.g. upload_jobs.validation_errors after a model update).
+        added = reconcile_columns(system_engine)
+        if added:
+            logger.info(f"Schema reconcile added columns: {added}")
     except Exception as e:
         logger.warning(f"Table auto-create: {e}")
 

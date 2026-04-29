@@ -128,35 +128,48 @@ class UpsertEngine:
         # Locks target table for seconds instead of minutes
         if total_rows > 1000:
             logger.info(f"[{batch_id}] Fast bulk upsert: {total_rows} rows → {table_name}")
+            bulk_ok = False
             try:
                 ins, upd = self._bulk_upsert(
                     table_name, df, primary_key_columns, target_columns,
                     batch_id, progress_callback, cancel_check,
                 )
-                total_inserted = ins
-                total_updated = upd
-                total_unchanged = total_rows - ins - upd
-
-                # Audit summary
-                self.audit.log_data_change(
-                    table_name=table_name, changed_by=changed_by, action="BULK_UPSERT",
-                    source=source, ip_address=ip_address, batch_id=batch_id,
-                    details={"inserted": ins, "updated": upd, "total": total_rows},
-                )
-                self.db.commit()
-
-                if progress_callback:
-                    progress_callback(total_rows, total_rows)
-
-                return self._build_result(
-                    table_name, batch_id, total_inserted, total_updated,
-                    total_unchanged, 0, total_rows, start_time, {},
-                )
+                bulk_ok = True
             except InterruptedError:
                 raise
             except Exception as e:
                 logger.warning(f"[{batch_id}] Fast bulk failed, falling back to chunked MERGE: {e}")
                 # Fall through to chunked approach
+
+            if bulk_ok:
+                total_inserted = ins
+                total_updated = upd
+                total_unchanged = total_rows - ins - upd
+
+                # Audit summary — best-effort; failure here MUST NOT trigger re-processing
+                try:
+                    self.audit.log_bulk_upsert(
+                        table_name=table_name,
+                        changed_by=changed_by,
+                        row_count=ins + upd,
+                        batch_id=batch_id,
+                        duration_ms=int((time.time() - start_time) * 1000),
+                        notes=f"Inserted: {ins}, Updated: {upd}, Total: {total_rows}",
+                        source=source,
+                        ip_address=ip_address,
+                    )
+                    self.db.commit()
+                except Exception as e:
+                    logger.warning(f"[{batch_id}] Audit log failed (data already upserted): {e}")
+
+                if progress_callback:
+                    progress_callback(total_rows, total_rows)
+
+                return self._build_result(
+                    table_name, batch_id, total_rows,
+                    total_inserted, total_updated, total_unchanged,
+                    0, start_time, {},
+                )
 
         # ── STANDARD PATH: Chunked MERGE (for small datasets or fallback) ─
         total_chunks = (len(df) + chunk_size - 1) // chunk_size
@@ -320,34 +333,55 @@ class UpsertEngine:
         staging = f"#bulk_stage_{batch_id}"
         non_pk_cols = [c for c in df.columns if c not in primary_key_columns]
         total_rows = len(df)
+        t_start = time.time()
 
         conn = self.engine.raw_connection()
         try:
             cursor = conn.cursor()
 
-            # 1. Create staging table (all NVARCHAR to handle __SKIP__/__NULL__)
-            col_defs = ", ".join(f"[{c}] NVARCHAR(MAX) NULL" for c in df.columns)
+            # 1. Create staging table — NVARCHAR(4000), NOT MAX.
+            # fast_executemany has a known pathology with NVARCHAR(MAX) (LOB):
+            # it allocates a per-cell buffer sized for the max LOB length, so
+            # bigger batches make memory use explode and the driver thrashes
+            # instead of speeding up. Bounded NVARCHAR(4000) lets the driver
+            # use a fixed wide buffer (~8 KB/cell) and scale linearly with
+            # batch size. 4000 is the upper bound for non-LOB nvarchar in
+            # SQL Server; longer values would need MAX (extremely rare for
+            # the data we stage — markers are short, IDs are short).
+            col_defs = ", ".join(f"[{c}] NVARCHAR(4000) NULL" for c in df.columns)
             cursor.execute(f"CREATE TABLE {staging} ({col_defs})")
+            t_create = time.time()
 
-            # 2. Bulk insert into staging in batches of 5000 (no locks on target!)
+            # 2. Bulk insert into staging (no locks on target!)
             insert_cols = list(df.columns)
             placeholders = ", ".join(["?" for _ in insert_cols])
             col_list = ", ".join([f"[{c}]" for c in insert_cols])
             insert_sql = f"INSERT INTO {staging} ({col_list}) VALUES ({placeholders})"
 
+            # Vectorized NaN→None — replaces iterrows (~100x faster on large frames)
+            df_for_insert = df[insert_cols].astype(object).where(df[insert_cols].notna(), None)
+            all_rows = df_for_insert.values.tolist()
+            t_prep = time.time()
+
             cursor.fast_executemany = True
-            batch_size = 5000
+            # Pin the per-parameter buffer width so pyodbc doesn't guess long
+            # values: (SQL_WVARCHAR, 4000, 0). Without this, pyodbc inspects
+            # the first row to size buffers and can mis-size on later rows.
+            try:
+                cursor.setinputsizes([(-9, 4000, 0)] * len(insert_cols))  # -9 = SQL_WVARCHAR
+            except Exception:
+                pass
+            # 20k batch — sweet spot for Azure SQL with NVARCHAR(4000) staging.
+            # Each batch is one TDS round-trip; bigger batches cut round-trips
+            # but also enlarge the driver's parameter array. Past ~20k the
+            # marginal speedup tapers and memory/GC overhead starts winning.
+            # Tune via UPSERT_STAGE_BATCH_SIZE if you want to experiment.
+            batch_size = 20000
             for i in range(0, total_rows, batch_size):
                 if cancel_check and cancel_check():
                     raise InterruptedError("Cancelled")
 
-                batch = df.iloc[i:i + batch_size]
-                rows = []
-                for _, row in batch.iterrows():
-                    rows.append(tuple(
-                        None if pd.isna(v) else v for v in (row[c] for c in insert_cols)
-                    ))
-                cursor.executemany(insert_sql, rows)
+                cursor.executemany(insert_sql, all_rows[i:i + batch_size])
 
                 if progress_callback:
                     progress_callback(min(i + batch_size, total_rows), total_rows)
@@ -355,7 +389,13 @@ class UpsertEngine:
                 logger.info(f"[{batch_id}] Staged {min(i + batch_size, total_rows)}/{total_rows} rows")
 
             conn.commit()
-            logger.info(f"[{batch_id}] Staging complete. Running UPDATE + INSERT...")
+            t_stage = time.time()
+            stage_secs = max(t_stage - t_prep, 0.001)
+            logger.info(
+                f"[{batch_id}] Staging complete in {t_stage - t_prep:.2f}s "
+                f"({total_rows / stage_secs:.0f} rows/s, prep={t_prep - t_create:.2f}s). "
+                f"Running UPDATE + INSERT..."
+            )
 
             # Helper: TRY_CAST for type conversion
             def cast(col, alias="s"):
@@ -396,7 +436,8 @@ class UpsertEngine:
                 updated = 0
 
             conn.commit()
-            logger.info(f"[{batch_id}] Updated {updated} rows")
+            t_update = time.time()
+            logger.info(f"[{batch_id}] Updated {updated} rows in {t_update - t_stage:.2f}s")
 
             # 4. INSERT new rows (ROWLOCK)
             all_cols = primary_key_columns + non_pk_cols
@@ -417,11 +458,23 @@ class UpsertEngine:
             cursor.execute(insert_new_sql)
             inserted = cursor.rowcount
             conn.commit()
-            logger.info(f"[{batch_id}] Inserted {inserted} new rows")
+            t_insert = time.time()
+            logger.info(f"[{batch_id}] Inserted {inserted} new rows in {t_insert - t_update:.2f}s")
 
             # 5. Cleanup
             cursor.execute(f"DROP TABLE IF EXISTS {staging}")
             conn.commit()
+            t_drop = time.time()
+            logger.info(
+                f"[{batch_id}] BULK UPSERT TIMINGS — "
+                f"create={t_create - t_start:.2f}s "
+                f"prep={t_prep - t_create:.2f}s "
+                f"stage={t_stage - t_prep:.2f}s "
+                f"update={t_update - t_stage:.2f}s "
+                f"insert={t_insert - t_update:.2f}s "
+                f"drop={t_drop - t_insert:.2f}s "
+                f"total={t_drop - t_start:.2f}s"
+            )
 
             return inserted, updated
 
@@ -466,6 +519,7 @@ class UpsertEngine:
         non_pk_columns = [c for c in chunk_df.columns if c not in primary_key_columns]
         changed_columns_count: Dict[str, int] = {}
         row_changes: List[Dict] = []
+        t_start = time.time()
 
         conn = self.engine.raw_connection()
         try:
@@ -483,6 +537,7 @@ class UpsertEngine:
                 temp_table, chunk_df, target_columns
             )
             cursor.execute(create_temp_sql)
+            t_create = time.time()
 
             # 2. Bulk insert into temp table using fast_executemany
             insert_cols = list(chunk_df.columns)
@@ -490,20 +545,13 @@ class UpsertEngine:
             col_list = ", ".join([f"[{c}]" for c in insert_cols])
             insert_sql = f"INSERT INTO {temp_table} ({col_list}) VALUES ({placeholders})"
 
-            # Convert DataFrame to list of tuples, handling NaN → None
-            rows = []
-            for _, row in chunk_df.iterrows():
-                row_vals = []
-                for col in insert_cols:
-                    val = row[col]
-                    if pd.isna(val):
-                        row_vals.append(None)
-                    else:
-                        row_vals.append(val)
-                rows.append(tuple(row_vals))
+            # Vectorized NaN→None — replaces iterrows (~100x faster)
+            df_for_insert = chunk_df[insert_cols].astype(object).where(chunk_df[insert_cols].notna(), None)
+            rows = df_for_insert.values.tolist()
 
             cursor.fast_executemany = True
             cursor.executemany(insert_sql, rows)
+            t_stage = time.time()
 
             # 2.5 Before MERGE - capture old data for audit if enabled
             old_data_map = {}
@@ -513,7 +561,7 @@ class UpsertEngine:
                     pk_col_list = ", ".join([f"t.[{pk}]" for pk in primary_key_columns])
                     all_col_list = ", ".join([f"t.[{c}]" for c in chunk_df.columns])
                     pk_join = " AND ".join([f"t.[{pk}] = s.[{pk}]" for pk in primary_key_columns])
-                    
+
                     # Get existing rows that match our temp table PKs (NOLOCK to avoid blocking)
                     old_query = f"""
                         SELECT {pk_col_list}, {all_col_list}
@@ -528,6 +576,7 @@ class UpsertEngine:
                         old_data_map[pk_key] = row_dict
                 except Exception as e:
                     logger.warning(f"Failed to capture old data for audit: {e}")
+            t_audit_capture = time.time()
 
             # 3. Execute MERGE
             merge_sql = self._build_merge_sql(
@@ -539,6 +588,7 @@ class UpsertEngine:
                 enable_row_audit=enable_row_audit,
             )
             cursor.execute(merge_sql)
+            t_merge = time.time()
 
             # 4. Collect MERGE output from the output table
             count_sql = f"""
@@ -566,6 +616,7 @@ class UpsertEngine:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to collect row changes: {e}")
+            t_collect = time.time()
 
             # 6. Collect changed column details for updated rows
             if updated > 0 and non_pk_columns:
@@ -582,6 +633,18 @@ class UpsertEngine:
             cursor.execute(f"DROP TABLE IF EXISTS {temp_table}")
 
             conn.commit()
+            t_done = time.time()
+            logger.info(
+                f"[{batch_id}] chunk {chunk_number} ({len(chunk_df)} rows) — "
+                f"create={t_create - t_start:.2f}s "
+                f"stage={t_stage - t_create:.2f}s "
+                f"audit_pre={t_audit_capture - t_stage:.2f}s "
+                f"merge={t_merge - t_audit_capture:.2f}s "
+                f"collect={t_collect - t_merge:.2f}s "
+                f"cleanup={t_done - t_collect:.2f}s "
+                f"total={t_done - t_start:.2f}s "
+                f"(ins={inserted} upd={updated} unchg={unchanged})"
+            )
 
             return inserted, updated, unchanged, changed_columns_count, row_changes
 
@@ -774,77 +837,65 @@ class UpsertEngine:
     ) -> List[Dict]:
         """
         Collect row-level changes from MERGE output for audit logging.
-        Returns list of dicts with action_type, pk, old_data, new_data, changed_columns.
+        Single JOIN query — replaces N per-row SELECTs (the prior implementation
+        ran one round-trip per affected row, which dominated chunk runtime).
         """
         row_changes = []
-        
+
+        def make_serializable(d: Dict) -> Dict:
+            out = {}
+            for k, v in d.items():
+                if v is None or isinstance(v, (int, float, bool, str)):
+                    out[k] = v
+                else:
+                    out[k] = str(v)
+            return out
+
         try:
-            # Query output table with PK columns
-            pk_cols_select = ", ".join([f"[pk_{pk}]" for pk in primary_key_columns])
-            query = f"SELECT action_type, {pk_cols_select} FROM {output_table}"
+            # ONE bulk fetch: join output → target to get post-MERGE state per affected pk.
+            # output_table stores pk as NVARCHAR(MAX); cast target pk to match.
+            target_cols_select = ", ".join(f"t.[{c}] AS [{c}]" for c in all_columns)
+            join_cond = " AND ".join(
+                f"CAST(t.[{pk}] AS NVARCHAR(MAX)) = o.[pk_{pk}]"
+                for pk in primary_key_columns
+            )
+            query = f"""
+                SELECT o.action_type, {target_cols_select}
+                FROM {output_table} o
+                INNER JOIN [{target_table}] t WITH (NOLOCK) ON {join_cond}
+            """
             cursor.execute(query)
-            output_rows = cursor.fetchall()
-            
-            if not output_rows:
+            col_names = [d[0] for d in cursor.description]
+            fetched = cursor.fetchall()
+            if not fetched:
                 return row_changes
-            
-            # For each row in output, get new data from target table
-            for row in output_rows:
-                action_type = row[0]
-                pk_values = {}
-                for i, pk in enumerate(primary_key_columns):
-                    pk_values[pk] = row[i + 1]
-                
-                pk_key = "|".join([str(pk_values.get(pk, "")) for pk in primary_key_columns])
-                
-                # Get new data from target table
-                pk_conditions = " AND ".join([f"[{pk}] = ?" for pk in primary_key_columns])
-                new_data_query = f"SELECT * FROM [{target_table}] WHERE {pk_conditions}"
-                cursor.execute(new_data_query, list(pk_values.values()))
-                new_row = cursor.fetchone()
-                
-                if new_row:
-                    col_names = [desc[0] for desc in cursor.description]
-                    new_data = dict(zip(col_names, new_row))
-                    
-                    # Get old data from map
-                    old_data = old_data_map.get(pk_key, {})
-                    
-                    # Determine changed columns (only for UPDATE)
-                    changed_columns = []
-                    if action_type == "UPDATE" and old_data:
-                        for col in all_columns:
-                            old_val = old_data.get(col)
-                            new_val = new_data.get(col)
-                            if str(old_val) != str(new_val):
-                                changed_columns.append(col)
-                    
-                    # Build primary key string
-                    pk_str = "|".join([f"{pk}={pk_values.get(pk)}" for pk in primary_key_columns])
-                    
-                    # Convert values to JSON-serializable
-                    def make_serializable(d):
-                        result = {}
-                        for k, v in d.items():
-                            if v is None:
-                                result[k] = None
-                            elif isinstance(v, (int, float, bool, str)):
-                                result[k] = v
-                            else:
-                                result[k] = str(v)
-                        return result
-                    
-                    row_changes.append({
-                        "action_type": action_type,
-                        "record_primary_key": pk_str,
-                        "old_data": make_serializable(old_data) if old_data else None,
-                        "new_data": make_serializable(new_data),
-                        "changed_columns": changed_columns if changed_columns else None,
-                    })
-                    
+
+            for raw in fetched:
+                row_dict = dict(zip(col_names, raw))
+                action_type = row_dict.pop("action_type")
+                new_data = row_dict
+                pk_key = "|".join(str(new_data.get(pk, "")) for pk in primary_key_columns)
+                old_data = old_data_map.get(pk_key, {})
+
+                changed_columns = []
+                if action_type == "UPDATE" and old_data:
+                    for col in all_columns:
+                        if str(old_data.get(col)) != str(new_data.get(col)):
+                            changed_columns.append(col)
+
+                pk_str = "|".join(f"{pk}={new_data.get(pk)}" for pk in primary_key_columns)
+
+                row_changes.append({
+                    "action_type": action_type,
+                    "record_primary_key": pk_str,
+                    "old_data": make_serializable(old_data) if old_data else None,
+                    "new_data": make_serializable(new_data),
+                    "changed_columns": changed_columns if changed_columns else None,
+                })
+
         except Exception as e:
             logger.warning(f"Error collecting row changes: {e}")
-        
+
         return row_changes
 
     def _bulk_insert_audit_logs(

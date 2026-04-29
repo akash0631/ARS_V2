@@ -116,7 +116,11 @@ export const tablesAPI = {
   reorderColumns: (name, columns) => api.put(`/tables/${name}/reorder-columns`, { columns }),
   delete: (name) => api.delete(`/tables/${name}`),
   data: (name, params) => api.get(`/tables/${name}/data`, { params }),
+  // Truncate now runs as a background job — returns { job_id } immediately.
+  // Use truncateProgress(jobId) to poll a progress bar (TRUNCATE TABLE is
+  // milliseconds; batched DELETE fallback reports per-batch progress).
   truncate: (name) => api.delete(`/tables/${name}/data`),
+  truncateProgress: (jobId) => api.get(`/tables/truncate/progress/${jobId}`),
   rowCount: (name) => api.get(`/tables/${name}/row-count`),
   settings: (name) => api.get(`/tables/${name}/settings`),
   updateSettings: (name, params) => api.put(`/tables/settings/${name}`, null, { params }),

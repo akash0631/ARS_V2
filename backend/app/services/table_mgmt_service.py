@@ -8,6 +8,7 @@ import json
 from typing import List, Dict, Any, Optional
 
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from loguru import logger
 
@@ -741,32 +742,107 @@ class TableManagementService:
     # TRUNCATE TABLE DATA (not drop)
     # ========================================================================
 
-    def truncate_table_data(self, table_name: str, deleted_by: str) -> Dict[str, Any]:
-        """Delete all data from a table (TRUNCATE) without dropping the table."""
+    def truncate_table_data(
+        self,
+        table_name: str,
+        deleted_by: str,
+        progress_cb=None,
+        batch_size: int = 50000,
+    ) -> Dict[str, Any]:
+        """Empty a table without dropping it.
+
+        Strategy (in order):
+        1. **TRUNCATE TABLE** — minimally logged, takes milliseconds, holds
+           only a brief Sch-M lock. Works UNLESS the table is referenced by a
+           foreign key from another table.
+        2. **Batched DELETE** — `DELETE TOP (N) FROM [t]` in a loop with a
+           commit between each batch. Each batch lets the log truncate, lets
+           other queries interleave (no escalated table lock for hours), and
+           lets us report progress.
+
+        `progress_cb(processed, total, phase)` is invoked between batches so
+        the API layer can publish progress to a polling client.
+        """
         if table_name.lower() in PROTECTED_TABLES:
             raise ValueError(f"Cannot truncate protected table: {table_name}")
 
-        # Get row count before truncate
+        # Initial row count (NOLOCK so this can't itself be blocked)
         count_sql = text(f"SELECT COUNT(*) FROM [{table_name}] WITH (NOLOCK)")
         with self.data_engine.connect() as conn:
-            row_count = conn.execute(count_sql).scalar()
+            row_count = conn.execute(count_sql).scalar() or 0
 
-        # Use DELETE instead of TRUNCATE to avoid FK issues
-        delete_sql = text(f"DELETE FROM [{table_name}]")
-        with self.data_engine.connect() as conn:
-            conn.execute(delete_sql)
-            conn.commit()
+        if progress_cb:
+            progress_cb(0, row_count, "starting")
+
+        if row_count == 0:
+            # Nothing to do — still log the no-op for audit consistency
+            self.audit.log(
+                table_name=table_name,
+                action_type="DELETE",
+                changed_by=deleted_by,
+                notes="Truncate requested but table was already empty.",
+                row_count=0,
+            )
+            self.db.commit()
+            if progress_cb:
+                progress_cb(0, 0, "done")
+            return {"table_name": table_name, "rows_deleted": 0, "method": "noop"}
+
+        # ---- Try TRUNCATE TABLE first (fast path) ----
+        method = None
+        try:
+            with self.data_engine.connect() as conn:
+                # autocommit so TRUNCATE doesn't sit inside a long transaction
+                conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                conn.execute(text(f"TRUNCATE TABLE [{table_name}]"))
+            method = "truncate"
+            if progress_cb:
+                progress_cb(row_count, row_count, "done")
+            logger.info(
+                f"TRUNCATE TABLE [{table_name}] succeeded — {row_count} rows freed"
+            )
+        except SQLAlchemyError as truncate_err:
+            # Most common reason: FK constraint references this table. Fall
+            # back to batched DELETE.
+            err_msg = str(truncate_err)[:200]
+            logger.info(
+                f"TRUNCATE not allowed on [{table_name}] ({err_msg}) — "
+                f"falling back to batched DELETE"
+            )
+            method = "batched_delete"
+            deleted_total = 0
+            # Loop until @@ROWCOUNT == 0. Commit each batch so the log can
+            # checkpoint and other queries can interleave.
+            with self.data_engine.connect() as conn:
+                conn = conn.execution_options(isolation_level="AUTOCOMMIT")
+                while True:
+                    res = conn.execute(
+                        text(f"DELETE TOP ({batch_size}) FROM [{table_name}]")
+                    )
+                    deleted = res.rowcount or 0
+                    if deleted <= 0:
+                        break
+                    deleted_total += deleted
+                    if progress_cb:
+                        progress_cb(deleted_total, row_count, "deleting")
+            if progress_cb:
+                progress_cb(deleted_total, row_count, "done")
+            row_count = deleted_total
 
         self.audit.log(
             table_name=table_name,
             action_type="DELETE",
             changed_by=deleted_by,
-            notes=f"Table data truncated. {row_count} rows deleted.",
+            notes=f"Table data cleared via {method}. {row_count} rows deleted.",
             row_count=row_count,
         )
         self.db.commit()
 
-        return {"table_name": table_name, "rows_deleted": row_count}
+        return {
+            "table_name":   table_name,
+            "rows_deleted": row_count,
+            "method":       method,
+        }
 
     # ========================================================================
     # HELPERS

@@ -120,6 +120,10 @@ class TempDBCleanupService:
         self._last_stats: Dict[str, Any] = {}
         self._last_alert: Optional[Dict[str, Any]] = None
         self._history: Deque[Dict[str, Any]] = deque(maxlen=history_size)
+        # Azure SQL DB detection — sticky once detected so we don't re-probe
+        # every cycle. None = unknown / not yet probed.
+        self._is_azure_sql_db: Optional[bool] = None
+        self._engine_edition: Optional[int] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -166,7 +170,11 @@ class TempDBCleanupService:
         return self._do_cleanup(dry_run=False, force_aggressive=True)
 
     def top_sessions(self) -> List[Dict[str, Any]]:
-        """Return the top tempdb-consuming sessions for diagnostics."""
+        """Return the top tempdb-consuming sessions for diagnostics.
+        Returns [] on Azure SQL DB — sys.dm_db_session_space_usage is per-DB
+        on Azure and the cross-tempdb view does not exist."""
+        if self._detect_azure_sql_db():
+            return []
         engine = get_data_engine()
         raw_conn = engine.raw_connection()
         try:
@@ -244,6 +252,49 @@ class TempDBCleanupService:
             logger.debug(f"TempDB size read failed: {exc}")
         return None
 
+    def _detect_azure_sql_db(self) -> bool:
+        """One-shot probe of SERVERPROPERTY('EngineEdition'). Cached.
+
+        Engine edition values:
+          1 = Personal/Desktop, 2 = Standard, 3 = Enterprise, 4 = Express,
+          5 = Azure SQL Database (single DB / elastic pool — NO USE statement,
+              NO cross-DB queries, NO tempdb shrink — Azure manages it)
+          6 = Azure SQL Data Warehouse (Synapse)
+          8 = Azure SQL Managed Instance (supports USE, has tempdb)
+          9 = Azure SQL Edge / 11 = Fabric SQL DB
+
+        Only edition 5 (and 6) need to be skipped — local SQL Server,
+        Express, and Managed Instance all support the cleanup operations.
+        """
+        if self._is_azure_sql_db is not None:
+            return self._is_azure_sql_db
+        try:
+            engine = get_data_engine()
+            with engine.connect() as conn:
+                from sqlalchemy import text as _text
+                edition = conn.execute(
+                    _text("SELECT CAST(SERVERPROPERTY('EngineEdition') AS INT)")
+                ).scalar()
+                self._engine_edition = int(edition) if edition is not None else None
+                self._is_azure_sql_db = self._engine_edition in (5, 6)
+                if self._is_azure_sql_db:
+                    logger.info(
+                        f"TempDB cleanup: detected Azure SQL Database "
+                        f"(EngineEdition={self._engine_edition}). "
+                        f"Skipping cleanup — Azure manages tempdb automatically "
+                        f"and USE statement is not supported."
+                    )
+                else:
+                    logger.info(
+                        f"TempDB cleanup: SQL Server EngineEdition="
+                        f"{self._engine_edition} (cleanup enabled)"
+                    )
+        except Exception as exc:
+            logger.debug(f"EngineEdition probe failed: {exc}")
+            # Don't cache on failure — try again next cycle
+            return False
+        return self._is_azure_sql_db
+
     def _do_cleanup(
         self,
         dry_run: bool = False,
@@ -257,7 +308,31 @@ class TempDBCleanupService:
           4. If size > aggressive threshold (or force_aggressive): flush caches
              and hard-shrink every data file to aggressive_target_mb.
           5. Snapshot tempdb size again and record history + optional alert.
+
+        On Azure SQL Database (EngineEdition=5/6) the entire body is skipped:
+        Azure manages tempdb automatically, and `USE`, `DBCC SHRINKFILE`, and
+        cross-database `tempdb.sys.tables` queries are all unsupported.
         """
+        # Short-circuit on Azure SQL Database — nothing here works there.
+        if self._detect_azure_sql_db():
+            stats = {
+                "run_at":      datetime.utcnow().isoformat(),
+                "skipped":     True,
+                "reason":      "Azure SQL Database — tempdb is managed by Azure",
+                "edition":     self._engine_edition,
+                "mb_before":   None,
+                "mb_after":    None,
+                "mb_freed":    0.0,
+                "mode":        "skipped_azure",
+                "dropped":     [],
+                "shrunk":      [],
+                "errors":      [],
+            }
+            self._last_run = datetime.utcnow()
+            self._last_stats = stats
+            self._history.append(stats)
+            return stats
+
         dropped: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
         shrunk:  List[str] = []

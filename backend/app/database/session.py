@@ -236,6 +236,151 @@ def set_data_connection_options(dbapi_connection, connection_record):
 
 
 # ============================================================================
+# Schema reconciliation — close the gap that Base.metadata.create_all leaves
+# ============================================================================
+def _sqlalchemy_to_mssql_type(col) -> str:
+    """Translate a SQLAlchemy Column into the MSSQL DDL type string we'd
+    use in `ALTER TABLE ... ADD`. Mirrors the subset used by the ARS models
+    (BigInteger, Integer, String, Text, DateTime, Boolean, etc.)."""
+    from sqlalchemy import (
+        BigInteger, Integer, SmallInteger, String, Text, DateTime, Boolean,
+        Numeric, Float, LargeBinary,
+    )
+    t = col.type
+    if isinstance(t, BigInteger):    return "BIGINT"
+    if isinstance(t, SmallInteger):  return "SMALLINT"
+    if isinstance(t, Integer):       return "INT"
+    if isinstance(t, Boolean):       return "BIT"
+    if isinstance(t, DateTime):      return "DATETIME"
+    if isinstance(t, Float):         return "FLOAT"
+    if isinstance(t, Numeric):
+        prec = getattr(t, "precision", None) or 18
+        scale = getattr(t, "scale", None) or 2
+        return f"NUMERIC({prec},{scale})"
+    if isinstance(t, Text):          return "NVARCHAR(MAX)"
+    if isinstance(t, String):
+        length = getattr(t, "length", None)
+        return f"NVARCHAR({length})" if length else "NVARCHAR(MAX)"
+    if isinstance(t, LargeBinary):   return "VARBINARY(MAX)"
+    # Fall back to compiling against the MSSQL dialect — works for unusual types
+    try:
+        from sqlalchemy.dialects import mssql
+        return t.compile(dialect=mssql.dialect())
+    except Exception:
+        return "NVARCHAR(MAX)"
+
+
+def reconcile_columns(target_engine=None) -> Dict[str, list]:
+    """For every table in `Base.metadata`, reconcile drift between the model
+    and the live database:
+
+    1. **Add missing columns** — `ALTER TABLE [t] ADD [c] <type> NULL` for any
+       column the model declares but the live DB lacks. (Closes the gap that
+       `Base.metadata.create_all(checkfirst=True)` leaves: it only creates
+       missing TABLES, never adds new columns to existing ones.)
+    2. **Widen nullability** — `ALTER TABLE [t] ALTER COLUMN [c] <type> NULL`
+       when the model says `nullable=True` but the live DB has `IS_NULLABLE='NO'`.
+       Only widens; never narrows `NULL → NOT NULL` automatically (that needs
+       data validation and could fail on existing NULL rows). Skips PK columns
+       since their nullability is structural.
+
+    Idempotent — safe on every startup and after a hot-reload.
+
+    Returns {table_name: [<change description>, ...], ...} for what was changed
+    this run; empty dict means everything already matched.
+    """
+    eng = target_engine or system_engine
+    changes: Dict[str, list] = {}
+    try:
+        with eng.connect() as conn:
+            for table_name, table in Base.metadata.tables.items():
+                # Pull every column with its nullability flag in one shot.
+                # Empty result = table doesn't exist (create_all owns that path).
+                rows = conn.execute(
+                    text(
+                        "SELECT COLUMN_NAME, IS_NULLABLE "
+                        "FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_NAME = :t"
+                    ),
+                    {"t": table_name},
+                ).fetchall()
+                if not rows:
+                    continue
+                # name(lower) -> is_nullable_bool
+                actual: Dict[str, bool] = {
+                    r[0].lower(): (str(r[1]).upper() == "YES") for r in rows
+                }
+
+                for col in table.columns:
+                    key = col.name.lower()
+
+                    # ---- 1) Missing column → ADD ----
+                    if key not in actual:
+                        col_type = _sqlalchemy_to_mssql_type(col)
+                        # Always allow NULL on retro-add: existing rows have
+                        # no value for the new column, and a hard NOT NULL
+                        # would fail on Azure SQL. Model-level NOT NULL is
+                        # still enforced for new INSERTs by the ORM.
+                        ddl = (
+                            f"ALTER TABLE [{table_name}] "
+                            f"ADD [{col.name}] {col_type} NULL"
+                        )
+                        try:
+                            conn.execute(text(ddl))
+                            try:
+                                conn.commit()
+                            except Exception:
+                                pass
+                            changes.setdefault(table_name, []).append(
+                                f"added {col.name} ({col_type})"
+                            )
+                            logger.info(
+                                f"reconcile_columns: added "
+                                f"{table_name}.{col.name} ({col_type})"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"reconcile_columns: failed to add "
+                                f"{table_name}.{col.name}: {e}"
+                            )
+                        continue  # nothing more to check on a freshly-added column
+
+                    # ---- 2) Existing column → check nullability drift ----
+                    # Only widen NOT NULL → NULL when the model says nullable.
+                    # Skip PK columns (nullability is structural for them).
+                    if col.primary_key:
+                        continue
+                    db_nullable = actual[key]
+                    if col.nullable and not db_nullable:
+                        col_type = _sqlalchemy_to_mssql_type(col)
+                        ddl = (
+                            f"ALTER TABLE [{table_name}] "
+                            f"ALTER COLUMN [{col.name}] {col_type} NULL"
+                        )
+                        try:
+                            conn.execute(text(ddl))
+                            try:
+                                conn.commit()
+                            except Exception:
+                                pass
+                            changes.setdefault(table_name, []).append(
+                                f"relaxed {col.name} to NULL"
+                            )
+                            logger.info(
+                                f"reconcile_columns: relaxed "
+                                f"{table_name}.{col.name} to NULL"
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"reconcile_columns: failed to relax "
+                                f"{table_name}.{col.name} to NULL: {e}"
+                            )
+    except Exception as e:
+        logger.warning(f"reconcile_columns failed for engine: {e}")
+    return changes
+
+
+# ============================================================================
 # Hot-Reload (used by Settings UI when DB credentials change)
 # ============================================================================
 def reload_db_engines() -> dict:
