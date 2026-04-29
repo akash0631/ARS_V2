@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useParams, Link, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Download, Columns, RefreshCw, Copy, ClipboardList, FilterX } from 'lucide-react'
-import { tablesAPI, dataAPI, checklistAPI } from '@/services/api'
+import { tablesAPI, dataAPI, checklistAPI, rlsAPI } from '@/services/api'
 import { AgGridReact } from 'ag-grid-react'
 import 'ag-grid-community/styles/ag-grid.css'
 import 'ag-grid-community/styles/ag-theme-alpine.css'
@@ -21,7 +21,8 @@ export default function TableDataPage() {
   const [pageSize, setPageSize] = useState(100)
   const [loading, setLoading] = useState(true)
   const [serverFilters, setServerFilters] = useState(null)
-  const { hasPermission } = useAuthStore()
+  const { hasPermission, isSuperAdmin } = useAuthStore()
+  const [colRestrictions, setColRestrictions] = useState([]) // [{column_name, is_visible, is_masked}]
   const filterTimer = useRef(null)
 
   const loadSchema = async () => {
@@ -47,6 +48,11 @@ export default function TableDataPage() {
   useEffect(() => {
     loadSchema(); loadData(1, null)
     if (fromChecklist) checklistAPI.stamp(tableName).catch(() => {})
+    if (!isSuperAdmin()) {
+      rlsAPI.myColumnRestrictions(tableName)
+        .then(r => setColRestrictions(r.data.data || []))
+        .catch(() => {})
+    }
   }, [tableName])
   useEffect(() => { loadData(page) }, [page, pageSize])
 
@@ -81,7 +87,14 @@ export default function TableDataPage() {
     const isTextType = (t) => ['nvarchar','varchar','nchar','char','ntext','text'].includes((t||'').toLowerCase())
     const isDateType = (t) => ['date','datetime','datetime2','smalldatetime','time'].includes((t||'').toLowerCase())
 
-    return schema.columns.filter(col => !HIDDEN_COLS.has((col.column_name || '').toUpperCase())).map(col => {
+    const restrictionMap = Object.fromEntries(colRestrictions.map(r => [r.column_name, r]))
+
+    return schema.columns.filter(col => {
+      if (HIDDEN_COLS.has((col.column_name || '').toUpperCase())) return false
+      const r = restrictionMap[col.column_name]
+      if (r && (!r.is_visible || r.is_masked)) return false // hide masked/invisible columns
+      return true
+    }).map(col => {
       const dt = col.data_type || ''
       const isNum = isNumType(dt)
       const isText = isTextType(dt)
@@ -104,7 +117,7 @@ export default function TableDataPage() {
         minWidth: 70,
       }
     })
-  }, [schema, hasPermission])
+  }, [schema, hasPermission, colRestrictions])
 
   const defaultColDef = useMemo(() => ({
     filter: 'agTextColumnFilter',

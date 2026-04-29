@@ -184,6 +184,34 @@ async def create_column_restriction(
     return APIResponse(message="Column restriction saved")
 
 
+@router.get("/my-column-restrictions/{table_name}", response_model=APIResponse)
+async def get_my_column_restrictions(
+    table_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Get column restrictions for the current user's roles (most restrictive wins)."""
+    role_ids = [ur.role_id for ur in current_user.user_roles if ur.is_active]
+    if not role_ids:
+        return APIResponse(data=[])
+    records = db.query(ColumnRestriction).filter(
+        ColumnRestriction.table_name == table_name,
+        ColumnRestriction.role_id.in_(role_ids),
+    ).all()
+    col_map = {}
+    for r in records:
+        c = r.column_name
+        if c not in col_map:
+            col_map[c] = {"is_visible": True, "is_masked": False, "can_edit": True}
+        if not r.is_visible:
+            col_map[c]["is_visible"] = False
+        if r.is_masked:
+            col_map[c]["is_masked"] = True
+        if not getattr(r, "can_edit", True):
+            col_map[c]["can_edit"] = False
+    return APIResponse(data=[{"column_name": col, **perms} for col, perms in col_map.items()])
+
+
 @router.get("/column-restrictions/{table_name}", response_model=APIResponse)
 async def get_column_restrictions(
     table_name: str,
