@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useParams, Link, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Download, Columns, RefreshCw, Copy, ClipboardList, FilterX } from 'lucide-react'
-import { tablesAPI, dataAPI, checklistAPI } from '@/services/api'
+import { tablesAPI, dataAPI, checklistAPI, rlsAPI } from '@/services/api'
 import { AgGridReact } from 'ag-grid-react'
 import 'ag-grid-community/styles/ag-grid.css'
 import 'ag-grid-community/styles/ag-theme-alpine.css'
@@ -21,7 +21,8 @@ export default function TableDataPage() {
   const [pageSize, setPageSize] = useState(100)
   const [loading, setLoading] = useState(true)
   const [serverFilters, setServerFilters] = useState(null)
-  const { hasPermission } = useAuthStore()
+  const { hasPermission, isSuperAdmin } = useAuthStore()
+  const [colRestrictions, setColRestrictions] = useState([]) // [{column_name, is_visible, is_masked}]
   const filterTimer = useRef(null)
 
   const loadSchema = async () => {
@@ -47,6 +48,11 @@ export default function TableDataPage() {
   useEffect(() => {
     loadSchema(); loadData(1, null)
     if (fromChecklist) checklistAPI.stamp(tableName).catch(() => {})
+    if (!isSuperAdmin()) {
+      rlsAPI.myColumnRestrictions(tableName)
+        .then(r => setColRestrictions(r.data.data || []))
+        .catch(() => {})
+    }
   }, [tableName])
   useEffect(() => { loadData(page) }, [page, pageSize])
 
@@ -81,7 +87,14 @@ export default function TableDataPage() {
     const isTextType = (t) => ['nvarchar','varchar','nchar','char','ntext','text'].includes((t||'').toLowerCase())
     const isDateType = (t) => ['date','datetime','datetime2','smalldatetime','time'].includes((t||'').toLowerCase())
 
-    return schema.columns.filter(col => !HIDDEN_COLS.has((col.column_name || '').toUpperCase())).map(col => {
+    const restrictionMap = Object.fromEntries(colRestrictions.map(r => [r.column_name, r]))
+
+    return schema.columns.filter(col => {
+      if (HIDDEN_COLS.has((col.column_name || '').toUpperCase())) return false
+      const r = restrictionMap[col.column_name]
+      if (r && (!r.is_visible || r.is_masked)) return false // hide masked/invisible columns
+      return true
+    }).map(col => {
       const dt = col.data_type || ''
       const isNum = isNumType(dt)
       const isText = isTextType(dt)
@@ -92,19 +105,22 @@ export default function TableDataPage() {
       const headerW = Math.ceil(header.length * 7.5) + 30
       const baseMin = isNum ? 75 : isDate ? 110 : isText ? 120 : 90
       const width = Math.max(headerW, baseMin)
+      const restriction = restrictionMap[col.column_name]
+      const rlsReadOnly = restriction && restriction.is_visible && !restriction.can_edit
       return {
         field: col.column_name,
         headerName: header,
         sortable: true,
         filter: true,
         resizable: true,
-        editable: hasPermission('DATA_EDIT') && !col.is_primary_key,
-        cellClass: col.is_primary_key ? 'ag-cell-pk' : '',
+        editable: hasPermission('DATA_EDIT') && !col.is_primary_key && !rlsReadOnly,
+        cellClass: col.is_primary_key ? 'ag-cell-pk' : rlsReadOnly ? 'ag-cell-rls-readonly' : '',
+        headerClass: rlsReadOnly ? 'ag-header-rls-readonly' : '',
         width,
         minWidth: 70,
       }
     })
-  }, [schema, hasPermission])
+  }, [schema, hasPermission, colRestrictions])
 
   const defaultColDef = useMemo(() => ({
     filter: 'agTextColumnFilter',
@@ -330,7 +346,11 @@ export default function TableDataPage() {
   }, [])
 
   const exportCSV = () => {
-    const headers = schema?.columns?.map(c => c.column_name) || []
+    const restrictionMap = Object.fromEntries(colRestrictions.map(r => [r.column_name, r]))
+    const headers = (schema?.columns?.map(c => c.column_name) || []).filter(col => {
+      const r = restrictionMap[col]
+      return !r || (r.is_visible && !r.is_masked)
+    })
     const csv = [headers.join(','), ...rowData.map(r => headers.map(h => `"${r[h] ?? ''}"`).join(','))].join('\n')
     const blob = new Blob([csv], { type: 'text/csv' })
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${tableName}.csv`; a.click()
@@ -406,6 +426,10 @@ export default function TableDataPage() {
             const colId = params.column?.getColId()
             if (colId && isCellSelected(params.rowIndex, colId)) {
               return { backgroundColor: '#bfdbfe', color: '#1e3a5f', fontWeight: 500 }
+            }
+            const r = colRestrictions.find(x => x.column_name === colId)
+            if (r && r.is_visible && !r.can_edit) {
+              return { backgroundColor: '#f3f4f6', color: '#6b7280' }
             }
             return null
           }}

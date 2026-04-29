@@ -1,8 +1,88 @@
-import { useEffect, useState } from 'react'
-import { Plus, Trash2, Eye, Search, Shield, Columns, Lock, Unlock, Save, Database, Users } from 'lucide-react'
+import { useEffect, useState, useRef } from 'react'
+import { Plus, Trash2, Eye, Search, Shield, Columns, Lock, Unlock, Save, Database, Users, ChevronDown, X } from 'lucide-react'
 import { rlsAPI, usersAPI, tablesAPI } from '@/services/api'
 import api from '@/services/api'
 import toast from 'react-hot-toast'
+
+function SearchSelect({ value, onChange, options, placeholder = 'Search...' }) {
+  const [query, setQuery] = useState('')
+  const [open, setOpen] = useState(false)
+  const ref = useRef()
+
+  useEffect(() => {
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [])
+
+  const filtered = options.filter(o => o.toLowerCase().includes(query.toLowerCase()))
+  const displayValue = value || ''
+
+  const select = (val) => {
+    onChange(val)
+    setQuery('')
+    setOpen(false)
+  }
+
+  const clear = (e) => {
+    e.stopPropagation()
+    onChange('')
+    setQuery('')
+  }
+
+  return (
+    <div ref={ref} className="relative">
+      <div
+        onClick={() => setOpen(o => !o)}
+        className="input flex items-center gap-2 cursor-pointer pr-8"
+      >
+        {open ? (
+          <input
+            autoFocus
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            onClick={e => e.stopPropagation()}
+            placeholder={placeholder}
+            className="flex-1 bg-transparent outline-none text-sm"
+          />
+        ) : (
+          <span className={`flex-1 text-sm truncate ${displayValue ? 'text-gray-900' : 'text-gray-400'}`}>
+            {displayValue || placeholder}
+          </span>
+        )}
+        <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+          {displayValue && !open && (
+            <button onClick={clear} className="text-gray-400 hover:text-gray-600">
+              <X size={12} />
+            </button>
+          )}
+          <ChevronDown size={13} className={`text-gray-400 transition-transform ${open ? 'rotate-180' : ''}`} />
+        </div>
+      </div>
+
+      {open && (
+        <div className="absolute z-50 mt-1 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-56 overflow-y-auto">
+          {filtered.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-gray-400">No tables found</div>
+          ) : (
+            filtered.map(opt => (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => select(opt)}
+                className={`w-full text-left px-3 py-1.5 text-xs hover:bg-primary-50 hover:text-primary-700 transition-colors ${
+                  opt === value ? 'bg-primary-50 text-primary-700 font-medium' : 'text-gray-700'
+                }`}
+              >
+                {opt}
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 export default function RLSPage() {
   const [tab, setTab] = useState('store') // store | column | table
@@ -105,9 +185,19 @@ export default function RLSPage() {
 
   const setColPerm = (colName, field, value) => {
     setColRestrictions(prev => {
-      const existing = prev.find(x => x.column_name === colName)
-      if (existing) return prev.map(x => x.column_name === colName ? { ...x, [field]: value } : x)
-      return [...prev, { column_name: colName, role_id: Number(selRole), is_visible: true, is_masked: false, can_edit: true, [field]: value }]
+      const base = prev.find(x => x.column_name === colName)
+        || { column_name: colName, role_id: Number(selRole), is_visible: true, is_masked: false, can_edit: true }
+      const updated = { ...base, [field]: value }
+      if (field === 'is_masked' && value === true) {
+        updated.is_visible = false
+        updated.can_edit = false
+      }
+      if ((field === 'is_visible' || field === 'can_edit') && value === true) {
+        updated.is_masked = false
+      }
+      return prev.find(x => x.column_name === colName)
+        ? prev.map(x => x.column_name === colName ? updated : x)
+        : [...prev, updated]
     })
   }
 
@@ -236,13 +326,12 @@ export default function RLSPage() {
           <div className="card p-3 flex gap-3 items-end flex-wrap">
             <div className="flex-1 min-w-[200px]">
               <label className="label"><Database size={10} className="inline mr-1" />Table</label>
-              <select value={selTable} onChange={e => setSelTable(e.target.value)} className="input">
-                <option value="">Select table...</option>
-                {tables.map(t => {
-                  const name = t.table_name || t
-                  return <option key={name} value={name}>{name}</option>
-                })}
-              </select>
+              <SearchSelect
+                value={selTable}
+                onChange={setSelTable}
+                options={tables.map(t => t.table_name || t)}
+                placeholder="Select table..."
+              />
             </div>
             <div className="w-[200px]">
               <label className="label"><Shield size={10} className="inline mr-1" />Role</label>
@@ -284,9 +373,19 @@ export default function RLSPage() {
                       {tableColumns.map(col => {
                         const p = getColPerm(col)
                         return (
-                          <tr key={col} className="hover:bg-gray-50">
+                          <tr key={col} className={p.is_masked ? 'bg-amber-50 border-amber-100' : 'hover:bg-gray-50'}>
                             <td className="px-3 py-1.5">
-                              <code className="text-[11px] font-semibold text-gray-800">{col}</code>
+                              <div className="flex items-center gap-2">
+                                {p.is_masked ? (
+                                  <>
+                                    <Lock size={11} className="text-amber-500 shrink-0" />
+                                    <span className="text-[11px] font-semibold text-amber-600 line-through">{col}</span>
+                                    <span className="text-[10px] font-mono tracking-widest text-amber-400">*****</span>
+                                  </>
+                                ) : (
+                                  <code className="text-[11px] font-semibold text-gray-800">{col}</code>
+                                )}
+                              </div>
                             </td>
                             <td className="px-3 py-1.5 text-center">
                               <input type="checkbox" checked={p.is_visible}
