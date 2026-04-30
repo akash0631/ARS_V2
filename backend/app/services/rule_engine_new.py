@@ -735,7 +735,7 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
         # Scope to touched MAJ_CATs (a grid-grain REQ_REM never crosses
         # MAJ_CAT, so H_REM only needs recompute for those rows).
         _run(conn, f"""
-            UPDATE [{working_table}] SET {', '.join(h_rem_sets)}
+            UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET {', '.join(h_rem_sets)}
             WHERE MAJ_CAT IN ({mc_in})
         """, params_mc)
 
@@ -746,7 +746,7 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
         h_sum  = " + ".join(f"ISNULL([{c}],0)" for c in pri_h)
         gh_sum = " + ".join(f"ISNULL([{c}],0)" for c in pri_gh)
         _run(conn, f"""
-            UPDATE [{working_table}] SET
+            UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET
                 PRI_CT_REM = CASE
                     WHEN ({gh_sum}) = 0 THEN 0
                     ELSE ROUND(CAST(({h_sum}) AS FLOAT) / ({gh_sum}) * 100, 1) END
@@ -762,7 +762,7 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
     if pri_ct_check_tbc: enforced.append("'TBC'")
     pri_opt_in = ", ".join(enforced)
     _run(conn, f"""
-        UPDATE [{working_table}] SET
+        UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET
             ALLOC_STATUS = CASE
                 WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0 THEN 'SKIPPED'
                 WHEN ISNULL(PRI_CT_REM, 0)    < 100
@@ -784,7 +784,7 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
     # Store-broken: MJ_REQ_REM < factor × ACS_D → skip rest of store for this opt_type
     if ENABLE_STORE_BROKEN and "MJ_REQ_REM" in work_cols:
         _run(conn, f"""
-            UPDATE [{working_table}] SET
+            UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET
                 ALLOC_STATUS = 'SKIPPED',
                 ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'') + ' SKIP_STORE_BROKEN;'
             WHERE LISTED_FLAG = 1
@@ -797,7 +797,7 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
 
     # (6) Propagate SKIP to alloc_table so future bands' Target CTE excludes them
     _run(conn, f"""
-        UPDATE A SET
+        UPDATE A WITH (ROWLOCK, UPDLOCK) SET
             A.ALLOC_STATUS = 'SKIPPED',
             A.SKIP_REASON  = CASE
                 WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
@@ -1374,7 +1374,7 @@ def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
                              ELSE 0 END
                      THEN 'ALLOCATED'
                 ELSE 'PARTIAL' END
-        FROM [{alloc_table}] A
+        FROM [{alloc_table}] A WITH (ROWLOCK, UPDLOCK)
         INNER JOIN Take X
             ON A.WERKS = X.WERKS AND A.RDC = X.RDC
            AND A.MAJ_CAT = X.MAJ_CAT AND A.GEN_ART_NUMBER = X.GEN_ART_NUMBER

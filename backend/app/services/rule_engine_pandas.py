@@ -43,7 +43,7 @@ from app.services.alloc_queue import (
     mark_in_progress,
     seed_queue,
 )
-from app.utils.db_helpers import run_sql
+from app.utils.db_helpers import run_sql, retry_on_deadlock
 
 
 # Default 4 (was 8). Pandas operations are CPU-bound and hold Python's GIL,
@@ -124,11 +124,21 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
 
         # Live write-back for THIS MAJ_CAT — disjoint slices, safe to run
         # concurrently across processes (different rows in alloc/working).
+        # Wrapped in retry_on_deadlock: even with ROWLOCK/UPDLOCK hints,
+        # 8 concurrent workers can occasionally race on shared pages, so
+        # we let SQL Server pick a victim and rerun cleanly (each call
+        # opens its own raw_connection() so a retry gets a fresh tx).
         eng = get_data_engine()
         t_wb = time.time()
-        _write_back_alloc(eng, alloc_table, a_out)
+        retry_on_deadlock(
+            lambda: _write_back_alloc(eng, alloc_table, a_out),
+            label=f"write_back_alloc[{mc}]",
+        )
         if not w_out.empty:
-            _write_back_working(eng, working_table, w_out, grids)
+            retry_on_deadlock(
+                lambda: _write_back_working(eng, working_table, w_out, grids),
+                label=f"write_back_working[{mc}]",
+            )
         wb_secs = time.time() - t_wb
 
         dur = time.time() - t_mc
@@ -982,7 +992,7 @@ def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
         )
         cur.execute(f"""
             UPDATE T SET {update_pairs}
-            FROM [{alloc_table}] T
+            FROM [{alloc_table}] T WITH (ROWLOCK, UPDLOCK)
             INNER JOIN {tmp} S
               ON T.WERKS = S.WERKS AND T.RDC = S.RDC
              AND T.MAJ_CAT = S.MAJ_CAT
@@ -1052,7 +1062,7 @@ def _write_back_working(engine, working_table: str, df: pd.DataFrame,
         )
         cur.execute(f"""
             UPDATE T SET {update_pairs}
-            FROM [{working_table}] T
+            FROM [{working_table}] T WITH (ROWLOCK, UPDLOCK)
             INNER JOIN {tmp} S
               ON T.WERKS = S.WERKS
              AND T.MAJ_CAT = S.MAJ_CAT

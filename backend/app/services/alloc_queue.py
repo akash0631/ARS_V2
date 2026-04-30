@@ -304,8 +304,13 @@ def get_done_summary(conn, batch_id: str) -> Dict:
 # ---------------------------------------------------------------------------
 def reset_failed_for_retry(conn, batch_id: str) -> int:
     """
-    Move every FAILED row in the batch back to PENDING. Called by the
-    /listing/retry-failed endpoint. Returns the number of rows reset.
+    Move every FAILED row in the batch back to PENDING and **reset
+    ATTEMPTS to 0** so the auto-retry budget (MAX_ATTEMPTS) is fully
+    restored. Without the ATTEMPTS reset a manual retry that hits a
+    fresh deadlock would be the row's last shot — `claim_next` would
+    not pick it up again because of the `ATTEMPTS < :max_a` clause.
+
+    Called by /listing/retry-failed. Returns the number of rows reset.
     """
     res = conn.execute(text(f"""
         UPDATE {QUEUE_TABLE}
@@ -313,7 +318,8 @@ def reset_failed_for_retry(conn, batch_id: str) -> int:
                WORKER_ID    = NULL,
                PICKED_AT    = NULL,
                COMPLETED_AT = NULL,
-               ERROR_MSG    = NULL
+               ERROR_MSG    = NULL,
+               ATTEMPTS     = 0
          WHERE BATCH_ID = :b AND STATUS = 'FAILED'
     """), {"b": batch_id})
     conn.commit()

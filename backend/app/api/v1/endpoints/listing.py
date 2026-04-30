@@ -2260,19 +2260,54 @@ def retry_failed(req: RetryFailedRequest,
                  current_user: User = Depends(get_current_user)):
     """
     Manual retry path. Resets every FAILED row in the batch back to
-    PENDING and re-dispatches workers. Parts 1-7 are NOT re-run; the
-    existing ARS_LISTING_WORKING / ARS_ALLOC_WORKING are reused.
+    PENDING (with ATTEMPTS=0 so the auto-retry budget is restored),
+    then re-dispatches workers on those MAJ_CATs only. Parts 1-7 are
+    NOT re-run — the existing ARS_LISTING_WORKING / ARS_ALLOC_WORKING
+    are reused.
+
+    Defensive against the "no action" UX trap: if a previous retry
+    click already moved the rows to PENDING and a worker is already
+    chewing through them, this endpoint won't re-spawn another pool.
+    Instead it tells the caller exactly what state the batch is in so
+    the UI can show a meaningful message.
     """
     from app.services.alloc_queue import (
-        get_failed_list, reset_failed_for_retry,
+        get_failed_list, reset_failed_for_retry, get_progress,
     )
     de = get_data_engine()
     with de.connect() as conn:
         failed = get_failed_list(conn, req.batch_id)
+        progress_before = get_progress(conn, req.batch_id)
+
         if not failed:
+            # Nothing currently FAILED. If there are PENDING/IN_PROGRESS
+            # rows it means a prior retry click is still working — surface
+            # that to the user instead of pretending we did something.
+            in_flight = (
+                int(progress_before.get("pending", 0))
+                + int(progress_before.get("in_progress", 0))
+            )
+            if in_flight > 0:
+                return {
+                    "success":  True,
+                    "retried":  0,
+                    "message":  (
+                        f"Nothing to retry — {in_flight} MAJ_CAT(s) are still "
+                        f"running from an earlier retry/run. Wait for them to "
+                        f"finish, then retry again if any fail."
+                    ),
+                    "progress": progress_before,
+                }
             raise HTTPException(400, "No failed MAJ_CATs to retry for this batch_id")
+
         failed_mcs = [f["maj_cat"] for f in failed]
-        reset_failed_for_retry(conn, req.batch_id)
+        reset_count = reset_failed_for_retry(conn, req.batch_id)
+
+    logger.info(
+        f"[retry-failed] batch={req.batch_id} mode={req.allocation_mode} "
+        f"workers={req.parallel_workers} → re-dispatching {reset_count} "
+        f"MAJ_CAT(s): {failed_mcs[:10]}{'...' if len(failed_mcs) > 10 else ''}"
+    )
 
     n_workers = max(2, min(8, int(req.parallel_workers or 4)))
     mode = (req.allocation_mode or "python_parallel").lower()
@@ -2303,10 +2338,24 @@ def retry_failed(req: RetryFailedRequest,
             batch_id=req.batch_id,
             only_majcats=failed_mcs,
         )
+
+    # Re-read progress so the UI can update without a separate poll round-trip.
+    with de.connect() as conn:
+        progress_after = get_progress(conn, req.batch_id)
+        failed_after = get_failed_list(conn, req.batch_id)
+
+    logger.info(
+        f"[retry-failed] batch={req.batch_id} done: "
+        f"done={progress_after.get('done')} failed={progress_after.get('failed')}"
+    )
+
     return {
-        "success":  True,
-        "retried":  len(failed_mcs),
-        "result":   result,
+        "success":         True,
+        "retried":         len(failed_mcs),
+        "still_failed":    len(failed_after),
+        "progress":        progress_after,
+        "failed":          failed_after,
+        "result":          result,
     }
 
 
@@ -2993,8 +3042,12 @@ def _compute_listing_summary(conn):
     by_rdc = {r[0]: {"rdc": r[0], "total": r[1], "new": r[2], "existing": r[3], "alloc_qty": 0}
               for r in rows}
 
-    # Allocated qty + Hold qty from ARS_LISTING_WORKING (actual allocation output)
-    WORKING_TABLE = "ARS_LISTING_WORKING"
+    # Allocated qty + Hold qty from ARS_ALLOC_WORKING (size-grain source of
+    # truth produced by the waterfall). Previously read from
+    # ARS_LISTING_WORKING (option-grain rollup via _stage_d_reflect); using
+    # the source directly avoids any drift if the rollup ever lags or
+    # filters rows.
+    WORKING_TABLE = "ARS_ALLOC_WORKING"
     if _table_exists(conn, WORKING_TABLE):
         wk_cols = _get_columns(conn, WORKING_TABLE)
         if "ALLOC_QTY" in wk_cols and "RDC" in wk_cols:
@@ -3003,7 +3056,7 @@ def _compute_listing_summary(conn):
                 SELECT [RDC],
                        ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0) AS aq,
                        {hold_expr} AS hq
-                FROM [{WORKING_TABLE}]
+                FROM [{WORKING_TABLE}] WITH (NOLOCK)
                 GROUP BY [RDC]
             """)).fetchall()
             for ar in alloc_rows:
@@ -3024,8 +3077,9 @@ def _compute_listing_summary(conn):
 
     summary["by_rdc"] = sorted(by_rdc.values(), key=lambda x: x["rdc"])
 
-    # by_maj_cat: SUM(ALLOC_QTY) from ARS_LISTING_WORKING — every MAJ_CAT that
-    # contributed to the allocation, so the modal total reconciles with the
+    # by_maj_cat: SUM(ALLOC_QTY) from ARS_ALLOC_WORKING (size-grain) — every
+    # MAJ_CAT that contributed to the allocation. Same source as the by_rdc
+    # totals above, so the MAJ_CAT-modal total reconciles exactly with the
     # TOTAL ALLOC QTY tile. The chart only renders top/bottom N anyway.
     # Also enrich each row with msa_qty = SUM(<MSA qty col>) FROM ARS_MSA_GEN_ART
     # for the same MAJ_CAT so the modal can show ALLOC vs MSA side-by-side.
@@ -3106,7 +3160,7 @@ def _compute_listing_summary(conn):
         """)).fetchall()
         summary["by_opt_type"] = {r[0]: r[1] for r in opt_rows}
 
-    # Alloc qty by OPT_TYPE from ARS_LISTING_WORKING
+    # Alloc qty by OPT_TYPE from ARS_ALLOC_WORKING (size-grain source of truth)
     if _table_exists(conn, WORKING_TABLE):
         wk_cols = _get_columns(conn, WORKING_TABLE)
         if "ALLOC_QTY" in wk_cols and "OPT_TYPE" in wk_cols:

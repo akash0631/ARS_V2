@@ -36,7 +36,8 @@
       "Bash(python:*)",
       "Bash(pip install:*)",
       "Bash(node --check ../frontend/src/pages/UploadPage.jsx)",
-      "mcp__claude_ai_sap_hht__ars_jobs"
+      "mcp__claude_ai_sap_hht__ars_jobs",
+      "Bash(xargs ls *)"
     ]
   }
 }

@@ -5,10 +5,24 @@ Centralized SQL execution, schema introspection, and column management.
 Eliminates duplicate _run(), _table_exists(), _get_columns(), _col_exists(),
 _ensure_col() across grid_builder, listing, grid_calculations, etc.
 """
+import random
 import time
-from typing import Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 from sqlalchemy import text
 from loguru import logger
+
+
+# SQL Server deadlock victim error number — used by both pyodbc / SQLAlchemy.
+# 1205 = "Transaction was deadlocked on lock resources..."
+# We also catch the ODBC SQLSTATE '40001' (serialization failure) which
+# wraps deadlocks regardless of underlying number.
+_DEADLOCK_TOKENS = ("1205", "40001", "deadlocked", "deadlock victim")
+
+
+def _is_deadlock(exc: BaseException) -> bool:
+    """True when an exception looks like a SQL Server deadlock victim."""
+    msg = str(exc)
+    return any(tok in msg for tok in _DEADLOCK_TOKENS)
 
 
 # ==========================================================================
@@ -19,6 +33,56 @@ def run_sql(conn, sql: str, params: dict = None):
     """Execute SQL and commit. Central point for all DDL/DML fire-and-forget."""
     conn.execute(text(sql) if isinstance(sql, str) else sql, params or {})
     conn.commit()
+
+
+def retry_on_deadlock(
+    fn: Callable[[], Any],
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 0.4,
+    label: str = "",
+) -> Any:
+    """Run `fn()` and transparently retry on SQL Server deadlock victim errors.
+
+    On a deadlock the rolled-back transaction is *fully* released by SQL
+    Server, so the simplest correct response is exactly: wait a moment,
+    rerun. We use exponential backoff with jitter to avoid hot-spinning
+    when multiple workers are pummelling the same pages.
+
+    Re-raises any non-deadlock exception unchanged. Re-raises the last
+    deadlock if all `max_attempts` are exhausted.
+
+    Caller contract: `fn` must encapsulate its **own** transaction (open
+    its own engine.connect()/raw_connection() inside fn, run the SQL,
+    commit, close). Retrying with a stale already-rolled-back connection
+    won't work.
+    """
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            if not _is_deadlock(e):
+                raise
+            last_exc = e
+            if attempt >= max_attempts:
+                logger.error(
+                    f"[deadlock-retry] {label or fn.__name__}: "
+                    f"giving up after {max_attempts} attempts: {str(e)[:200]}"
+                )
+                raise
+            # Exponential backoff with jitter: 0.4s, 0.8s, 1.6s ± 30%
+            delay = base_delay * (2 ** (attempt - 1))
+            delay *= 1.0 + random.uniform(-0.3, 0.3)
+            logger.warning(
+                f"[deadlock-retry] {label or fn.__name__}: "
+                f"attempt {attempt}/{max_attempts} hit deadlock, "
+                f"sleeping {delay:.2f}s and retrying"
+            )
+            time.sleep(delay)
+    # Defensive — _should_ have raised already
+    if last_exc is not None:
+        raise last_exc
 
 
 # ==========================================================================

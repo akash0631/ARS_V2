@@ -12,13 +12,13 @@ last_reviewed: 2026-04-20
 
 ## Current access state (live)
 
-<!-- @metric sql="SELECT COUNT(*) FROM rbac_users" label="Total users" -->
+<!-- @metric db="system" sql="SELECT COUNT(*) FROM rbac_users" label="Total users" -->
 
-<!-- @metric sql="SELECT COUNT(*) FROM rbac_roles" label="Defined roles" -->
+<!-- @metric db="system" sql="SELECT COUNT(*) FROM rbac_roles" label="Defined roles" -->
 
-<!-- @metric sql="SELECT COUNT(*) FROM rbac_permissions" label="Permissions in catalogue" -->
+<!-- @metric db="system" sql="SELECT COUNT(*) FROM rbac_permissions" label="Permissions in catalogue" -->
 
-<!-- @metric sql="SELECT COUNT(*) FROM audit_log WHERE created_at >= DATEADD(day, -1, GETDATE())" label="Audit events in last 24 h" -->
+<!-- @metric db="system" sql="SELECT COUNT(*) FROM audit_log WHERE created_at >= DATEADD(day, -1, GETDATE())" label="Audit events in last 24 h" -->
 
 ## In plain English
 

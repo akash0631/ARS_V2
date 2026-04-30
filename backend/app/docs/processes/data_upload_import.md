@@ -12,7 +12,7 @@ last_reviewed: 2026-04-20
 
 ## Recent upload activity (live)
 
-<!-- @metric format="table" sql="SELECT TOP 10 resource_id AS [Table], MAX(created_at) AS last_upload, MAX(username) AS uploader FROM audit_log WHERE action='UPLOAD_DATA' GROUP BY resource_id ORDER BY MAX(created_at) DESC" label="Last 10 tables uploaded to" -->
+<!-- @metric db="system" format="table" sql="SELECT TOP 10 resource_id AS [Table], MAX(created_at) AS last_upload, MAX(username) AS uploader FROM audit_log WHERE action='UPLOAD_DATA' GROUP BY resource_id ORDER BY MAX(created_at) DESC" label="Last 10 tables uploaded to" -->
 
 ## In plain English
 

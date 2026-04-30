@@ -40,7 +40,7 @@ from loguru import logger
 
 from app.api.v1.endpoints.auth import get_current_user
 from app.models.rbac import User
-from app.database.session import get_data_engine
+from app.database.session import get_data_engine, get_system_engine
 
 router = APIRouter(prefix="/process", tags=["Process Docs"])
 
@@ -159,10 +159,38 @@ def _parse_attrs(s: str) -> Dict[str, str]:
 _SAFE_SQL_PREFIXES = ("select", "with")
 
 
+_SYSTEM_DB_TABLES = (
+    "rbac_users", "rbac_roles", "rbac_permissions",
+    "rbac_role_permissions", "rbac_user_roles",
+    "rls_stores", "rls_user_store_access", "rls_user_region_access",
+    "rls_user_category_access", "rls_column_restrictions",
+    "rls_table_role_access", "table_settings",
+    "audit_log", "export_settings", "export_jobs", "table_permissions",
+    "upload_jobs", "data_change_log", "msa_storage_jobs",
+    "sys_table_registry", "sys_column_registry",
+)
+
+
+def _pick_engine(db_hint: str, sql: str):
+    """Pick the engine based on explicit hint, then fall back to detecting
+    a known system-DB table name in the SQL. Default is the data engine."""
+    hint = (db_hint or "").strip().lower()
+    if hint in ("system", "claude"):
+        return get_system_engine()
+    if hint in ("data", "rep_data", "repdata"):
+        return get_data_engine()
+    lowered = sql.lower()
+    for t in _SYSTEM_DB_TABLES:
+        if re.search(rf"\b{t}\b", lowered):
+            return get_system_engine()
+    return get_data_engine()
+
+
 def _resolve_metric(attrs: Dict[str, str]) -> str:
     sql   = (attrs.get("sql") or "").strip()
     label = attrs.get("label") or "metric"
     fmt   = attrs.get("format") or "scalar"   # scalar | table
+    db    = attrs.get("db") or ""             # system | data (auto-detect if blank)
 
     if not sql:
         return f"_[metric error: sql missing]_"
@@ -171,8 +199,8 @@ def _resolve_metric(attrs: Dict[str, str]) -> str:
 
     def run():
         try:
-            de = get_data_engine()
-            with de.connect() as c:
+            eng = _pick_engine(db, sql)
+            with eng.connect() as c:
                 rows = c.execute(text(sql)).fetchall()
         except Exception as e:
             logger.warning(f"process @metric failed: {e}")
@@ -186,7 +214,7 @@ def _resolve_metric(attrs: Dict[str, str]) -> str:
         v = first[0] if len(first) else None
         return {"value": v}
 
-    data = _cached(f"metric::{sql}::{fmt}", run)
+    data = _cached(f"metric::{db}::{sql}::{fmt}", run)
 
     if "error" in data:
         return f"> ⚠️ metric `{label}` failed: `{data['error']}`"

@@ -788,13 +788,35 @@ export default function ListingPage() {
         allocation_mode: allocationMode,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
       })
-      toast.success(`Retried ${data.retried} failed MAJ_CAT(s)`)
-      // Refresh progress + failed list one more time post-retry.
-      try {
-        const { data: pd } = await listingAPI.allocProgress(allocBatchId)
-        setAllocProgress(pd?.progress || null)
-        setAllocFailed(pd?.failed || [])
-      } catch { /* ignore */ }
+      // The backend now returns one of:
+      //   { retried > 0,  still_failed, progress, failed }  → real retry happened
+      //   { retried = 0,  message }                          → nothing was failed (in-flight)
+      const retried = data.retried || 0
+      const stillFailed = data.still_failed
+      if (retried === 0 && data.message) {
+        // Already-running case — show backend's explanation, don't claim success.
+        toast(data.message, { icon: 'i', duration: 6000 })
+      } else if (stillFailed != null && stillFailed > 0) {
+        toast.error(
+          `Retried ${retried} MAJ_CAT(s); ${stillFailed} still failed. Check logs.`,
+          { duration: 8000 },
+        )
+      } else {
+        toast.success(`Retried ${retried} failed MAJ_CAT(s) — all succeeded.`)
+      }
+      // Push the post-retry progress/failed straight from the response so
+      // the UI updates immediately, even if the next poll is a few seconds
+      // away. Fall back to a fresh poll if the backend didn't include them.
+      if (data.progress) {
+        setAllocProgress(data.progress)
+        setAllocFailed(data.failed || [])
+      } else {
+        try {
+          const { data: pd } = await listingAPI.allocProgress(allocBatchId)
+          setAllocProgress(pd?.progress || null)
+          setAllocFailed(pd?.failed || [])
+        } catch { /* ignore */ }
+      }
       loadSummary()
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Retry failed')

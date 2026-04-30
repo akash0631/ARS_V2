@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
   Clock, Truck, FileText, ClipboardCheck, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
-  HardDrive
+  HardDrive, Code2
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -14,6 +14,8 @@ const navItems = [
   { label: 'Dashboard', path: '/', icon: LayoutDashboard, end: true },
   { label: 'Allocations', path: '/allocations', icon: PackageCheck, permission: 'ALLOC_READ' },
   { label: 'Process', path: '/process', icon: BookOpen },
+  // Developer Guide — superadmin only. Auto-introspecting, no SOP rot.
+  { label: 'Developer Guide', path: '/dev-guide', icon: Code2, superadminOnly: true },
 ]
 
 // Data Management submenu
@@ -211,7 +213,12 @@ export default function Sidebar({ collapsed, onToggle }) {
 
       {/* Nav */}
       <nav className="flex-1 px-2 py-3 space-y-0.5 overflow-y-auto">
-        {navItems.map(item => <SideLink key={item.path} item={item} collapsed={collapsed} />)}
+        {/* Top-level items: hide superadmin-only ones for non-superadmins;
+            permission gating on top-level was historically not enforced here,
+            so keep that behaviour to avoid regressing existing access. */}
+        {navItems
+          .filter(item => !(item.superadminOnly && !superadmin))
+          .map(item => <SideLink key={item.path} item={item} collapsed={collapsed} />)}
         
         {/* Data Management submenu */}
         <SubMenu 

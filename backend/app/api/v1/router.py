@@ -120,3 +120,7 @@ api_router.include_router(alloc_engine_router)
 # Process Docs (SOPs rendered on the Process page)
 from app.api.v1.endpoints.process_docs import router as process_docs_router
 api_router.include_router(process_docs_router)
+
+# Developer Guide — auto-introspecting docs for engineers
+from app.api.v1.endpoints.dev_guide import router as dev_guide_router
+api_router.include_router(dev_guide_router)

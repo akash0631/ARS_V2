@@ -15,7 +15,7 @@ class MSAService:
     def __init__(self, db, rls_categories: list = None):
         """
         Initialize MSAService
-        
+
         Args:
             db: SQLAlchemy session (Data DB session)
             rls_categories: Optional list of MAJ_CAT values the user can access.
@@ -24,7 +24,59 @@ class MSAService:
         self.db = db
         self.main_table = "VW_ET_MSA_STK_WITH_MASTER"
         self.pending_table = "MASTER_ALC_PEND"
+        self.hold_table = "ARS_NL_TBL_HOLD_TRACKING"
+        self.st_master_table = "Master_ALC_INPUT_ST_MASTER"
         self._rls_categories = rls_categories or []
+
+    # ------------------------------------------------------------------
+    # Open-hold loader (used by Step 6 to deduct reserved units from STK)
+    # ------------------------------------------------------------------
+    def _load_open_holds(self) -> pd.DataFrame:
+        """Aggregate HOLD_REM for currently-open NL/TBL hold reservations.
+
+        Returns a DataFrame with columns RDC, ARTICLE_NUMBER, HOLD_QTY ready
+        to merge into msa_pivot on (ST_CD, ARTICLE_NUMBER). The tracker stores
+        WERKS (store) so we map WERKS -> RDC via the store master to bring the
+        deduction up to the warehouse grain MSA operates at. Empty DataFrame
+        is returned if the tracker or master is absent — MSA still works,
+        just without the hold deduction.
+        """
+        try:
+            # Probe the RDC column name on the store master (varies by env)
+            cols_df = pd.read_sql(text(
+                "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_NAME = :t"
+            ), self.db.bind, params={"t": self.st_master_table})
+            cols_set = {str(c).upper() for c in cols_df["COLUMN_NAME"].tolist()}
+            rdc_col = next((c for c in ("RDC", "WAREHOUSE", "HUB", "WH_CD")
+                            if c in cols_set), None)
+            if not rdc_col:
+                logger.warning(
+                    f"_load_open_holds: no RDC column found on "
+                    f"{self.st_master_table}; skipping hold deduction"
+                )
+                return pd.DataFrame(columns=["RDC", "ARTICLE_NUMBER", "HOLD_QTY"])
+
+            sql = f"""
+                SELECT
+                    S.[{rdc_col}]   AS RDC,
+                    H.[VAR_ART]     AS ARTICLE_NUMBER,
+                    SUM(ISNULL(H.[HOLD_REM], 0)) AS HOLD_QTY
+                FROM [{self.hold_table}] H
+                INNER JOIN [{self.st_master_table}] S
+                    ON S.[ST_CD] = H.[WERKS]
+                WHERE ISNULL(H.[IS_CLOSED], 0) = 0
+                  AND ISNULL(H.[HOLD_REM], 0) > 0
+                GROUP BY S.[{rdc_col}], H.[VAR_ART]
+            """
+            holds = pd.read_sql(text(sql), self.db.bind)
+            holds["HOLD_QTY"] = pd.to_numeric(
+                holds["HOLD_QTY"], errors="coerce"
+            ).fillna(0)
+            return holds
+        except Exception as e:
+            logger.warning(f"_load_open_holds failed (skipping hold deduction): {e}")
+            return pd.DataFrame(columns=["RDC", "ARTICLE_NUMBER", "HOLD_QTY"])
 
     # ========================================================================
     # Data Discovery Methods
@@ -515,13 +567,49 @@ class MSAService:
                 logger.warning(f"Could not load pending allocations: {pend_err}")
                 msa_pivot["PEND_QTY"] = 0
 
+            # ============ STEP 6.5: DEDUCT OPEN HOLDS (NL/TBL reservations) ====
+            # Held units physically sit at the RDC but are reserved for a
+            # specific store from a previous TBL/NL allocation. They must not
+            # be re-offered to a different store on this run. Same shape as
+            # the PEND merge above so downstream classification logic picks
+            # HOLD_QTY up automatically.
+            try:
+                holds_pivot = self._load_open_holds()
+                if (
+                    not holds_pivot.empty
+                    and "ARTICLE_NUMBER" in msa_pivot.columns
+                ):
+                    msa_pivot = msa_pivot.merge(
+                        holds_pivot,
+                        left_on=["ST_CD", "ARTICLE_NUMBER"],
+                        right_on=["RDC", "ARTICLE_NUMBER"],
+                        how="left",
+                    )
+                    msa_pivot["HOLD_QTY"] = msa_pivot["HOLD_QTY"].fillna(0)
+                    msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
+                    logger.info(
+                        f"Merged open holds: {len(holds_pivot)} (RDC,ARTICLE) rows, "
+                        f"total HOLD_QTY={float(holds_pivot['HOLD_QTY'].sum()):.0f}"
+                    )
+                else:
+                    msa_pivot["HOLD_QTY"] = 0
+                    logger.info("No open holds to merge")
+            except Exception as hold_err:
+                logger.warning(f"Could not load open holds: {hold_err}")
+                msa_pivot["HOLD_QTY"] = 0
+
             # ============ STEP 7: CALCULATE FINAL QUANTITY ============
+            # FNL_Q = max(STK − PEND − HOLD, 0)
+            # PEND  = units already promised and being picked (MASTER_ALC_PEND)
+            # HOLD  = units reserved for specific stores from prior TBL/NL runs
+            #         (ARS_NL_TBL_HOLD_TRACKING). Subtracting both prevents
+            #         double-allocation of physically-shared warehouse stock.
             msa_pivot["FNL_Q"] = np.maximum(
-                msa_pivot["STK_QTY"] - msa_pivot["PEND_QTY"], 0
+                msa_pivot["STK_QTY"] - msa_pivot["PEND_QTY"] - msa_pivot["HOLD_QTY"], 0
             )
 
 
-            logger.info(f"Calculated FNL_Q")
+            logger.info(f"Calculated FNL_Q (after PEND + HOLD deduction)")
 
            
             
@@ -552,13 +640,13 @@ class MSAService:
 
             # Identify aggregate columns (SLOC columns + MOA columns + calculated columns)
             sloc_cols_list = [c for c in msa_pivot.columns
-                if c not in pivot_keys + ["STK_QTY", "PEND_QTY", "FNL_Q", "RDC"]
+                if c not in pivot_keys + ["STK_QTY", "PEND_QTY", "HOLD_QTY", "FNL_Q", "RDC"]
                 and pd.api.types.is_numeric_dtype(msa_gen_clr_var[c])]
             moa_cols_list = [c for c in pend_merged_cols
                 if c not in ["ARTICLE_NUMBER", "RDC"]
                 and c in msa_gen_clr_var.columns
                 and pd.api.types.is_numeric_dtype(msa_gen_clr_var[c])]
-            calculated_cols = ["STK_QTY", "PEND_QTY", "FNL_Q"]
+            calculated_cols = ["STK_QTY", "PEND_QTY", "HOLD_QTY", "FNL_Q"]
 
             # Classify each column
             for col in msa_gen_clr_var.columns:

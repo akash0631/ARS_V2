@@ -43,6 +43,7 @@ const TrendAdminPage         = lazy(() => import('@/pages/TrendAdminPage'))
 const TrendDashboardPage     = lazy(() => import('@/pages/TrendDashboardPage'))
 const ProcessPage            = lazy(() => import('@/pages/ProcessPage'))
 const TempDBAdminPage        = lazy(() => import('@/pages/TempDBAdminPage'))
+const DeveloperGuidePage     = lazy(() => import('@/pages/DeveloperGuidePage'))
 
 function PageLoader() {
   return (
@@ -123,6 +124,7 @@ export default function App() {
         <Route path="data-prep/listing" element={<ErrorBoundary><ListingPage /></ErrorBoundary>} />
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />
         <Route path="process" element={<ErrorBoundary><ProcessPage /></ErrorBoundary>} />
+        <Route path="dev-guide" element={<ErrorBoundary><DeveloperGuidePage /></ErrorBoundary>} />
         {/* Trends */}
         <Route path="trends/dashboard" element={<ProtectedRoute permission="TRENDS_DASHBOARD"><ErrorBoundary><TrendDashboardPage /></ErrorBoundary></ProtectedRoute>} />
         <Route path="trends/upload" element={<ProtectedRoute permission="TRENDS_UPLOAD"><ErrorBoundary><TrendUploadPage /></ErrorBoundary></ProtectedRoute>} />
