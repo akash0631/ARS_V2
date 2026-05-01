@@ -97,7 +97,15 @@ def seed_queue(conn, batch_id: str, alloc_table: str,
     only_majcats=None     -> seed every MAJ_CAT present in alloc_table.
     only_majcats=[...]    -> seed only the given list (used by retry endpoint).
 
-    Returns the number of rows inserted.
+    Idempotent: rows already in the queue for (BATCH_ID, MAJ_CAT) are
+    skipped via NOT EXISTS, so the manual retry path (which leaves the
+    queue rows in place and just flips them PENDING via
+    reset_failed_for_retry) does not collide with the PK.
+
+    Returns the count of PENDING rows in the queue for this batch *after*
+    the upsert — not just the number of new rows inserted. Retry callers
+    rely on this so the "queue empty → bail" guard in the engines doesn't
+    fire when nothing needed to be inserted.
 
     Performance notes:
     - GROUP BY uses the narrow IX_<alloc_table>_majcat index (added in
@@ -108,8 +116,6 @@ def seed_queue(conn, batch_id: str, alloc_table: str,
       NOLOCK keeps us off any leftover IX/SCH-S waits either way.
     - OPTION (MAXDOP 4) lets SQL Server parallelise the aggregate when the
       table is large; it's a no-op on small/medium tables.
-    - We use @@ROWCOUNT instead of a follow-up SELECT COUNT(*) to avoid a
-      second full scan of the queue table.
     """
     import time as _time
     ensure_queue_table(conn)
@@ -126,20 +132,33 @@ def seed_queue(conn, batch_id: str, alloc_table: str,
     res = conn.execute(text(f"""
         INSERT INTO {QUEUE_TABLE}
             (BATCH_ID, MAJ_CAT, OPT_COUNT, STATUS, ALLOCATION_MODE)
-        SELECT :batch_id, MAJ_CAT, COUNT_BIG(*), 'PENDING', :mode
-        FROM [{alloc_table}] WITH (NOLOCK)
-        WHERE MAJ_CAT IS NOT NULL {where_mc}
-        GROUP BY MAJ_CAT
+        SELECT :batch_id, src.MAJ_CAT, src.cnt, 'PENDING', :mode
+        FROM (
+            SELECT MAJ_CAT, COUNT_BIG(*) AS cnt
+            FROM [{alloc_table}] WITH (NOLOCK)
+            WHERE MAJ_CAT IS NOT NULL {where_mc}
+            GROUP BY MAJ_CAT
+        ) src
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {QUEUE_TABLE} q
+            WHERE q.BATCH_ID = :batch_id AND q.MAJ_CAT = src.MAJ_CAT
+        )
         OPTION (MAXDOP 4)
     """), params)
     conn.commit()
-    n = int(res.rowcount or 0)
+    inserted = int(res.rowcount or 0)
+
+    # Total queue rows for this batch — what callers need for the
+    # "anything to do?" check after a no-op retry seed.
+    total = int(conn.execute(text(
+        f"SELECT COUNT(*) FROM {QUEUE_TABLE} WHERE BATCH_ID = :b"
+    ), {"b": batch_id}).scalar() or 0)
 
     logger.info(
-        f"[queue] seeded {n} MAJ_CATs for batch_id={batch_id} "
-        f"in {_time.time() - t0:.1f}s"
+        f"[queue] seeded batch_id={batch_id}: inserted={inserted} "
+        f"total={total} in {_time.time() - t0:.1f}s"
     )
-    return n
+    return total
 
 
 # ---------------------------------------------------------------------------
