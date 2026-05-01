@@ -315,14 +315,19 @@ export const gridBuilderAPI = {
 // + a short timeout so transient backend pressure during a Generate run
 // doesn't spam the user with timeout toasts.
 const _POLL = { quiet: true, timeout: 30000 }
+// Foreground (quiet:false) callers — initial page load, explicit refresh —
+// run with no timeout: a cold Azure SQL connection can take well over 30s
+// on the first config/summary query and we'd rather wait than fail.
+const _FOREGROUND = { timeout: 0 }
+const _pollOrForeground = (opts) => (opts?.quiet ? { ..._POLL, ...opts } : { ..._FOREGROUND, ...opts })
 export const listingAPI = {
-  // config / summary default to polling-friendly (quiet) but the caller can
-  // override with { quiet: false } when it's a foreground/user action that
-  // should surface the error toast.
-  config:       (opts={}) => api.get('/listing/config',  { ..._POLL, ...opts }),
+  // config / summary default to foreground (long timeout, error toast). Pass
+  // { quiet: true } from background pollers to suppress the toast and use the
+  // shorter polling timeout.
+  config:       (opts={}) => api.get('/listing/config',  _pollOrForeground(opts)),
   generate:     (data, opts) => api.post('/listing/generate', data, { timeout: 600000, ...opts }),
   preview:      (params) => api.get('/listing/preview', { params }),
-  summary:      (opts={}) => api.get('/listing/summary', { ..._POLL, ...opts }),
+  summary:      (opts={}) => api.get('/listing/summary', _pollOrForeground(opts)),
   export:       (params) => api.get('/listing/export', { params, responseType: 'blob', timeout: 600000 }),
   createFinal:  (data)   => api.post('/listing/create-final', data || {}),
   storeRanking: (params) => api.get('/listing/store-ranking', { params }),
@@ -350,6 +355,21 @@ export const listingAPI = {
   sessionLog:    (sid, tail) => api.get(`/listing/sessions/${sid}/log`, { params: tail ? { tail } : {} }),
   killSession:   (sid)       => api.post(`/listing/sessions/${sid}/kill`),
   deleteSession: (sid)       => api.delete(`/listing/sessions/${sid}`),
+  // Park-then-promote alloc history: snapshot of ARS_ALLOC_WORKING per
+  // run lands in ARS_ALLOC_PARKED awaiting review; on Approve it moves
+  // to ARS_ALLOC_HISTORY (permanent record); on Reject it stays parked
+  // with PARK_STATUS='REJECTED' for audit.
+  parkedRuns:      (includeRejected=false) =>
+                    api.get('/listing/parked-runs',
+                            { params: { include_rejected: includeRejected }, ..._POLL }),
+  // which: 'alloc' (ARS_ALLOC_PARKED) | 'listing' (ARS_LISTING_WORKING_PARKED)
+  parkedRunDetail: (sid, params={}) =>
+                    api.get(`/listing/parked-runs/${sid}`, { params }),
+  approveParked:   (sid) => api.post(`/listing/parked-runs/${sid}/approve`),
+  rejectParked:    (sid, note) =>
+                    api.post(`/listing/parked-runs/${sid}/reject`, { note: note || '' }),
+  allocHistory:    (params) => api.get('/listing/alloc-history', { params }),
+  listingHistory:  (params) => api.get('/listing/listing-history', { params }),
 }
 
 // ============== Lookup Art Master (Data Preparation) ==============
@@ -486,6 +506,19 @@ export const reportsAPI = {
     Object.entries(filters).forEach(([col, vals]) => { if (vals.length) params[`f_${col}`] = vals.join(',') })
     return api.get('/reports/pend-alc/download', { params, responseType: 'blob', timeout: 600000 })
   },
+}
+
+// ============== Hold Dashboard (HOLD_QTY review across angles) ==============
+export const holdDashboardAPI = {
+  summary:        () => api.get('/hold-dashboard/summary'),
+  byStore:        (params) => api.get('/hold-dashboard/by-store', { params }),
+  byRdc:          (params) => api.get('/hold-dashboard/by-rdc', { params }),
+  byArticle:      (params) => api.get('/hold-dashboard/by-article', { params }),
+  byStatus:       () => api.get('/hold-dashboard/by-status'),
+  byAge:          () => api.get('/hold-dashboard/by-age'),
+  timeline:       (params) => api.get('/hold-dashboard/timeline', { params }),
+  detail:         (params) => api.get('/hold-dashboard/detail', { params }),
+  reconciliation: () => api.get('/hold-dashboard/reconciliation'),
 }
 
 export default api
