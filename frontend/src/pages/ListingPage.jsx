@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 import { BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import * as XLSX from 'xlsx'
 
 /* ── Searchable Multi-Select (dropdown only on search) ────────────────── */
 function SearchSelect({ label, items, selected, setSelected, placeholder }) {
@@ -2790,6 +2791,43 @@ export default function ListingPage() {
         const grandAlloc = rows.reduce((s, r) => s + r.totalAlloc, 0)
         const grandStock = rows.reduce((s, r) => s + r.totalStock, 0)
 
+        const exportMajCatExcel = () => {
+          const headers = ['#', 'MAJ_CAT']
+          rdcs.forEach(rdc => { headers.push(`${rdc} STOCK`, `${rdc} ALLOC`, `${rdc} %`) })
+          headers.push('TOTAL STOCK', 'TOTAL ALLOC', 'TOTAL %')
+          const data = rows.map((row, i) => {
+            const r = { '#': i + 1, MAJ_CAT: row.maj_cat }
+            rdcs.forEach(rdc => {
+              const cell = row.d[rdc] || { alloc_qty: 0, stock_avail: 0 }
+              const pct  = cell.stock_avail > 0 ? parseFloat((cell.alloc_qty / cell.stock_avail * 100).toFixed(1)) : 0
+              r[`${rdc} STOCK`] = cell.stock_avail
+              r[`${rdc} ALLOC`] = cell.alloc_qty
+              r[`${rdc} %`]     = pct
+            })
+            r['TOTAL STOCK'] = row.totalStock
+            r['TOTAL ALLOC'] = row.totalAlloc
+            r['TOTAL %']     = row.totalStock > 0 ? parseFloat(row.totalPct.toFixed(1)) : 0
+            return r
+          })
+          // Grand total row
+          const grand = { '#': '', MAJ_CAT: 'TOTAL' }
+          rdcs.forEach(rdc => {
+            const s = rows.reduce((a, row) => a + (row.d[rdc]?.stock_avail || 0), 0)
+            const q = rows.reduce((a, row) => a + (row.d[rdc]?.alloc_qty  || 0), 0)
+            grand[`${rdc} STOCK`] = s
+            grand[`${rdc} ALLOC`] = q
+            grand[`${rdc} %`]     = s > 0 ? parseFloat((q / s * 100).toFixed(1)) : 0
+          })
+          grand['TOTAL STOCK'] = grandStock
+          grand['TOTAL ALLOC'] = grandAlloc
+          grand['TOTAL %']     = grandStock > 0 ? parseFloat((grandAlloc / grandStock * 100).toFixed(1)) : 0
+          data.push(grand)
+          const ws = XLSX.utils.json_to_sheet(data, { header: headers })
+          const wb = XLSX.utils.book_new()
+          XLSX.utils.book_append_sheet(wb, ws, 'MAJ_CAT Summary')
+          XLSX.writeFile(wb, `majcat_summary_${new Date().toISOString().slice(0,10)}.xlsx`)
+        }
+
         const thSort = (col, label, style = {}) => {
           const active = mcSortCol === col
           return (
@@ -2824,6 +2862,10 @@ export default function ListingPage() {
                     />
                     {mcFilter && <button onClick={() => setMcFilter('')} style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', padding: 0, color: C.textMuted }}><X size={10}/></button>}
                   </div>
+                  <button onClick={exportMajCatExcel} title="Export to Excel"
+                    style={{ display: 'flex', alignItems: 'center', gap: 4, height: 28, padding: '0 10px', fontSize: 11, fontWeight: 600, background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer' }}>
+                    <Download size={12}/> Excel
+                  </button>
                   <button onClick={() => setMajCatModalOpen(false)} style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 4, color: C.textSub }}><X size={16}/></button>
                 </div>
               </div>
@@ -2910,6 +2952,34 @@ export default function ListingPage() {
         const totalHold  = items.reduce((s, r) => s + (r.hold_qty  || 0), 0)
         const totalReq   = items.reduce((s, r) => s + (r.mj_req   || 0), 0)
         const hasReq = items.some(r => (r.mj_req || 0) > 0)
+
+        const exportStoreExcel = () => {
+          const data = items.map((r, i) => {
+            const share  = totalAlloc > 0 ? parseFloat(((r.alloc_qty || 0) / totalAlloc * 100).toFixed(1)) : 0
+            const reqPct = (r.mj_req || 0) > 0 ? parseFloat(((r.alloc_qty || 0) / r.mj_req * 100).toFixed(1)) : 0
+            const row = {
+              '#':         i + 1,
+              STORE:       r.werks,
+              ALLOC_QTY:   r.alloc_qty || 0,
+              HOLD_QTY:    r.hold_qty  || 0,
+            }
+            if (hasReq) { row.REQ = r.mj_req || 0; row['REQ%'] = reqPct }
+            row.ROWS      = r.row_count || 0
+            row['SHARE%'] = share
+            return row
+          })
+          // Total row
+          const tot = { '#': '', STORE: 'TOTAL', ALLOC_QTY: totalAlloc, HOLD_QTY: totalHold }
+          if (hasReq) { tot.REQ = totalReq; tot['REQ%'] = totalReq > 0 ? parseFloat((totalAlloc / totalReq * 100).toFixed(1)) : 0 }
+          tot.ROWS      = items.reduce((s, r) => s + (r.row_count || 0), 0)
+          tot['SHARE%'] = 100
+          data.push(tot)
+          const ws = XLSX.utils.json_to_sheet(data)
+          const wb = XLSX.utils.book_new()
+          XLSX.utils.book_append_sheet(wb, ws, 'Store Allocation')
+          XLSX.writeFile(wb, `store_allocation_${new Date().toISOString().slice(0,10)}.xlsx`)
+        }
+
         return (
           <div onClick={() => setStoreModalOpen(false)}
             style={{
@@ -2937,10 +3007,16 @@ export default function ListingPage() {
                     {hasReq && totalReq > 0 ? ` · REQ ${totalReq.toLocaleString()} · fill ${(totalAlloc / totalReq * 100).toFixed(1)}%` : ''}
                   </div>
                 </div>
-                <button onClick={() => setStoreModalOpen(false)}
-                  style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 4, color: C.textSub }}>
-                  <X size={16}/>
-                </button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <button onClick={exportStoreExcel} title="Export to Excel"
+                    style={{ display: 'flex', alignItems: 'center', gap: 4, height: 28, padding: '0 10px', fontSize: 11, fontWeight: 600, background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer' }}>
+                    <Download size={12}/> Excel
+                  </button>
+                  <button onClick={() => setStoreModalOpen(false)}
+                    style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 4, color: C.textSub }}>
+                    <X size={16}/>
+                  </button>
+                </div>
               </div>
               <div style={{ overflow: 'auto', padding: '4px 0' }}>
                 {items.length === 0 ? (
