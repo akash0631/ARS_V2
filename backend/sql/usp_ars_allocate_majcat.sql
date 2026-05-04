@@ -333,7 +333,9 @@ BEGIN
         SELECT T.*, P.FNL_Q_REM,
                ROW_NUMBER() OVER (
                  PARTITION BY T.RDC, T.MAJ_CAT, T.GEN_ART_NUMBER, T.CLR, T.VAR_ART, T.SZ
-                 ORDER BY T.OPT_PRIORITY_RANK ASC, ISNULL(T.ST_RANK, 999999) ASC
+                 ORDER BY
+                   T.OPT_PRIORITY_RANK ASC,
+                   ISNULL(T.ST_RANK, 999999) ASC
                ) AS ord
         FROM Target T
         INNER JOIN #nre_pool P

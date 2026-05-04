@@ -1,10 +1,10 @@
 import { NavLink } from 'react-router-dom'
-import { 
+import {
   LayoutDashboard, Table2, Upload, PackageCheck, Users, Shield, Eye, ScrollText,
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
   Clock, Truck, FileText, ClipboardCheck, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
-  HardDrive, Code2
+  HardDrive, Code2, Lock
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -48,6 +48,13 @@ const contributionItems = [
 // Reports submenu
 const reportsItems = [
   { label: 'Pending Allocation', path: '/reports/pend-alc', icon: ClipboardCheck, permission: 'REPORTS_PEND_ALC' },
+  { label: 'Hold Dashboard',     path: '/reports/hold',     icon: Lock },
+]
+
+// Pending Allocation lifecycle submenu
+const pendAlcItems = [
+  { label: 'Overview',     path: '/pend-alc/overview', icon: PackageCheck },
+  { label: 'Daily DO Entry', path: '/pend-alc/do-entry', icon: Truck },
 ]
 
 // Data Validation submenu
@@ -265,6 +272,15 @@ export default function Sidebar({ collapsed, onToggle }) {
           title="Reports"
           icon={Activity}
           items={reportsItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+        />
+
+        {/* Pending Allocation lifecycle */}
+        <SubMenu
+          title="Pending Allocation"
+          icon={Truck}
+          items={pendAlcItems}
           collapsed={collapsed}
           hasPermission={hasPermission}
         />

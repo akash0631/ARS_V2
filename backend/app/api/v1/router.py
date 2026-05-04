@@ -53,6 +53,12 @@ from app.api.v1.endpoints.maintenance import router as maintenance_router
 # Phase 6: Dashboard
 from app.api.v1.endpoints.dashboard import router as dashboard_router
 
+# Hold Dashboard — review HOLD_QTY across multiple angles
+from app.api.v1.endpoints.hold_dashboard import router as hold_dashboard_router
+
+# Pending Allocation — ARS_PEND_ALC lifecycle management
+from app.api.v1.endpoints.pend_alc import router as pend_alc_router
+
 api_router = APIRouter(prefix="/api/v1")
 
 # Phase 1
@@ -92,6 +98,8 @@ api_router.include_router(lookup_art_master_router)
 
 # Phase 6
 api_router.include_router(dashboard_router)
+api_router.include_router(hold_dashboard_router)
+api_router.include_router(pend_alc_router)
 
 # Data Checklist
 api_router.include_router(checklist_router)

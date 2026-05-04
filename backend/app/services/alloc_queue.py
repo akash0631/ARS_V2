@@ -6,10 +6,21 @@ rule_engine_parallel_python.py and rule_engine_parallel_sql.py.
 Backing table: ARS_ALLOC_MAJCAT_QUEUE (created by migration 011).
 
 Lifecycle of a row:
-    PENDING  -> claim_next  -> IN_PROGRESS  -> mark_done   -> DONE
-                                            -> mark_failed -> FAILED
-    FAILED   -> reset_failed_for_retry      -> PENDING       (manual retry)
-    FAILED   -> claim_next (ATTEMPTS<MAX)   -> IN_PROGRESS   (auto retry)
+    PENDING   -> claim_next   -> IN_PROGRESS  -> mark_done   -> DONE
+                                              -> mark_failed -> FAILED
+    FAILED    -> reset_failed_for_retry       -> PENDING       (manual retry)
+    FAILED    -> claim_next (ATTEMPTS<MAX)    -> IN_PROGRESS   (auto retry)
+
+    PENDING / IN_PROGRESS / FAILED -> /listing/cancel-batch -> CANCELLED
+                                                              (terminal; never retried)
+
+CANCELLED is a TERMINAL state. claim_next won't pick it (its WHERE filter
+is PENDING-or-FAILED-with-budget, so CANCELLED is implicitly excluded).
+mark_in_progress / mark_done / mark_failed all refuse to overwrite a row
+that is already CANCELLED — so a subprocess worker that finishes its
+in-flight MAJ_CAT after the user clicked Cancel cannot resurrect the row.
+reset_failed_for_retry filters STATUS='FAILED' so manual retry never
+revives a user-cancelled row.
 """
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -205,6 +216,10 @@ def mark_in_progress(conn, batch_id: str, mc: str, worker_id: int) -> None:
     we still want the dashboard to show the live `In progress` count.
     Idempotent — safe to call again on retry.
     """
+    # Explicitly exclude CANCELLED — a subprocess worker that was already
+    # mid-flight when the user clicked Cancel must NOT resurrect a cancelled
+    # row by flipping it back to IN_PROGRESS. PENDING / FAILED stay claimable
+    # for legitimate retries.
     conn.execute(text(f"""
         UPDATE {QUEUE_TABLE}
            SET STATUS    = 'IN_PROGRESS',
@@ -220,6 +235,9 @@ def mark_in_progress(conn, batch_id: str, mc: str, worker_id: int) -> None:
 def mark_done(conn, batch_id: str, mc: str,
               ship: float, hold: float,
               rows_affected: int, duration_sec: float) -> None:
+    """Mark a MAJ_CAT row DONE. **Refuses to overwrite STATUS='CANCELLED'**
+    so a subprocess worker that finishes its in-flight MAJ_CAT after the
+    user clicked Cancel can't resurrect the row by writing DONE on top."""
     conn.execute(text(f"""
         UPDATE {QUEUE_TABLE}
            SET STATUS         = 'DONE',
@@ -230,6 +248,7 @@ def mark_done(conn, batch_id: str, mc: str,
                DURATION_SEC   = :d,
                ERROR_MSG      = NULL
          WHERE BATCH_ID = :b AND MAJ_CAT = :mc
+           AND STATUS <> 'CANCELLED'
     """), {
         "b": batch_id, "mc": mc,
         "sh": float(ship), "ho": float(hold),
@@ -240,6 +259,10 @@ def mark_done(conn, batch_id: str, mc: str,
 
 def mark_failed(conn, batch_id: str, mc: str,
                 error: str, duration_sec: float) -> None:
+    """Mark a MAJ_CAT row FAILED. **Refuses to overwrite STATUS='CANCELLED'**
+    so a worker that errors after a user cancel doesn't downgrade the row's
+    status from CANCELLED → FAILED (which would make it eligible for
+    retry-failed and resurrect cancelled work)."""
     conn.execute(text(f"""
         UPDATE {QUEUE_TABLE}
            SET STATUS       = 'FAILED',
@@ -247,6 +270,7 @@ def mark_failed(conn, batch_id: str, mc: str,
                ERROR_MSG    = :e,
                DURATION_SEC = :d
          WHERE BATCH_ID = :b AND MAJ_CAT = :mc
+           AND STATUS <> 'CANCELLED'
     """), {
         "b": batch_id, "mc": mc,
         "e": (error or "")[:2000],

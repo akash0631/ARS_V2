@@ -77,9 +77,27 @@ CREATE TABLE dbo.{SESSIONS_TABLE} (
     STEP_TIMINGS      NVARCHAR(MAX)  NULL,
     REQUEST_JSON      NVARCHAR(MAX)  NULL,
     LOG_FILE_PATH     NVARCHAR(500)  NULL,
+    TABLES_AFFECTED   NVARCHAR(MAX)  NULL,
+    PARKED_STATUS     NVARCHAR(20)   NULL,
     CONSTRAINT PK_{SESSIONS_TABLE} PRIMARY KEY (SESSION_ID)
 );
 """
+
+# Idempotent column-add for existing deployments (table already created
+# without the new fields). Runs after table-create so the columns exist on
+# both fresh and upgraded DBs.
+_COLUMN_RECONCILE_DDL = [
+    (
+        "TABLES_AFFECTED",
+        f"IF COL_LENGTH('dbo.{SESSIONS_TABLE}','TABLES_AFFECTED') IS NULL "
+        f"ALTER TABLE dbo.{SESSIONS_TABLE} ADD TABLES_AFFECTED NVARCHAR(MAX) NULL",
+    ),
+    (
+        "PARKED_STATUS",
+        f"IF COL_LENGTH('dbo.{SESSIONS_TABLE}','PARKED_STATUS') IS NULL "
+        f"ALTER TABLE dbo.{SESSIONS_TABLE} ADD PARKED_STATUS NVARCHAR(20) NULL",
+    ),
+]
 
 _INDEX_DDL = (
     f"IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_{SESSIONS_TABLE}_started') "
@@ -92,6 +110,12 @@ _INDEX_DDL = (
 def ensure_sessions_table(conn) -> None:
     """Idempotent — ensures the sessions table + index exist."""
     conn.execute(text(_SCHEMA_DDL))
+    # Add columns introduced after the table was first created.
+    for col_name, ddl in _COLUMN_RECONCILE_DDL:
+        try:
+            conn.execute(text(ddl))
+        except Exception as e:
+            logger.warning(f"[sessions] add column {col_name} failed: {e}")
     try:
         conn.execute(text(_INDEX_DDL))
     except Exception as e:
@@ -182,12 +206,18 @@ def start_session(
 
 def end_session(
     session_id: str,
-    status: str,                 # 'SUCCESS' | 'FAILED'
+    status: str,                 # 'SUCCESS' | 'FAILED' | 'CANCELLED'
     summary: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Close a session: write summary metrics to the DB row and detach the
     loguru sink. Always call this from a finally: even on exception.
+
+    **Cancel-safe**: refuses to overwrite a session row whose STATUS is
+    already 'CANCELLED'. The cancel pathway (cancel_batch / kill_session)
+    flips STATUS to 'CANCELLED' the moment the user clicks Cancel; if the
+    background daemon thread later finishes its remaining work and tries
+    to call end_session('SUCCESS', ...), this guard preserves the cancel.
     """
     summary = summary or {}
     with logger.contextualize(session_id=session_id):
@@ -200,20 +230,29 @@ def end_session(
 
     # Update DB row
     engine = get_data_engine()
+    tables_affected = summary.get("tables_affected")
+    parked_status   = summary.get("parked_status")
     try:
         with engine.connect() as conn:
+            ensure_sessions_table(conn)  # add new cols on legacy DBs
             conn.execute(text(f"""
                 UPDATE {SESSIONS_TABLE} SET
-                    COMPLETED_AT   = GETDATE(),
-                    DURATION_SEC   = :dur,
-                    STATUS         = :status,
-                    LISTED_OPTS    = :listed,
-                    ALLOC_ROWS     = :alloc_rows,
-                    SHIP_QTY_TOTAL = :ship,
-                    HOLD_QTY_TOTAL = :hold,
-                    FAILED_MAJCATS = :failed,
-                    ERROR_MSG      = :err,
-                    STEP_TIMINGS   = :timings
+                    COMPLETED_AT     = GETDATE(),
+                    DURATION_SEC     = :dur,
+                    STATUS           = CASE WHEN STATUS = 'CANCELLED'
+                                            THEN STATUS
+                                            ELSE :status END,
+                    LISTED_OPTS      = :listed,
+                    ALLOC_ROWS       = :alloc_rows,
+                    SHIP_QTY_TOTAL   = :ship,
+                    HOLD_QTY_TOTAL   = :hold,
+                    FAILED_MAJCATS   = :failed,
+                    ERROR_MSG        = CASE WHEN STATUS = 'CANCELLED'
+                                            THEN ERROR_MSG
+                                            ELSE :err END,
+                    STEP_TIMINGS     = :timings,
+                    TABLES_AFFECTED  = :tables_affected,
+                    PARKED_STATUS    = :parked_status
                 WHERE SESSION_ID = :sid
             """), {
                 "sid":        session_id,
@@ -227,6 +266,12 @@ def end_session(
                 "err":        (summary.get("error") or "")[:2000] or None,
                 "timings":    json.dumps(summary.get("step_timings") or [],
                                          default=str)[:30000],
+                "tables_affected": (
+                    json.dumps(tables_affected, default=str)
+                    if tables_affected is not None else None
+                ),
+                "parked_status":   (parked_status[:20]
+                                     if parked_status else None),
             })
             conn.commit()
     except Exception as e:
@@ -307,7 +352,7 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
                    RDC_MODE, STORE_COUNT, MAJCAT_COUNT,
                    LISTED_OPTS, ALLOC_ROWS, SHIP_QTY_TOTAL, HOLD_QTY_TOTAL,
                    FAILED_MAJCATS, ERROR_MSG, STEP_TIMINGS, REQUEST_JSON,
-                   LOG_FILE_PATH
+                   LOG_FILE_PATH, TABLES_AFFECTED, PARKED_STATUS
             FROM {SESSIONS_TABLE} WHERE SESSION_ID = :sid
         """), {"sid": session_id}).fetchone()
     if not row:
@@ -339,6 +384,8 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         "step_timings":   _maybe_json(row[17]),
         "request":        _maybe_json(row[18]),
         "log_file_path":  row[19],
+        "tables_affected": _maybe_json(row[20]),
+        "parked_status":   row[21],
     }
 
 
@@ -365,26 +412,29 @@ def kill_session(session_id: str, reason: str = "killed by user") -> Dict[str, A
     sess_row_updated = False
     with engine.connect() as conn:
         ensure_sessions_table(conn)
-        # 1) Mark the session row FAILED so the listing-sessions UI shows
-        #    it ended (only if still RUNNING — a no-op otherwise).
+        # 1) Mark the session row CANCELLED so the orchestrator's post-Part-8
+        #    cancel check sees it and short-circuits before Part 8.4 / 8.5
+        #    / 8.6 / parking. (Only if still RUNNING — no-op otherwise.)
         res = conn.execute(text(f"""
             UPDATE {SESSIONS_TABLE}
-               SET STATUS       = 'FAILED',
+               SET STATUS       = 'CANCELLED',
                    COMPLETED_AT = GETDATE(),
                    ERROR_MSG    = LEFT(ISNULL(ERROR_MSG,'') + :why, 2000)
              WHERE SESSION_ID = :sid AND STATUS = 'RUNNING'
         """), {"sid": session_id, "why": f" [{reason}]"})
         sess_row_updated = bool(res.rowcount)
-        # 2) Cancel the linked alloc-queue rows (batch_id == session_id for
-        #    parallel modes — no-op for sequential, which doesn't seed a queue).
+        # 2) Mark the linked alloc-queue rows CANCELLED (terminal — never
+        #    re-claimed by claim_next, never resurrected by mark_in_progress).
+        #    Also freezes any deadlock-FAILED rows that would otherwise be
+        #    auto-retried by the next claim_next call.
         try:
             res2 = conn.execute(text(f"""
                 UPDATE {QUEUE_TABLE}
-                   SET STATUS       = 'FAILED',
+                   SET STATUS       = 'CANCELLED',
                        COMPLETED_AT = GETDATE(),
                        ERROR_MSG    = LEFT(ISNULL(ERROR_MSG,'') + :why, 2000)
                  WHERE BATCH_ID = :sid
-                   AND STATUS IN ('PENDING','IN_PROGRESS')
+                   AND STATUS IN ('PENDING','IN_PROGRESS','FAILED')
             """), {"sid": session_id, "why": f" [{reason}]"})
             cancelled_queue_rows = int(res2.rowcount or 0)
         except Exception as e:

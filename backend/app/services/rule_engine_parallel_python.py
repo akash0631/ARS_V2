@@ -319,8 +319,11 @@ def run_listing_and_allocation_python_parallel(
         for f in as_completed(futures):
             f.result()  # propagate unexpected exceptions
 
-    # All workers done — drop the cancel registry for this batch_id.
-    ac.cleanup(batch_id)
+    # NOTE: do NOT call ac.cleanup(batch_id) here. The orchestrator
+    # (_generate_listing_impl) needs to query is_cancelled / is_session_cancelled
+    # AFTER this function returns to decide whether to skip Part 8.4 / 8.5
+    # / 8.6. Cleanup happens once at the very end of the daemon thread's
+    # finally block in listing.py:_run_generate_in_thread.
 
     # ── Finalise on main thread (verbatim from rule_engine_new._stage_c_waterfall) ──
     with engine.connect() as conn:
@@ -386,10 +389,14 @@ def run_listing_and_allocation_python_parallel(
 def _run_one_majcat(conn, working_table, alloc_table, mc, grids,
                     pri_ct_check_rl: bool, pri_ct_check_tbc: bool):
     """
-    Run RL → TBC → TBL waterfall for ONE MAJ_CAT. Operates on the worker's
-    own connection / session (= its own #nre_pool and its own ROUND_*
-    deltas — but ROUND_* live on alloc_table which IS shared, so they are
-    scoped per MAJ_CAT in every UPDATE below).
+    Run RL → TBC → TBL waterfall for ONE MAJ_CAT.
+
+    Execution order: OPT_TYPE → round → ST_RANK → OPT_PRIORITY_RANK.
+    Round 1 is completed for ALL stores (in ST_RANK priority order) before
+    round 2 starts. Within each round, the store with the best ST_RANK (=1)
+    exhausts its OPTs before the next store starts. Revalidation (MSA_FNL_Q_REM,
+    PRI_CT_REM, skip rules) is scoped to the current store via the werks
+    parameter so one store's deductions don't prematurely skip another.
     """
     for ot in rne.OPT_TYPE_ORDER:
         bounds = conn.execute(text(f"""
@@ -402,41 +409,51 @@ def _run_one_majcat(conn, working_table, alloc_table, mc, grids,
             continue
 
         for r in range(1, max_round + 1):
-            # Iterate only ranks that actually exist for this MAJ_CAT in this
-            # OPT_TYPE for this round. Sparse rank space — global ranks are
-            # scattered, and round 2/3 only includes rows with I_ROD >= r.
-            ranks = [
-                int(row[0]) for row in conn.execute(text(f"""
-                    SELECT DISTINCT OPT_PRIORITY_RANK
-                    FROM [{alloc_table}]
-                    WHERE OPT_TYPE = :ot
-                      AND MAJ_CAT  = :mc
-                      AND ISNULL(I_ROD,1) >= :r
-                      AND OPT_PRIORITY_RANK IS NOT NULL
-                    ORDER BY OPT_PRIORITY_RANK
-                """), {"ot": ot, "mc": mc, "r": r}).fetchall()
-                if row[0] is not None
-            ]
-            if not ranks:
-                continue
-
-            # Reset round deltas — scoped to this MAJ_CAT only so we never
-            # touch rows another worker is currently allocating.
+            # Reset round deltas once per round, scoped to this MAJ_CAT.
             run_sql(conn, f"""
                 UPDATE [{alloc_table}]
                    SET ROUND_SHIP = 0, ROUND_HOLD = 0
                  WHERE OPT_TYPE = :ot AND MAJ_CAT = :mc
             """, {"ot": ot, "mc": mc})
 
-            # BAND_SIZE=1 — one rank per band, full revalidation per band.
-            # Logic identical to sequential, but the entire band+revalidate
-            # cycle is sent as ONE multi-statement T-SQL batch — cuts
-            # round-trips per band from ~11 to 1, which dominates the
-            # single-MAJ_CAT-many-ranks case.
-            for rank in ranks:
-                rne._run_band_and_revalidate_batched(
-                    conn, working_table, alloc_table,
-                    ot, r, rank, grids, maj_cat=mc,
-                    pri_ct_check_rl=pri_ct_check_rl,
-                    pri_ct_check_tbc=pri_ct_check_tbc,
-                )
+            # Distinct (ST_RANK, WERKS) pairs for this round, best store first.
+            store_rows = conn.execute(text(f"""
+                SELECT DISTINCT ST_RANK, WERKS
+                FROM [{alloc_table}]
+                WHERE OPT_TYPE = :ot
+                  AND MAJ_CAT  = :mc
+                  AND ISNULL(I_ROD, 1) >= :r
+                  AND ST_RANK IS NOT NULL
+                  AND ISNULL(ALLOC_STATUS, 'PENDING')
+                      NOT IN ('SKIPPED', 'INELIGIBLE', 'ALLOCATED')
+                ORDER BY ST_RANK
+            """), {"ot": ot, "mc": mc, "r": r}).fetchall()
+
+            for (st_rank, werks) in store_rows:
+                # OPT_PRIORITY_RANKs for this specific store in this round.
+                ranks = [
+                    int(row[0]) for row in conn.execute(text(f"""
+                        SELECT DISTINCT OPT_PRIORITY_RANK
+                        FROM [{alloc_table}]
+                        WHERE OPT_TYPE = :ot
+                          AND MAJ_CAT  = :mc
+                          AND WERKS    = :wk
+                          AND ISNULL(I_ROD, 1) >= :r
+                          AND OPT_PRIORITY_RANK IS NOT NULL
+                          AND ISNULL(ALLOC_STATUS, 'PENDING')
+                              NOT IN ('SKIPPED', 'INELIGIBLE', 'ALLOCATED')
+                        ORDER BY OPT_PRIORITY_RANK
+                    """), {"ot": ot, "mc": mc, "wk": werks, "r": r}).fetchall()
+                    if row[0] is not None
+                ]
+                if not ranks:
+                    continue
+
+                for rank in ranks:
+                    rne._run_band_and_revalidate_batched(
+                        conn, working_table, alloc_table,
+                        ot, r, rank, grids, maj_cat=mc,
+                        pri_ct_check_rl=pri_ct_check_rl,
+                        pri_ct_check_tbc=pri_ct_check_tbc,
+                        werks=werks,
+                    )

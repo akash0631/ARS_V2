@@ -35,7 +35,10 @@ const GridBuilderPage        = lazy(() => import('@/pages/GridBuilderPage'))
 const LookupArtMasterPage    = lazy(() => import('@/pages/LookupArtMasterPage'))
 const ListingPage            = lazy(() => import('@/pages/ListingPage'))
 const ListingLogsPage        = lazy(() => import('@/pages/ListingLogsPage'))
-const PendAlcReportPage      = lazy(() => import('@/pages/PendAlcReportPage'))
+const PendAlcReportPage          = lazy(() => import('@/pages/PendAlcReportPage'))
+const PendingAllocationPage      = lazy(() => import('@/pages/PendingAllocationPage'))
+const PendingDeliveryOrderPage   = lazy(() => import('@/pages/PendingDeliveryOrderPage'))
+const HoldDashboardPage      = lazy(() => import('@/pages/HoldDashboardPage'))
 const ChecklistPage          = lazy(() => import('@/pages/ChecklistPage'))
 const TrendUploadPage        = lazy(() => import('@/pages/TrendUploadPage'))
 const TrendReviewPage        = lazy(() => import('@/pages/TrendReviewPage'))
@@ -132,6 +135,10 @@ export default function App() {
         <Route path="trends/admin" element={<ErrorBoundary><TrendAdminPage /></ErrorBoundary>} />
         {/* Reports */}
         <Route path="reports/pend-alc" element={<PendAlcReportPage />} />
+        <Route path="reports/hold" element={<ErrorBoundary><HoldDashboardPage /></ErrorBoundary>} />
+        {/* Pending Allocation Lifecycle */}
+        <Route path="pend-alc/overview"  element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
+        <Route path="pend-alc/do-entry"  element={<ErrorBoundary><PendingDeliveryOrderPage /></ErrorBoundary>} />
         {/* Allocations */}
         <Route path="allocations" element={<AllocationsPage />} />
         <Route path="allocations/new" element={<NewAllocationPage />} />

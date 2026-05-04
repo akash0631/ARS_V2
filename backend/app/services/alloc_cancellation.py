@@ -120,10 +120,56 @@ def hard_cancel(batch_id: str) -> Dict:
 
 
 def cleanup(batch_id: str) -> None:
-    """Remove this batch's registry state — call after the run finishes."""
+    """Remove this batch's registry state — call after the run finishes.
+
+    Defensive: explicitly clear the threading.Event before popping so any
+    stray reference held by a worker (e.g. one that's about to call
+    is_cancelled in its loop epilogue) sees a not-set event rather than
+    a still-set one. Pop alone wouldn't be enough if the worker captured
+    the Event reference earlier."""
     with _LOCK:
-        _CANCEL_EVENTS.pop(batch_id, None)
+        ev = _CANCEL_EVENTS.pop(batch_id, None)
+        if ev is not None:
+            try:
+                ev.clear()
+            except Exception:
+                pass
         _BATCH_SPIDS.pop(batch_id, None)
+
+
+# ─── DB-backed cancel fallback ───────────────────────────────────────
+# After cleanup() pops the in-memory event, is_cancelled() returns False
+# even though the session was cancelled. The orchestrator's post-Part-8
+# checkpoint must therefore consult the session row STATUS in the DB,
+# which the cancel endpoints flip to 'CANCELLED' atomically.
+def is_session_cancelled(session_id: str) -> bool:
+    """True if ARS_LISTING_SESSIONS.STATUS = 'CANCELLED' for this session.
+    Used as a DB-backed fallback for is_cancelled() — survives across
+    cleanup(), thread restarts, and subprocess boundaries."""
+    if not session_id:
+        return False
+    try:
+        engine = get_data_engine()
+        with engine.connect() as conn:
+            v = conn.execute(text(
+                "SELECT STATUS FROM ARS_LISTING_SESSIONS "
+                "WHERE SESSION_ID = :sid"
+            ), {"sid": session_id}).scalar()
+            return (v or "").upper() == "CANCELLED"
+    except Exception:
+        # If the table doesn't exist yet (first install) or the query
+        # fails for any reason, default to "not cancelled" so we don't
+        # falsely abort a healthy run.
+        return False
+
+
+def is_cancelled_anywhere(batch_id_or_session: str) -> bool:
+    """Combined check: in-memory event OR DB session row says cancelled.
+    Use this in the orchestrator's post-stage checkpoints — it's robust
+    to event cleanup AND to subprocess workers that can't see the
+    in-memory dict."""
+    return is_cancelled(batch_id_or_session) or \
+           is_session_cancelled(batch_id_or_session)
 
 
 # ─── Helper: get the current connection's SPID ───────────────────────

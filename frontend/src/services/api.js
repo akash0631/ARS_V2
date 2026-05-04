@@ -521,4 +521,13 @@ export const holdDashboardAPI = {
   reconciliation: () => api.get('/hold-dashboard/reconciliation'),
 }
 
+// ============== Pending Allocation (ARS_PEND_ALC) ==============
+export const pendAlcAPI = {
+  summary:   ()                       => api.get('/pend-alc/summary'),
+  sessions:  ()                       => api.get('/pend-alc/sessions'),
+  detail:    (params = {})            => api.get('/pend-alc/detail', { params }),
+  doHistory: (limit = 100)            => api.get('/pend-alc/do-history', { params: { limit } }),
+  doUpdate:  (rows)                   => api.post('/pend-alc/do-update', { rows }),
+}
+
 export default api

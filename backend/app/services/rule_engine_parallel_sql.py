@@ -349,16 +349,16 @@ def run_listing_and_allocation_sql_parallel(
                     row = wconn.execute(text("""
                         DECLARE @ship FLOAT, @hold FLOAT, @rows INT;
                         EXEC dbo.usp_ars_allocate_majcat
-                            @maj_cat        = :mc,
-                            @working_table  = :wt,
-                            @alloc_table    = :at,
-                            @msa_var_table  = :mvt,
-                            @grids_json     = :gj,
+                            @maj_cat          = :mc,
+                            @working_table    = :wt,
+                            @alloc_table      = :at,
+                            @msa_var_table    = :mvt,
+                            @grids_json       = :gj,
                             @pri_ct_check_rl  = :rl,
                             @pri_ct_check_tbc = :tbc,
-                            @ship_out       = @ship OUTPUT,
-                            @hold_out       = @hold OUTPUT,
-                            @rows_out       = @rows OUTPUT;
+                            @ship_out         = @ship OUTPUT,
+                            @hold_out         = @hold OUTPUT,
+                            @rows_out         = @rows OUTPUT;
                         SELECT @ship AS ship, @hold AS hold, @rows AS rws;
                     """), {
                         "mc":  mc,

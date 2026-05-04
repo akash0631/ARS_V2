@@ -26,6 +26,46 @@ def _is_deadlock(exc: BaseException) -> bool:
 
 
 # ==========================================================================
+# Deadlock-retry telemetry
+# ==========================================================================
+# Process-local counters so the worker can report how many deadlocks it
+# absorbed silently. ProcessPoolExecutor children each get their own copy;
+# the parent picks them up via the per-worker `result()` payload.
+
+class DeadlockStats:
+    """Process-local counter (each worker has its own instance).
+
+    Cleared at the start of every Stage C run via `reset()`. Read at the end
+    via `snapshot()` so the orchestrator can log a single summary line like:
+        deadlock retries: caught=47 succeeded=44 exhausted=3
+    """
+    _caught:    int = 0   # total times a deadlock was raised inside retry_on_deadlock
+    _succeeded: int = 0   # caught and a later attempt succeeded
+    _exhausted: int = 0   # all max_attempts exhausted, gave up
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._caught = 0
+        cls._succeeded = 0
+        cls._exhausted = 0
+
+    @classmethod
+    def record_caught(cls)    -> None: cls._caught    += 1
+    @classmethod
+    def record_succeeded(cls) -> None: cls._succeeded += 1
+    @classmethod
+    def record_exhausted(cls) -> None: cls._exhausted += 1
+
+    @classmethod
+    def snapshot(cls) -> Dict[str, int]:
+        return {
+            "caught":    cls._caught,
+            "succeeded": cls._succeeded,
+            "exhausted": cls._exhausted,
+        }
+
+
+# ==========================================================================
 # SQL EXECUTION
 # ==========================================================================
 
@@ -60,12 +100,19 @@ def retry_on_deadlock(
     last_exc: Optional[BaseException] = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return fn()
+            result = fn()
+            # If a previous attempt deadlocked and we got here, this attempt
+            # succeeded — record it for the end-of-run summary.
+            if attempt > 1:
+                DeadlockStats.record_succeeded()
+            return result
         except Exception as e:
             if not _is_deadlock(e):
                 raise
+            DeadlockStats.record_caught()
             last_exc = e
             if attempt >= max_attempts:
+                DeadlockStats.record_exhausted()
                 logger.error(
                     f"[deadlock-retry] {label or fn.__name__}: "
                     f"giving up after {max_attempts} attempts: {str(e)[:200]}"

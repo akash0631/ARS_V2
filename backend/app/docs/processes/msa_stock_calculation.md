@@ -3,7 +3,7 @@ title: MSA Stock Calculation — What the Warehouse Can Actually Ship
 category: Data Prep
 order: 30
 source: backend/app/services/msa_service.py, backend/app/api/v1/endpoints/msa_stock.py
-last_reviewed: 2026-04-20
+last_reviewed: 2026-05-03
 ---
 
 # MSA Stock Calculation
@@ -47,7 +47,7 @@ Run MSA:
 | Check | How |
 |---|---|
 | Latest warehouse stock loaded | `ET_STORE_STOCK` or the MSA staging table has today's data |
-| Pending allocations loaded | `MASTER_ALC_PEND` is current (units already dispatched but not delivered) |
+| Pending DOs entered | `ARS_PEND_ALC` open rows are current — open Pending Allocation → Overview to verify |
 | Size master is fresh | `Master_CONT_SZ` contains the right size list for the categories in scope |
 
 ## Step-by-step: how to run it
@@ -87,8 +87,9 @@ MSA uses a 9-step algorithm. You don't choose the steps — they always run in o
 | 3 | Fill missing colours / vendors / sizes | "Where data is blank, use safe defaults so nothing gets dropped." |
 | 4 | Keep only APP and GM segments | "Ignore 'services' and 'gift cards' and other non-merchandise." |
 | 5 | Pivot by SLOC | "Put each warehouse as its own column. Sum across columns = `STK_QTY`." |
-| 6 | Subtract pending allocations | "Look up `MASTER_ALC_PEND`. If 5 units are already on their way to a store, don't count them as available." |
-| 7 | Compute `FNL_Q` | "**FNL_Q = max(STK_QTY − PEND_QTY, 0)**. Never negative — zero means 'nothing to ship'." |
+| 6 | Subtract ARS pending | "Look up `ARS_PEND_ALC` — approved allocations whose SAP DO has not yet been issued. Subtracts them so they can't be double-allocated." |
+| 6.5 | Subtract open holds | "Look up `ARS_NL_TBL_HOLD_TRACKING` — NL/TBL hold reservations. Reduces FNL_Q for articles reserved for specific stores." |
+| 7 | Compute `FNL_Q` | "**FNL_Q = max(STK_QTY − PEND_QTY − HOLD_QTY, 0)**. Never negative — zero means 'nothing to ship'." |
 | 8 | Generate colour variants | "Expand each option into its colours and sizes (the variant grain)." |
 | 9 | Aggregate to option level | "Group back to `GEN_ART × CLR` for the allocator's quick lookup." |
 
@@ -104,9 +105,9 @@ SLOC=V02_RESERVE, STK_Q=5
 
 After Step 5 pivot: `STK_QTY = 10 + 5 = 15`.
 
-`MASTER_ALC_PEND` says 2 units of this variant are already on the way to Store HN14.
+`ARS_PEND_ALC` has an open row for this article at this RDC: PEND_QTY = 2 (approved allocation, DO not yet received).
 
-Step 7: `FNL_Q = max(15 − 2, 0) = 13`.
+Step 7: `FNL_Q = max(15 − 2 − 0, 0) = 13`.
 
 Step 9 aggregate: `ARS_MSA_GEN_ART` has one row `GEN_ART=1116111940, CLR=LT_PST, FNL_Q=13`.
 
@@ -116,7 +117,7 @@ The allocator later sees `13` available units of this variant to distribute.
 
 **Q: MSA finished, but FNL_Q is 0 for an article I know we have stock of. Why?**
 One of three things:
-1. `PEND_QTY` is inflated (allocation from last cycle hasn't cleared) — check `MASTER_ALC_PEND` for stale rows.
+1. `PEND_QTY` is inflated — check `ARS_PEND_ALC` for this article. If the session is > 5 days old with no DO, enter the DO quantities in Pending Allocation → Daily DO Entry.
 2. The SLOC you care about was excluded in Step 1 — look at your SLOC filter.
 3. The SEG is neither APP nor GM — check `vw_master_product` for this `GEN_ART`.
 
@@ -137,7 +138,7 @@ Not through the UI — MSA is "all segments" by design because allocation runs h
 | You see | Meaning | Fix |
 |---|---|---|
 | "0 rows in ARS_MSA_VAR_ART" | Filter wiped everything | Check your SLOC list — probably wrong code. |
-| `FNL_Q` is huge (larger than `STK_QTY`) | Pending merge went wrong, PEND_QTY came out negative | Re-check `MASTER_ALC_PEND` for weird negatives and re-run. |
+| `FNL_Q` is huge (larger than `STK_QTY`) | PEND_QTY came out negative | Check `ARS_PEND_ALC` for negative ALLOC_QTY rows — should not happen normally. Re-run MSA. |
 | MSA crashes with "memory error" | Dataset > 1 M rows, single-machine pandas pivot | Use the pipeline endpoint (`/pipeline/...`) which parallelises across workers. |
 | `ST_CD` column missing / renamed | You're looking at an older MSA output table | April 2026: `ST_CD` was renamed to `RDC` in all MSA output tables. |
 

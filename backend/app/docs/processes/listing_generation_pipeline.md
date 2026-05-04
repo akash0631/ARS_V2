@@ -228,6 +228,77 @@ All Part timings are logged via the `_time_step()` helper (around line 360). Eac
 - `AppSettings` table (persistent defaults per user)
 - Request body overrides (temporary, for this one run)
 
+## Park-then-promote history (alloc + listing-working)
+
+Every successful run snapshots **both** `ARS_ALLOC_WORKING` AND `ARS_LISTING_WORKING` into matching parking tables so results can be validated **before** they're promoted to permanent history. Both snapshots ride the same `SESSION_ID`; Approve/Reject act on both atomically.
+
+### Lifecycle
+
+```
+ARS_ALLOC_WORKING        (live, dropped each run)        ARS_LISTING_WORKING        (live, dropped each run)
+    │                                                          │
+    │ Part 8.4 ─ snapshot_session_to_parked(session_id) ────────┤
+    ▼                                                          ▼
+ARS_ALLOC_PARKED                                       ARS_LISTING_WORKING_PARKED
+(PARK_STATUS='PARKED')                                 (PARK_STATUS='PARKED')
+    │                                                          │
+    │  ┌──── Approve (atomic across both) ────────────────┐   │
+    │  │                                                    │   │
+    └──┴────► ARS_ALLOC_HISTORY        ARS_LISTING_WORKING_HISTORY ◄─┘
+                (permanent)                  (permanent)
+    │                                                          │
+    └──► Reject ──► PARK_STATUS='REJECTED' on both tables ◄─────┘
+                    (kept for audit until TTL)
+```
+
+### Tables
+
+| Table | Lifecycle | Notes |
+|---|---|---|
+| `ARS_ALLOC_WORKING` | dropped/recreated every run | live workspace (size-grain alloc plan) |
+| `ARS_LISTING_WORKING` | dropped/recreated every run | live workspace (option-grain working table) |
+| `ARS_ALLOC_PARKED` | append-on-park, delete-on-approve | columns auto-reconciled from `ARS_ALLOC_WORKING` at every snapshot |
+| `ARS_LISTING_WORKING_PARKED` | append-on-park, delete-on-approve | columns auto-reconciled from `ARS_LISTING_WORKING` at every snapshot |
+| `ARS_ALLOC_HISTORY` | append-on-approve, never auto-deleted | row-grain; idempotency via `IF NOT EXISTS` guard |
+| `ARS_LISTING_WORKING_HISTORY` | append-on-approve, never auto-deleted | row-grain; idempotency via `IF NOT EXISTS` guard |
+
+The schema-drift handling (`ALTER TABLE … ADD <new col> NULL`) runs at **every** snapshot and at **every** Approve, so dynamic columns added by future Parts (`H_*`, `GH_*`, `ALLOC_FLAG`, `PRI_CT%`, …) flow into parked + history tables automatically — no manual migration.
+
+### Atomicity
+
+Approve and Reject open a single SQLAlchemy connection and commit once. Either both source-table snapshots move to history, or neither does. If the Approve INSERT for `ARS_LISTING_WORKING_PARKED → ARS_LISTING_WORKING_HISTORY` fails after `ARS_ALLOC_*` succeeds in the same transaction, the rollback unwinds both. Idempotency: a duplicate Approve checks each history table for existing rows under the SESSION_ID and returns `{already_approved: true}` without re-inserting.
+
+### Endpoints
+
+- `GET  /listing/parked-runs` — sessions awaiting review, with row counts from BOTH parked tables (`alloc_parked_rows`, `listing_parked_rows`).
+- `GET  /listing/parked-runs/{session_id}?which=alloc|listing` — paginated detail rows from one of the two parked tables (default `which=alloc` for back-compat).
+- `POST /listing/parked-runs/{session_id}/approve` — promote both tables to history atomically (idempotent). Returns `{approved_rows, by_table: {alloc, listing}, already_approved}`.
+- `POST /listing/parked-runs/{session_id}/reject` — flip `PARK_STATUS='REJECTED'` on both tables; audit_log entry.
+- `GET  /listing/alloc-history` — query approved alloc history.
+- `GET  /listing/listing-history` — query approved listing-working history.
+- `POST /listing/parked-runs/purge` — TTL helper: deletes PARKED >14d and REJECTED >30d on **both** parked tables.
+
+### Concurrency
+
+`POST /listing/generate` returns **409 Conflict** when another run is still `STATUS='RUNNING'`. This prevents two overlapping runs from racing on the `DROP TABLE [ARS_ALLOC_WORKING]` that happens in Part 7/Part 8.
+
+### Tables-affected summary
+
+`ARS_LISTING_SESSIONS` now carries two extra columns:
+
+- `TABLES_AFFECTED` — JSON array `[{table, action, rows}, ...]` for `ARS_LISTING`, `ARS_LISTING_WORKING`, `ARS_LISTED_OPT`, `ARS_ALLOC_WORKING`, `ARS_MSA_TOTAL`, `ARS_MSA_GEN_ART`, `ARS_MSA_VAR_ART`. `action` is `CREATED` / `RECREATED` / `TRUNCATED` / `UPSERTED` / `MISSING`. Captured by a single post-run sweep.
+- `PARKED_STATUS` — `PARKED` (snapshot succeeded), `SKIPPED_ERROR` (snapshot failed; listing still SUCCESS), `SKIPPED_EMPTY` (nothing to park).
+
+The Listing UI shows the tables-affected list inline below the KPI tiles after a SUCCESS, and surfaces the parked-runs review queue as a collapsible section.
+
+### Implementation files
+
+- `backend/app/services/parked_history.py` — service. Multi-target by design: `_SNAPSHOT_TARGETS` is a list of `(label, source, parked, history)` triples; adding a third triple makes the whole pipeline (snapshot, approve, reject, purge, list, detail) cover it too. Public functions: `snapshot_session_to_parked`, `approve_parked`, `reject_parked`, `list_parked_runs`, `get_parked_detail(which=…)`, `list_alloc_history`, `list_listing_history`, `purge_old_parked`, `tables_affected_summary`, `has_running_session`.
+- `backend/app/api/v1/endpoints/listing.py` — Part 8.4 wiring + new endpoints (`/parked-runs`, `/parked-runs/{sid}` with `which`, `/approve`, `/reject`, `/alloc-history`, `/listing-history`, `/purge`).
+- `backend/app/services/listing_sessions.py` — extra columns on the sessions table (`TABLES_AFFECTED`, `PARKED_STATUS`).
+- `frontend/src/services/api.js` — `listingAPI.parkedRuns / parkedRunDetail({which}) / approveParked / rejectParked / allocHistory / listingHistory`.
+- `frontend/src/pages/ListingPage.jsx` — completion panel, Parked Runs queue with both row counts, drawer with `[Alloc rows | Listing rows]` tab toggle.
+
 ## How to update this doc
 
 Update when you add / remove / reorder a Part in `generate_listing`, change a tunable default, or change the log format that this doc shows. Bump `last_reviewed`.

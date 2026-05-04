@@ -23,7 +23,6 @@ class MSAService:
         """
         self.db = db
         self.main_table = "VW_ET_MSA_STK_WITH_MASTER"
-        self.pending_table = "MASTER_ALC_PEND"
         self.hold_table = "ARS_NL_TBL_HOLD_TRACKING"
         self.st_master_table = "Master_ALC_INPUT_ST_MASTER"
         self._rls_categories = rls_categories or []
@@ -31,6 +30,27 @@ class MSAService:
     # ------------------------------------------------------------------
     # Open-hold loader (used by Step 6 to deduct reserved units from STK)
     # ------------------------------------------------------------------
+    def _load_ars_pending(self) -> pd.DataFrame:
+        """Load open pending allocations from ARS_PEND_ALC.
+
+        Returns DataFrame with columns RDC, ARTICLE_NUMBER, ARS_PEND — the
+        approved-but-not-yet-DO'd quantities from the ARS system. These are
+        added to the legacy MASTER_ALC_PEND deduction in Step 6 to prevent
+        double-allocation of warehouse stock before SAP issues a Delivery Order.
+        """
+        try:
+            df = pd.read_sql(text("""
+                SELECT RDC, ARTICLE_NUMBER,
+                       SUM(PEND_QTY) AS ARS_PEND
+                FROM ARS_PEND_ALC WITH (NOLOCK)
+                WHERE IS_CLOSED = 0 AND PEND_QTY > 0
+                GROUP BY RDC, ARTICLE_NUMBER
+            """), self.db.bind)
+            df["ARS_PEND"] = pd.to_numeric(df["ARS_PEND"], errors="coerce").fillna(0)
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["RDC", "ARTICLE_NUMBER", "ARS_PEND"])
+
     def _load_open_holds(self) -> pd.DataFrame:
         """Aggregate HOLD_REM for currently-open NL/TBL hold reservations.
 
@@ -510,62 +530,35 @@ class MSAService:
             msa_pivot["STK_QTY"] = msa_pivot[sloc_cols].sum(axis=1)
             logger.info(f"Pivoted table: {len(msa_pivot)} rows, {len(sloc_cols)} SLOCs")
 
-            # ============ STEP 6: LOAD & PIVOT PENDING ALLOCATION ============
-            pend_merged_cols = []
+            # ============ STEP 6: DEDUCT ARS PENDING (ARS_PEND_ALC) ============
+            # Units that were approved in an ARS allocation run but whose SAP
+            # Delivery Orders have not yet been generated. Subtracting them here
+            # prevents the next MSA run from offering the same stock again before
+            # the DO is issued. Once DO_QTY >= ALLOC_QTY the row is IS_CLOSED=1
+            # and no longer contributes to PEND_QTY.
+            msa_pivot["PEND_QTY"] = 0
             try:
-                pend = pd.read_sql(text(f"SELECT * FROM {self.pending_table}"), self.db.bind)
-                print("============================0================================")
-                
-                
-                if (
-                    not pend.empty
-                    and "ARTICLE_NUMBER" in pend.columns
-                    and "ARTICLE_NUMBER" in msa_pivot.columns
-                ):
-                    pend["QTY"] = pd.to_numeric(pend["QTY"], errors="coerce").fillna(0)
-                    
-                    pend_pivot = (
-                        pend.pivot_table(
-                            index=["RDC","ARTICLE_NUMBER"],
-                            columns="MOA",
-                            values="QTY",
-                            aggfunc="sum",
-                            fill_value=0
-                        )
-                        .reset_index()
-                    )
-
-                    
-                    print("============================================================")
-
-
-                    pend_cols = [c for c in pend_pivot.columns if c not in ["RDC","ARTICLE_NUMBER"]]
-                    pend_pivot["PEND_QTY"] = pend_pivot[pend_cols].sum(axis=1)
-                    pend_merged_cols = pend_cols
-                    # to be deleted after verification
-                   
-                    print("===========================2=================================")
-
+                ars_pend = self._load_ars_pending()
+                if not ars_pend.empty and "ARTICLE_NUMBER" in msa_pivot.columns:
                     msa_pivot = msa_pivot.merge(
-                        pend_pivot,
-                        left_on=["ST_CD","ARTICLE_NUMBER"],
+                        ars_pend,
+                        left_on=["ST_CD", "ARTICLE_NUMBER"],
                         right_on=["RDC", "ARTICLE_NUMBER"],
-                        how="left"
-                    ).fillna(0) 
-                    print(f"Columns merged from pending: {pend_merged_cols}") 
-                    msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore") 
-                    msa_pivot["PEND_QTY"] = msa_pivot["PEND_QTY"].fillna(0)
-                    logger.info(f"Merged pending allocations: {len(pend_pivot)} records, merged on ARTICLE_NUMBER")
-                   
-                    print("=============================3===============================")
-
-                    logger.info(f"Merged pending allocations")
+                        how="left",
+                    )
+                    msa_pivot["ARS_PEND"] = msa_pivot["ARS_PEND"].fillna(0)
+                    msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
+                    msa_pivot["PEND_QTY"] = msa_pivot["ARS_PEND"]
+                    logger.info(
+                        f"Merged ARS pending: {len(ars_pend)} (RDC,ARTICLE) rows, "
+                        f"total ARS_PEND={float(ars_pend['ARS_PEND'].sum()):.0f}"
+                    )
                 else:
-                    msa_pivot["PEND_QTY"] = 0
-                    logger.info("No pending allocations to merge")
-            except Exception as pend_err:
-                logger.warning(f"Could not load pending allocations: {pend_err}")
-                msa_pivot["PEND_QTY"] = 0
+                    msa_pivot["ARS_PEND"] = 0
+                    logger.info("ARS_PEND_ALC: no open pending rows — PEND_QTY = 0")
+            except Exception as ars_err:
+                logger.warning(f"Could not load ARS pending: {ars_err}")
+                msa_pivot["ARS_PEND"] = 0
 
             # ============ STEP 6.5: DEDUCT OPEN HOLDS (NL/TBL reservations) ====
             # Held units physically sit at the RDC but are reserved for a
@@ -600,7 +593,7 @@ class MSAService:
 
             # ============ STEP 7: CALCULATE FINAL QUANTITY ============
             # FNL_Q = max(STK − PEND − HOLD, 0)
-            # PEND  = units already promised and being picked (MASTER_ALC_PEND)
+            # PEND  = units approved in ARS (ARS_PEND_ALC) but DO not yet issued
             # HOLD  = units reserved for specific stores from prior TBL/NL runs
             #         (ARS_NL_TBL_HOLD_TRACKING). Subtracting both prevents
             #         double-allocation of physically-shared warehouse stock.

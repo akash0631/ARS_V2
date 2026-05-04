@@ -775,8 +775,25 @@ async def upload_delivery_order(
 
         not_found_count = len(do_df) - updated_count if updated_count < len(do_df) else 0
 
-        # Rebuild ARS_pend_alc
+        # Rebuild legacy ARS_pend_alc (BDC-based; kept for backward compat)
         _rebuild_pend_alc(engine)
+
+        # Also deduct from ARS_PEND_ALC (ARS-sourced pending table) and close holds
+        try:
+            from app.services.pend_alc_service import apply_do_deductions
+            do_rows = [
+                {"rdc": str(r["RECEIVING STORE"]),
+                 "article_number": str(r["MATERIAL NO"]),
+                 "do_qty": float(r["DO_QTY"])}
+                for _, r in do_df.iterrows()
+                if float(r.get("DO_QTY") or 0) > 0
+            ]
+            if do_rows:
+                with engine.connect() as _pc:
+                    _updated = apply_do_deductions(_pc, do_rows)
+                    logger.info(f"[pend_alc] DO upload: {_updated} ARS_PEND_ALC rows updated")
+        except Exception as _pe:
+            logger.warning(f"[pend_alc] apply_do_deductions skipped: {_pe}")
 
         return {
             "success": True,

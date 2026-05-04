@@ -78,6 +78,9 @@ def load_app_settings() -> Dict[str, Any]:
             "date_format": "YYYY-MM-DD",
             "number_format": "en-US",
         },
+        "allocation": {
+            "history_retention_days": 30,
+        },
     }
     
     if os.path.exists(SETTINGS_FILE):
