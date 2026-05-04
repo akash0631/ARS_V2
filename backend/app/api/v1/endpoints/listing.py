@@ -112,6 +112,7 @@ class GenerateRequest(BaseModel):
     grid_table: str = "ARS_GRID_MJ_GEN_ART"
     st_master_table: str = "Master_ALC_INPUT_ST_MASTER"
     ssn_values: List[str] = []  # restrict run to MAJ_CATs whose articles belong to selected seasons
+    opt_types: List[str] = ["RL", "TBC", "TBL"]  # which OPT_TYPEs the waterfall runs (subset to skip types)
 
 
 # ── Helpers — delegating to shared db_helpers ───────────────────────────────
@@ -2077,6 +2078,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 pri_ct_check_tbc=req.pri_ct_check_tbc,
                 rl_mbq_cap_pct=req.rl_mbq_cap_pct,
                 tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
+                opt_types=req.opt_types or ["RL", "TBC", "TBL"],
             )
         else:  # "sequential" — single-thread fallback
             from app.services.rule_engine_new import run_listing_and_allocation
@@ -2092,6 +2094,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     pri_ct_check_tbc=req.pri_ct_check_tbc,
                     rl_mbq_cap_pct=req.rl_mbq_cap_pct,
                     tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
+                    opt_types=req.opt_types or ["RL", "TBC", "TBL"],
                 )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")

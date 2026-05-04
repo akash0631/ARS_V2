@@ -71,6 +71,7 @@ def run_listing_and_allocation(
     pri_ct_check_tbc: bool = True,   # apply PRI_CT%>=100 gate to TBC?
     rl_mbq_cap_pct: float = 0.0,     # when pri_ct_check_rl=False, cap RL at X% of MJ_MBQ
     tbc_mbq_cap_pct: float = 0.0,    # when pri_ct_check_tbc=False, cap TBC at X% of MJ_MBQ
+    opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only (default = all)
 ) -> Dict:
     """
     Orchestrates Stages A–D. See docs/NEW_RULE_ENGINE_SPEC.md.
@@ -134,7 +135,8 @@ def run_listing_and_allocation(
                         pri_ct_check_rl=pri_ct_check_rl,
                         pri_ct_check_tbc=pri_ct_check_tbc,
                         size_threshold=size_threshold,
-                        min_size_count=min_size_count)
+                        min_size_count=min_size_count,
+                        opt_types=opt_types)
     # Apply MBQ cap for OPT_TYPEs whose PRI gate is disabled.
     if (not pri_ct_check_rl) and rl_mbq_cap_pct > 0:
         _stage_c_apply_mbq_cap(conn, alloc_table, working_table, 'RL', rl_mbq_cap_pct)
@@ -1583,7 +1585,8 @@ def _stage_c_waterfall(conn, alloc_table, working_table=None, grids=None,
                         pri_ct_check_rl: bool = True,
                         pri_ct_check_tbc: bool = True,
                         size_threshold: float = 0.6,
-                        min_size_count: int = 3):
+                        min_size_count: int = 3,
+                        opt_types: Optional[List[str]] = None):
     """
     For each (OPT_TYPE, round r, rank band) — run one batch SQL that:
       1) computes need_pool / need_ship per eligible row,
@@ -1597,7 +1600,8 @@ def _stage_c_waterfall(conn, alloc_table, working_table=None, grids=None,
     """
     # per-opt_type bounds: scan only the rank range that actually belongs
     # to this opt_type (ranks are global; TBL's ranks start after RL+TBC).
-    for ot in OPT_TYPE_ORDER:
+    active_types = [ot for ot in OPT_TYPE_ORDER if not opt_types or ot in opt_types]
+    for ot in active_types:
         bounds = conn.execute(text(f"""
             SELECT ISNULL(MAX(I_ROD), 0),
                    ISNULL(MIN(OPT_PRIORITY_RANK), 0),

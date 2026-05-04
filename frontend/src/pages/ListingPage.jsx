@@ -603,6 +603,7 @@ export default function ListingPage() {
 
   // ── Parallel allocation (Part 8) ─────────────────────────────────────
   const [allocationMode, setAllocationMode] = useState('pandas') // 'sequential' | 'pandas'
+  const [allocOtFilter, setAllocOtFilter]   = useState('all')   // 'all' | 'rl' | 'rl_tbc'
   // Default 4 (not 8) — on Azure SQL with a small SKU, 8 workers cause
   // 'generic waitable object' deadlocks (tempdb metadata + memory-grant
   // contention) that retry_on_deadlock has to absorb. 4 is the sweet spot:
@@ -915,6 +916,7 @@ export default function ListingPage() {
         allocation_mode: allocationMode,
         parallel_workers: parseInt(parallelWorkers, 10) || 8,
         ssn_values: selectedSsn,
+        opt_types: ({ all: ['RL','TBC','TBL'], rl: ['RL'], rl_tbc: ['RL','TBC'] })[allocOtFilter] || ['RL','TBC','TBL'],
       }
       if (rdcMode === 'own') {
         payload.rdc_values = autoRdcs
@@ -1374,6 +1376,18 @@ export default function ListingPage() {
                 background: '#fff', border: `1px solid ${C.cardBorder}`,
                 borderRadius: 8, height: 38,
               }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
+                  textTransform: 'uppercase', letterSpacing: 0.4 }}>OPT Types</span>
+                {[['all','All (RL→TBC→TBL)'],['rl','RL only'],['rl_tbc','RL + TBC']].map(([val, label]) => (
+                  <button key={val} onClick={() => setAllocOtFilter(val)}
+                    style={{ height: 26, padding: '0 9px', fontSize: 10, fontWeight: 600,
+                      borderRadius: 5, cursor: 'pointer',
+                      border: allocOtFilter === val ? `1.5px solid #4f46e5` : `1px solid ${C.cardBorder}`,
+                      background: allocOtFilter === val ? '#ede9fe' : '#fff',
+                      color: allocOtFilter === val ? '#4f46e5' : C.textSub }}>
+                    {label}
+                  </button>
+                ))}
                 <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted,
                   textTransform: 'uppercase', letterSpacing: 0.4 }}>Alloc</span>
                 <select value={allocationMode}

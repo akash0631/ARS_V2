@@ -86,7 +86,7 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
      pri_ct_check_rl, pri_ct_check_tbc,
      rl_mbq_cap_pct, tbc_mbq_cap_pct,
-     size_threshold, min_size_count) = args
+     size_threshold, min_size_count, opt_types) = args
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
@@ -156,6 +156,7 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
             hold_dict=hold_dict if hold_dict else None,
             size_threshold=size_threshold,
             min_size_count=min_size_count,
+            opt_types=opt_types,
         )
         ship_mc = float(a_out['SHIP_QTY'].fillna(0).sum())
         hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
@@ -247,6 +248,7 @@ def run_listing_and_allocation_pandas(
     pri_ct_check_tbc: bool = True,
     rl_mbq_cap_pct:  float = 0.0,
     tbc_mbq_cap_pct: float = 0.0,
+    opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -359,6 +361,7 @@ def run_listing_and_allocation_pandas(
     dl_succeeded = 0
     dl_exhausted = 0
 
+    _active_types = [ot for ot in OPT_TYPE_ORDER if not opt_types or ot in opt_types]
     pool_args = [
         (
             mc,
@@ -374,6 +377,7 @@ def run_listing_and_allocation_pandas(
             float(tbc_mbq_cap_pct),
             float(size_threshold),
             int(min_size_count),
+            list(_active_types),
         )
         for mc in alloc_groups
     ]
@@ -824,6 +828,7 @@ def _run_majcat_waterfall(
     hold_dict: Optional[Dict[Tuple, float]] = None,
     size_threshold: float = 0.6,
     min_size_count: int = 3,
+    opt_types: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run RL → TBC → TBL waterfall in pandas for one MAJ_CAT slice.
@@ -865,7 +870,8 @@ def _run_majcat_waterfall(
     # FNL_Q_REM rather than NULL.
     _snapshot_fnl_q_rem(alloc_df, pool_dict)
 
-    for i, ot in enumerate(OPT_TYPE_ORDER):
+    active_ot = [ot for ot in OPT_TYPE_ORDER if not opt_types or ot in opt_types]
+    for i, ot in enumerate(active_ot):
         ot_mask = (alloc_df['OPT_TYPE'] == ot)
         if not ot_mask.any():
             continue
