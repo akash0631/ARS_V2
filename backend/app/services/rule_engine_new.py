@@ -30,11 +30,12 @@ _cols = get_columns
 # ───────────────────────────────────────────────────────────────
 RULE_R01_LISTING          = True
 RULE_R02_NOT_MIX          = True
-RULE_R03_NOT_NL           = True
+RULE_R03_NOT_NL           = False  # NL options handled upstream; disabled
 RULE_R04_MSA_POS          = True
 RULE_R05_REQ_POS          = True
 RULE_R06_PRI_100          = True
 RULE_R07_VAR_RATIO_TBL    = True
+RULE_R08_MJ_REQ_BOOSTED   = True   # skip RL/TBC when boosted MJ_REQ < ACS_D/2 (only when PRI gate is off)
 RULE_R09_TBL_TRIVIAL      = True
 
 ENABLE_FOCUS_TIERING      = True
@@ -66,8 +67,10 @@ def run_listing_and_allocation(
     size_threshold: float = 0.6,
     min_size_count: int = 3,
     tbl_trivial_factor: float = 0.5,
-    pri_ct_check_rl: bool = True,   # apply PRI_CT%>=100 gate to RL?
-    pri_ct_check_tbc: bool = True,  # apply PRI_CT%>=100 gate to TBC?
+    pri_ct_check_rl: bool = True,    # apply PRI_CT%>=100 gate to RL?
+    pri_ct_check_tbc: bool = True,   # apply PRI_CT%>=100 gate to TBC?
+    rl_mbq_cap_pct: float = 0.0,     # when pri_ct_check_rl=False, cap RL at X% of MJ_MBQ
+    tbc_mbq_cap_pct: float = 0.0,    # when pri_ct_check_tbc=False, cap TBC at X% of MJ_MBQ
 ) -> Dict:
     """
     Orchestrates Stages A–D. See docs/NEW_RULE_ENGINE_SPEC.md.
@@ -93,7 +96,9 @@ def run_listing_and_allocation(
     _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
                          tbl_trivial_factor,
                          pri_ct_check_rl=pri_ct_check_rl,
-                         pri_ct_check_tbc=pri_ct_check_tbc)
+                         pri_ct_check_tbc=pri_ct_check_tbc,
+                         rl_mbq_cap_pct=rl_mbq_cap_pct,
+                         tbc_mbq_cap_pct=tbc_mbq_cap_pct)
     _stage_a_assign_tier(conn, working_table)
     _stage_a_assign_rank(conn, working_table)
     listed_count = _stage_a_materialize_listed(conn, working_table, listed_table)
@@ -105,7 +110,9 @@ def run_listing_and_allocation(
         return result
 
     # STAGE B — explode to VAR_ART × SZ
-    base_rows = _stage_b_explode(conn, listed_table, alloc_table, msa_var_table)
+    base_rows = _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
+                                  pri_ct_check_rl=pri_ct_check_rl,
+                                  pri_ct_check_tbc=pri_ct_check_tbc)
     logger.info(f"[B] alloc rows = {base_rows}")
     if base_rows == 0:
         result["duration_sec"] = round(time.time() - t0, 1)
@@ -125,7 +132,14 @@ def run_listing_and_allocation(
     _stage_c_build_pool(conn, alloc_table)
     _stage_c_waterfall(conn, alloc_table, working_table, grids,
                         pri_ct_check_rl=pri_ct_check_rl,
-                        pri_ct_check_tbc=pri_ct_check_tbc)
+                        pri_ct_check_tbc=pri_ct_check_tbc,
+                        size_threshold=size_threshold,
+                        min_size_count=min_size_count)
+    # Apply MBQ cap for OPT_TYPEs whose PRI gate is disabled.
+    if (not pri_ct_check_rl) and rl_mbq_cap_pct > 0:
+        _stage_c_apply_mbq_cap(conn, alloc_table, working_table, 'RL', rl_mbq_cap_pct)
+    if (not pri_ct_check_tbc) and tbc_mbq_cap_pct > 0:
+        _stage_c_apply_mbq_cap(conn, alloc_table, working_table, 'TBC', tbc_mbq_cap_pct)
 
     # STAGE D — reflect back to listing working
     _stage_d_reflect(conn, working_table, alloc_table)
@@ -164,6 +178,7 @@ def _stage_a_add_columns(conn, working_table):
         "HOLD_QTY":          "FLOAT NULL",
         "ALLOC_STATUS":      "NVARCHAR(50) NULL",
         "ALLOC_REMARKS":     "NVARCHAR(MAX) NULL",
+        "ALLOC_SEQ":         "INT NULL",
     }
     existing = {c.upper() for c in _cols(conn, working_table)}
     for col, typedef in cols.items():
@@ -180,14 +195,16 @@ def _stage_a_add_columns(conn, working_table):
             LISTED_FLAG=0, LISTED_REASON='',
             OPT_PRIORITY_RANK=NULL, OPT_PRIORITY_TIER=NULL,
             ALLOC_QTY=0, HOLD_QTY=0,
-            ALLOC_STATUS='PENDING', ALLOC_REMARKS=''
+            ALLOC_STATUS='PENDING', ALLOC_REMARKS='', ALLOC_SEQ=NULL
     """)
 
 
 def _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
                           tbl_trivial_factor,
                           pri_ct_check_rl: bool = True,
-                          pri_ct_check_tbc: bool = True):
+                          pri_ct_check_tbc: bool = True,
+                          rl_mbq_cap_pct: float = 0.0,
+                          tbc_mbq_cap_pct: float = 0.0):
     """
     Chain every rule into a reason string. LISTED_FLAG=1 iff the chain is empty.
     Rules are guarded by feature flags so the user can turn any off.
@@ -195,16 +212,28 @@ def _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
     pri_ct_check_rl / pri_ct_check_tbc:
         Scope the PRI_CT%>=100 gate (R06). TBL always enforces. RL and TBC
         honour the flag — when False, they pass R06 even with PRI_CT% < 100.
+
+    rl_mbq_cap_pct / tbc_mbq_cap_pct (R08):
+        When PRI gate is off for RL/TBC and these caps are > 0, compute a
+        boosted MJ_REQ = MJ_MBQ × cap/100 − MJ_STK_TTL. If that boosted
+        requirement < ACS_SKIP_FACTOR × ACS_D the store's RL/TBC rows are
+        skipped — there is no meaningful gap left to fill after the cap lift.
     """
     pieces = []
     if RULE_R01_LISTING:
         pieces.append("CASE WHEN ISNULL(TRY_CAST([LISTING] AS INT),1) <> 1 THEN 'R01_LISTING;' ELSE '' END")
     if RULE_R02_NOT_MIX:
         pieces.append("CASE WHEN ISNULL([OPT_TYPE],'') = 'MIX' THEN 'R02_NOT_MIX;' ELSE '' END")
-    if RULE_R03_NOT_NL:
-        pieces.append("CASE WHEN ISNULL([OPT_TYPE],'') = 'NL'  THEN 'R03_NOT_NL;'  ELSE '' END")
+    # R03 removed: NL options are filtered out upstream (Part 3.6 / OPT_TYPE tagging)
+    # R04: block only when BOTH MSA_FNL_Q=0 AND RL_HOLD_QTY=0 (no prior-run hold).
+    #      RL_HOLD_QTY is the ARS_NL in-transit qty (separate from HOLD_QTY which is
+    #      the current-run allocation hold written by Stage C).
     if RULE_R04_MSA_POS:
-        pieces.append("CASE WHEN ISNULL(TRY_CAST([MSA_FNL_Q] AS FLOAT),0) <= 0 THEN 'R04_MSA_POS;' ELSE '' END")
+        pieces.append(
+            "CASE WHEN ISNULL(TRY_CAST([MSA_FNL_Q]    AS FLOAT),0) <= 0 "
+            "      AND ISNULL(TRY_CAST([RL_HOLD_QTY]  AS FLOAT),0) <= 0 "
+            "      THEN 'R04_MSA_POS;' ELSE '' END"
+        )
     if RULE_R05_REQ_POS:
         pieces.append("CASE WHEN ISNULL(TRY_CAST([OPT_REQ_WH] AS FLOAT),0) < 1 THEN 'R05_REQ_POS;' ELSE '' END")
     if RULE_R06_PRI_100:
@@ -230,9 +259,30 @@ def _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
     if RULE_R09_TBL_TRIVIAL:
         pieces.append(
             f"CASE WHEN ISNULL([OPT_TYPE],'') = 'TBL' "
-            f"      AND ISNULL([MJ_REQ],0) < {tbl_trivial_factor} * ISNULL([MAX_DAILY_SALE],0) "
+            f"      AND ISNULL([MJ_REQ],0) < {tbl_trivial_factor} * ISNULL([ACS_D],0) "
             f"      THEN 'R09_TBL_TRIVIAL;' ELSE '' END"
         )
+    # R08: boosted-MJ_REQ skip — only active when PRI gate is off for a type
+    # and a cap_pct is configured. Boosted req = MJ_MBQ×cap% − MJ_STK_TTL;
+    # if that gap is smaller than ACS_SKIP_FACTOR×ACS_D, the store is already
+    # near its capped target and listing this OPT adds no meaningful value.
+    if RULE_R08_MJ_REQ_BOOSTED:
+        if (not pri_ct_check_rl) and rl_mbq_cap_pct > 0:
+            rl_factor = rl_mbq_cap_pct / 100.0
+            pieces.append(
+                f"CASE WHEN ISNULL([OPT_TYPE],'') = 'RL' "
+                f"      AND ISNULL([MJ_MBQ],0) * {rl_factor} - ISNULL([MJ_STK_TTL],0) "
+                f"          < {ACS_SKIP_FACTOR} * ISNULL(NULLIF([ACS_D],0), 1) "
+                f"     THEN 'R08_MJ_REQ_BOOSTED;' ELSE '' END"
+            )
+        if (not pri_ct_check_tbc) and tbc_mbq_cap_pct > 0:
+            tbc_factor = tbc_mbq_cap_pct / 100.0
+            pieces.append(
+                f"CASE WHEN ISNULL([OPT_TYPE],'') = 'TBC' "
+                f"      AND ISNULL([MJ_MBQ],0) * {tbc_factor} - ISNULL([MJ_STK_TTL],0) "
+                f"          < {ACS_SKIP_FACTOR} * ISNULL(NULLIF([ACS_D],0), 1) "
+                f"     THEN 'R08_MJ_REQ_BOOSTED;' ELSE '' END"
+            )
 
     if not pieces:
         reason_expr = "''"
@@ -276,29 +326,35 @@ def _stage_a_assign_rank(conn, working_table):
 
     Within each (WERKS, OPT_TYPE) partition:
         OPT_PRIORITY_TIER (1=focus-uncapped, 2=focus-capped, 3=regular) ASC,
+        SIZE_RATIO DESC,      (VAR_FNL_COUNT/VAR_COUNT — more complete size coverage first)
         SEC_CT% DESC,         (higher contribution % first)
         MAX_DAILY_SALE DESC,  (higher sales velocity first)
         OPT_REQ_WH DESC,      (more required first)
-        GEN_ART_NUMBER, CLR   (stable final tie-breakers)
 
     ST_RANK is NOT used here — it's a store-level rank, constant within a
     single (WERKS, OPT_TYPE) partition, so it can't influence the order.
     """
     _run(conn, f"""
-        ;WITH R AS (
+        ;WITH Base AS (
+            SELECT *,
+                CASE WHEN ISNULL([VAR_COUNT], 0) = 0 THEN 0
+                     ELSE CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT]
+                END AS SIZE_RATIO
+            FROM [{working_table}]
+            WHERE LISTED_FLAG = 1
+        ),
+        R AS (
             SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
                    ROW_NUMBER() OVER (
                        PARTITION BY [WERKS], ISNULL([OPT_TYPE],'')
                        ORDER BY
-                         ISNULL([OPT_PRIORITY_TIER], 3) ASC,
-                         ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0) DESC,
-                         ISNULL([MAX_DAILY_SALE], 0) DESC,
-                         ISNULL([OPT_REQ_WH], 0) DESC,
-                         ISNULL(TRY_CAST([GEN_ART_NUMBER] AS BIGINT), 0) ASC,
-                         ISNULL([CLR],'') ASC
+                         ISNULL([OPT_PRIORITY_TIER], 3)            ASC,
+                         ISNULL([SIZE_RATIO], 0)                    DESC,
+                         ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0)   DESC,
+                         ISNULL([MAX_DAILY_SALE], 0)               DESC,
+                         ISNULL([OPT_REQ_WH], 0)                   DESC
                    ) AS rk
-            FROM [{working_table}]
-            WHERE LISTED_FLAG = 1
+            FROM Base
         )
         UPDATE W SET W.OPT_PRIORITY_RANK = R.rk
         FROM [{working_table}] W
@@ -307,6 +363,122 @@ def _stage_a_assign_rank(conn, working_table):
            AND W.GEN_ART_NUMBER=R.GEN_ART_NUMBER
            AND ISNULL(W.CLR,'') = ISNULL(R.CLR,'')
     """)
+
+
+def _rerank_for_next_opt_type(
+    conn,
+    alloc_table: str,
+    next_ot: str,
+    size_threshold: float = 0.6,
+    min_size_count: int = 3,
+) -> None:
+    """Re-rank OPT_PRIORITY_RANK for `next_ot` rows and skip OPTs whose live
+    size coverage has dropped below the threshold after prior OPT_TYPEs ran.
+
+    Step 1 — SKIP: any (WERKS, GEN_ART_NUMBER, CLR) where
+        live_SIZE_RATIO < size_threshold AND live_VAR_FNL_COUNT < min_size_count
+    is marked ALLOC_STATUS='SKIPPED', SKIP_REASON='R07_SIZE_RATIO_LIVE'.
+
+    Step 2 — RERANK: surviving rows get fresh OPT_PRIORITY_RANK using the
+    same ORDER BY as _stage_a_assign_rank but with live SIZE_RATIO.
+
+    Called once per OPT_TYPE boundary (after RL → before TBC,
+    after TBC → before TBL). Only rows with ALLOC_STATUS IS NULL are affected.
+    """
+    params = {
+        "next_ot": next_ot,
+        "size_thr": size_threshold,
+        "min_sz":   min_size_count,
+    }
+
+    # Step 1: build live SIZE_RATIO per (GEN_ART_NUMBER, CLR, VAR_ART) and skip
+    # OPTs that no longer have enough size coverage.
+    _run(conn, f"""
+        ;WITH PoolState AS (
+            SELECT [GEN_ART_NUMBER], [CLR], [VAR_ART],
+                   COUNT(*) AS VAR_COUNT_LIVE,
+                   SUM(CASE WHEN ISNULL([FNL_Q_REM], 0) > 0 THEN 1 ELSE 0 END) AS VAR_FNL_LIVE
+            FROM [{alloc_table}]
+            WHERE [OPT_TYPE] = :next_ot
+            GROUP BY [GEN_ART_NUMBER], [CLR], [VAR_ART]
+        ),
+        LowCoverage AS (
+            SELECT DISTINCT A.WERKS, A.GEN_ART_NUMBER, A.CLR
+            FROM [{alloc_table}] A
+            INNER JOIN PoolState P
+                ON A.GEN_ART_NUMBER = P.GEN_ART_NUMBER
+               AND ISNULL(A.CLR,'') = ISNULL(P.CLR,'')
+               AND A.VAR_ART = P.VAR_ART
+            WHERE A.[OPT_TYPE] = :next_ot
+              AND A.[ALLOC_STATUS] IS NULL
+              AND P.VAR_COUNT_LIVE > 0
+              AND (CAST(P.VAR_FNL_LIVE AS FLOAT) / P.VAR_COUNT_LIVE) < :size_thr
+              AND P.VAR_FNL_LIVE < :min_sz
+        )
+        UPDATE A SET
+            A.[ALLOC_STATUS]  = 'SKIPPED',
+            A.[ALLOC_REMARKS] = ISNULL(A.[ALLOC_REMARKS],'')
+                + ' R07_SIZE_RATIO_LIVE;'
+        FROM [{alloc_table}] A
+        INNER JOIN LowCoverage LC
+            ON A.WERKS = LC.WERKS
+           AND A.GEN_ART_NUMBER = LC.GEN_ART_NUMBER
+           AND ISNULL(A.CLR,'') = ISNULL(LC.CLR,'')
+        WHERE A.[OPT_TYPE] = :next_ot
+          AND A.[ALLOC_STATUS] IS NULL
+    """, params=params)
+
+    # Step 2: re-rank survivors using live SIZE_RATIO.
+    _run(conn, f"""
+        ;WITH PoolState AS (
+            SELECT [GEN_ART_NUMBER], [CLR], [VAR_ART],
+                   COUNT(*) AS VAR_COUNT_LIVE,
+                   SUM(CASE WHEN ISNULL([FNL_Q_REM], 0) > 0 THEN 1 ELSE 0 END) AS VAR_FNL_LIVE
+            FROM [{alloc_table}]
+            WHERE [OPT_TYPE] = :next_ot
+            GROUP BY [GEN_ART_NUMBER], [CLR], [VAR_ART]
+        ),
+        Base AS (
+            SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
+                   A.[OPT_PRIORITY_TIER],
+                   CASE WHEN ISNULL(P.VAR_COUNT_LIVE, 0) = 0 THEN 0
+                        ELSE CAST(ISNULL(P.VAR_FNL_LIVE, 0) AS FLOAT) / P.VAR_COUNT_LIVE
+                   END AS SIZE_RATIO,
+                   A.[SEC_CT%], A.[MAX_DAILY_SALE], A.[OPT_REQ_WH]
+            FROM [{alloc_table}] A
+            LEFT JOIN PoolState P
+                ON A.GEN_ART_NUMBER = P.GEN_ART_NUMBER
+               AND ISNULL(A.CLR,'') = ISNULL(P.CLR,'')
+               AND A.VAR_ART = P.VAR_ART
+            WHERE A.[OPT_TYPE] = :next_ot
+              AND A.[ALLOC_STATUS] IS NULL
+        ),
+        R AS (
+            SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY [WERKS]
+                       ORDER BY
+                         ISNULL([OPT_PRIORITY_TIER], 3)           ASC,
+                         ISNULL([SIZE_RATIO], 0)                   DESC,
+                         ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0)  DESC,
+                         ISNULL([MAX_DAILY_SALE], 0)              DESC,
+                         ISNULL([OPT_REQ_WH], 0)                  DESC
+                   ) AS rk
+            FROM Base
+        )
+        UPDATE A SET A.[OPT_PRIORITY_RANK] = R.rk
+        FROM [{alloc_table}] A
+        INNER JOIN R
+            ON A.WERKS = R.WERKS AND A.MAJ_CAT = R.MAJ_CAT
+           AND A.GEN_ART_NUMBER = R.GEN_ART_NUMBER
+           AND ISNULL(A.CLR,'') = ISNULL(R.CLR,'')
+        WHERE A.[OPT_TYPE] = :next_ot
+          AND A.[ALLOC_STATUS] IS NULL
+    """, params=params)
+    logger.debug(
+        f"[C] {next_ot}: live-SIZE_RATIO skip + rerank done "
+        f"(thr={size_threshold}, min_sz={min_size_count})"
+    )
 
 
 def _stage_a_materialize_listed(conn, working_table, listed_table) -> int:
@@ -324,10 +496,11 @@ def _stage_a_materialize_listed(conn, working_table, listed_table) -> int:
             ISNULL(STK_TTL,0) AS STK_TTL,
             ISNULL(ACS_D,0) AS ACS_D, ISNULL(AGE,0) AS AGE,
             ISNULL(MAX_DAILY_SALE,0) AS MAX_DAILY_SALE,
+            ISNULL(MJ_REQ,0) AS MJ_REQ,
             LISTING, [PRI_CT%], [SEC_CT%], ALLOC_FLAG,
             FOCUS_W_CAP, FOCUS_WO_CAP,
             ST_RANK, OPT_PRIORITY_RANK, OPT_PRIORITY_TIER,
-            LISTED_FLAG, LISTED_REASON
+            LISTED_FLAG, LISTED_REASON, ALLOC_SEQ
         INTO [{listed_table}]
         FROM [{working_table}]
         WHERE LISTED_FLAG = 1
@@ -339,7 +512,15 @@ def _stage_a_materialize_listed(conn, working_table, listed_table) -> int:
 # ───────────────────────────────────────────────────────────────
 # STAGE B — EXPLODE TO VAR_ART × SZ
 # ───────────────────────────────────────────────────────────────
-def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table) -> int:
+def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
+                     pri_ct_check_rl: bool = True,
+                     pri_ct_check_tbc: bool = True) -> int:
+    # Build the OPT_TYPE list that must enforce PRI_CT%=100 — mirrors R06.
+    enforced = ["'TBL'"]
+    if pri_ct_check_rl:  enforced.append("'RL'")
+    if pri_ct_check_tbc: enforced.append("'TBC'")
+    enforced_in = ", ".join(enforced)
+
     _run(conn, f"IF OBJECT_ID('{alloc_table}','U') IS NOT NULL DROP TABLE [{alloc_table}]")
     _run(conn, f"""
         SELECT
@@ -372,7 +553,8 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table) -> int:
             CAST(NULL AS NVARCHAR(20))  AS ALLOC_WAVE,
             CAST(0 AS INT)              AS ALLOC_ROUND,
             CAST('PENDING' AS NVARCHAR(50)) AS ALLOC_STATUS,
-            CAST(NULL AS NVARCHAR(500)) AS SKIP_REASON
+            CAST(NULL AS NVARCHAR(500)) AS SKIP_REASON,
+            CAST(NULL AS INT)           AS ALLOC_SEQ
         INTO [{alloc_table}]
         FROM [{listed_table}] L
         INNER JOIN [{msa_var_table}] V WITH (NOLOCK)
@@ -385,6 +567,16 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table) -> int:
             AND LTRIM(RTRIM(CAST(L.RDC AS NVARCHAR(50))))
                = LTRIM(RTRIM(CAST(V.[RDC] AS NVARCHAR(50))))
         WHERE TRY_CAST(V.[FNL_Q] AS FLOAT) > 0
+          -- PRI_CT%=100 gate mirrors R06: TBL always enforces; RL/TBC only when
+          -- their pri_ct_check flag is True.  Rows whose OPT_TYPE is not in the
+          -- enforced list pass through regardless of PRI_CT%.
+          AND (    ISNULL(L.[OPT_TYPE],'') NOT IN ({enforced_in})
+               OR  ISNULL(TRY_CAST(L.[PRI_CT%] AS FLOAT), 0) = 100
+              )
+          -- Meaningful MAJ_CAT requirement gate: prevents ineligible stores from
+          -- consuming RDC pool in Stage C and being zeroed post-waterfall.
+          AND ISNULL(TRY_CAST(L.[MJ_REQ] AS FLOAT), 0)
+              > 0.5 * ISNULL(NULLIF(TRY_CAST(L.[ACS_D] AS FLOAT), 0), 18.0)
     """)
     cnt = conn.execute(text(f"SELECT COUNT(*) FROM [{alloc_table}]")).scalar()
     return int(cnt or 0)
@@ -608,7 +800,15 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
     filtered by `MAJ_CAT = :mc`. Used by the parallel orchestrator so that
     workers operating on different MAJ_CATs don't interfere.
     """
-    params = {"ot": opt_type, "bs": band_start, "be": band_end}
+    params = {
+        "ot": opt_type, "bs": band_start, "be": band_end,
+        # next-band window: skip rules only check the immediate next band so
+        # that further-out OPTs are re-evaluated at their own turn. Prevents
+        # mass-marking distant ranks SKIPPED prematurely while still pruning
+        # the very next consumer before it enters the pool waterfall.
+        "be_p1":   band_end + 1,
+        "be_next": band_end + BAND_SIZE,
+    }
     mc_pred_alloc = ""
     mc_pred_work  = ""
     if maj_cat is not None:
@@ -753,10 +953,10 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
             WHERE MAJ_CAT IN ({mc_in})
         """, params_mc)
 
-    # (5) Skip-rules on remaining PENDING/PARTIAL OPTs
-    #   MSA_EXHAUSTED applies to all opt_types.
-    #   PRI_BROKEN scope mirrors the Stage A gate — TBL always enforces;
-    #   RL / TBC enforce only when their flag is True.
+    # (5) Skip-rules — applied only to the NEXT BAND (not all remaining ranks).
+    #   Each OPT is evaluated at its own turn instead of being marked SKIPPED
+    #   many ranks ahead (next-band-only = less premature elimination).
+    #   REM values are embedded in ALLOC_REMARKS for audit visibility.
     enforced = ["'TBL'"]
     if pri_ct_check_rl:  enforced.append("'RL'")
     if pri_ct_check_tbc: enforced.append("'TBC'")
@@ -770,38 +970,47 @@ def _revalidate_after_band(conn, working_table, alloc_table, opt_type,
                 ELSE ALLOC_STATUS END,
             ALLOC_REMARKS = CASE
                 WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0
-                    THEN ISNULL(ALLOC_REMARKS,'') + ' SKIP_MSA_EXHAUSTED;'
+                    THEN ISNULL(ALLOC_REMARKS,'')
+                         + ' SKIP_MSA_EXHAUSTED(rem='
+                         + CAST(ISNULL(MSA_FNL_Q_REM,0) AS NVARCHAR(20)) + ');'
                 WHEN ISNULL(PRI_CT_REM, 0)    < 100
                      AND ISNULL(OPT_TYPE,'') IN ({pri_opt_in})
-                    THEN ISNULL(ALLOC_REMARKS,'') + ' SKIP_PRI_BROKEN;'
+                    THEN ISNULL(ALLOC_REMARKS,'')
+                         + ' SKIP_PRI_BROKEN(pri_ct='
+                         + CAST(ISNULL(PRI_CT_REM,0) AS NVARCHAR(20)) + '%);'
                 ELSE ALLOC_REMARKS END
         WHERE LISTED_FLAG = 1
           AND MAJ_CAT IN ({mc_in})
           AND ISNULL(ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED')
-          AND OPT_PRIORITY_RANK > :be
+          AND OPT_PRIORITY_RANK BETWEEN :be_p1 AND :be_next
     """, params_mc)
 
-    # Store-broken: MJ_REQ_REM < factor × ACS_D → skip rest of store for this opt_type
+    # Store-broken: MJ_REQ_REM < factor × ACS_D → skip next band of this store+opt_type
     if ENABLE_STORE_BROKEN and "MJ_REQ_REM" in work_cols:
         _run(conn, f"""
             UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET
                 ALLOC_STATUS = 'SKIPPED',
-                ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'') + ' SKIP_STORE_BROKEN;'
+                ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'')
+                    + ' SKIP_STORE_BROKEN(req_rem='
+                    + CAST(ISNULL(MJ_REQ_REM,0) AS NVARCHAR(20))
+                    + ',acs_d=' + CAST(ISNULL(ACS_D,0) AS NVARCHAR(20)) + ');'
             WHERE LISTED_FLAG = 1
               AND MAJ_CAT IN ({mc_in})
               AND ISNULL(ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED')
               AND OPT_TYPE = :ot
-              AND OPT_PRIORITY_RANK > :be
+              AND OPT_PRIORITY_RANK BETWEEN :be_p1 AND :be_next
               AND ISNULL(MJ_REQ_REM, 0) < {ACS_SKIP_FACTOR} * ISNULL(ACS_D, 0)
         """, params_mc)
 
-    # (6) Propagate SKIP to alloc_table so future bands' Target CTE excludes them
+    # (6) Propagate SKIP to alloc_table so future bands' Target CTE excludes them.
+    #   SKIP_REASON carries working_table ALLOC_REMARKS so the reviewer sees the
+    #   actual state (rem=X, pri_ct=Y%) without needing to join working_table.
     _run(conn, f"""
         UPDATE A WITH (ROWLOCK, UPDLOCK) SET
             A.ALLOC_STATUS = 'SKIPPED',
             A.SKIP_REASON  = CASE
                 WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
-                    THEN 'REVALIDATION_SKIP'
+                    THEN LTRIM(ISNULL(W.ALLOC_REMARKS,''))
                 ELSE A.SKIP_REASON END
         FROM [{alloc_table}] A
         INNER JOIN [{working_table}] W
@@ -825,6 +1034,7 @@ def _run_band_and_revalidate_batched(
     maj_cat: str,
     pri_ct_check_rl: bool = True,
     pri_ct_check_tbc: bool = True,
+    werks: Optional[str] = None,
 ):
     """
     Single multi-statement T-SQL batch that does everything one rank/band needs:
@@ -842,8 +1052,19 @@ def _run_band_and_revalidate_batched(
     runs across multiple MAJ_CATs). Sequential mode keeps using the original
     `_stage_c_run_band` + `_revalidate_after_band` — see those for the
     canonical, statement-by-statement implementation.
+
+    werks: when provided, every SQL statement in the batch is additionally
+    scoped to this single WERKS. Used by the store-first execution loop in
+    _run_one_majcat so that revalidation (MSA_FNL_Q_REM, PRI_CT_REM, skip
+    rules) only touches the store currently being processed — not all stores
+    in the MAJ_CAT simultaneously.
     """
     work_cols = {c.upper() for c in _cols(conn, working_table)}
+
+    # Store-scoped filter predicates — empty string when running all stores.
+    wk_a  = " AND A.WERKS = :wk"           if werks else ""   # alloc alias A
+    wk_w  = " AND WERKS = :wk"             if werks else ""   # plain / alias W
+    wk_aw = " AND W.WERKS = :wk AND A.WERKS = :wk" if werks else ""  # step 6
 
     # ── Per-grid REQ_REM update fragments (built from grids dict) ──
     grid_update_fragments: List[str] = []
@@ -875,7 +1096,7 @@ def _run_band_and_revalidate_batched(
                    AND ISNULL(A.CLR,'') = ISNULL(W2.CLR,'')
                 WHERE A.OPT_TYPE = :ot
                   AND A.OPT_PRIORITY_RANK = :rk
-                  AND A.MAJ_CAT = :mc
+                  AND A.MAJ_CAT = :mc{wk_a}
                 GROUP BY {group_by}
                 HAVING SUM(ISNULL(A.ROUND_SHIP,0)) > 0
             )
@@ -909,7 +1130,7 @@ def _run_band_and_revalidate_batched(
         # different MAJ_CATs (= different rows) won't escalate to page locks.
         h_rem_sql = f"""
             UPDATE [{working_table}] WITH (ROWLOCK) SET {', '.join(h_rem_sets)}
-            WHERE MAJ_CAT = :mc;
+            WHERE MAJ_CAT = :mc{wk_w};
         """
 
     pri_ct_sql = ""
@@ -921,7 +1142,7 @@ def _run_band_and_revalidate_batched(
                 PRI_CT_REM = CASE
                     WHEN ({gh_sum}) = 0 THEN 0
                     ELSE ROUND(CAST(({h_sum}) AS FLOAT) / ({gh_sum}) * 100, 1) END
-            WHERE MAJ_CAT = :mc;
+            WHERE MAJ_CAT = :mc{wk_w};
         """
 
     # PRI_CT% gate enforcement list
@@ -935,13 +1156,16 @@ def _run_band_and_revalidate_batched(
         store_broken_sql = f"""
             UPDATE [{working_table}] WITH (ROWLOCK) SET
                 ALLOC_STATUS = 'SKIPPED',
-                ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'') + ' SKIP_STORE_BROKEN;'
+                ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'')
+                    + ' SKIP_STORE_BROKEN(req_rem='
+                    + CAST(ISNULL(MJ_REQ_REM,0) AS NVARCHAR(20))
+                    + ',acs_d=' + CAST(ISNULL(ACS_D,0) AS NVARCHAR(20)) + ');'
             WHERE LISTED_FLAG = 1
               AND MAJ_CAT = :mc
               AND ISNULL(ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED')
               AND OPT_TYPE = :ot
-              AND OPT_PRIORITY_RANK > :rk
-              AND ISNULL(MJ_REQ_REM, 0) < {ACS_SKIP_FACTOR} * ISNULL(ACS_D, 0);
+              AND OPT_PRIORITY_RANK BETWEEN :next_rk AND :next_end
+              AND ISNULL(MJ_REQ_REM, 0) < {ACS_SKIP_FACTOR} * ISNULL(ACS_D, 0){wk_w};
         """
 
     # ── ONE multi-statement batch ──
@@ -953,9 +1177,27 @@ def _run_band_and_revalidate_batched(
             SELECT A.WERKS, A.RDC, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
                    A.VAR_ART, A.SZ,
                    A.OPT_PRIORITY_RANK, A.ST_RANK, A.IS_NEW,
-                   CASE WHEN :r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0)
-                           > ISNULL(A.POOL_CONSUMED,0)
-                        THEN :r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0)
+                   /* need_pool rules:
+                      TBL — hold buffer counted ONCE across all rounds (all TBL,
+                        not just IS_NEW=1, since TBL is pre-classified based on IS_NEW).
+                        Cumulative target = SZ_MBQ_WH + (r-1)*SZ_MBQ.
+                        Pure-HOLD guard: suppress when no ship demand remains.
+                      RL/TBC — pool demand = ship demand (no hold buffer). */
+                   CASE
+                        WHEN :ot = 'TBL'
+                             AND (:r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                                  - ISNULL(A.SHIP_QTY,0)) <= 0
+                        THEN 0
+                        WHEN :ot = 'TBL'
+                             AND ISNULL(A.SZ_MBQ_WH,0) + :r*ISNULL(A.SZ_MBQ,0)
+                                 - ISNULL(A.SZ_MBQ,0)
+                                 > ISNULL(A.SZ_STK,0) + ISNULL(A.POOL_CONSUMED,0)
+                        THEN ISNULL(A.SZ_MBQ_WH,0) + :r*ISNULL(A.SZ_MBQ,0)
+                             - ISNULL(A.SZ_MBQ,0)
+                             - ISNULL(A.SZ_STK,0) - ISNULL(A.POOL_CONSUMED,0)
+                        WHEN :r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                                > ISNULL(A.POOL_CONSUMED,0)
+                        THEN :r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
                            - ISNULL(A.POOL_CONSUMED,0)
                         ELSE 0 END AS need_pool,
                    CASE WHEN :r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
@@ -968,13 +1210,13 @@ def _run_band_and_revalidate_batched(
               AND A.OPT_PRIORITY_RANK = :rk
               AND A.MAJ_CAT = :mc
               AND ISNULL(A.ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','INELIGIBLE')
-              AND ISNULL(A.I_ROD, 1) >= :r
+              AND ISNULL(A.I_ROD, 1) >= :r{wk_a}
         ),
         Ranked AS (
             SELECT T.*, P.FNL_Q_REM,
                    ROW_NUMBER() OVER (
                        PARTITION BY T.RDC, T.MAJ_CAT, T.GEN_ART_NUMBER, T.CLR, T.VAR_ART, T.SZ
-                       ORDER BY T.OPT_PRIORITY_RANK ASC, ISNULL(T.ST_RANK,999999) ASC
+                       ORDER BY ISNULL(T.ST_RANK,999999) ASC, T.OPT_PRIORITY_RANK ASC
                    ) AS ord
             FROM Target T
             INNER JOIN {POOL_TABLE} P
@@ -1003,34 +1245,47 @@ def _run_band_and_revalidate_batched(
         )
         UPDATE A SET
             A.POOL_CONSUMED = ISNULL(A.POOL_CONSUMED,0) + X.take_pool,
-            A.ROUND_SHIP    = CASE WHEN A.IS_NEW = 1
+            /* All TBL: split at need_ship; excess to warehouse HOLD. RL/TBC 100% SHIP. */
+            A.ROUND_SHIP    = CASE WHEN :ot = 'TBL'
                                    THEN CASE WHEN X.take_pool < X.need_ship
                                              THEN X.take_pool ELSE X.need_ship END
                                    ELSE X.take_pool END,
-            A.ROUND_HOLD    = CASE WHEN A.IS_NEW = 1
+            A.ROUND_HOLD    = CASE WHEN :ot = 'TBL'
                                    THEN X.take_pool - CASE WHEN X.take_pool < X.need_ship
                                                            THEN X.take_pool ELSE X.need_ship END
                                    ELSE 0 END,
             A.SHIP_QTY      = ISNULL(A.SHIP_QTY,0) +
-                              CASE WHEN A.IS_NEW = 1
+                              CASE WHEN :ot = 'TBL'
                                    THEN CASE WHEN X.take_pool < X.need_ship
                                              THEN X.take_pool ELSE X.need_ship END
                                    ELSE X.take_pool END,
             A.HOLD_QTY      = ISNULL(A.HOLD_QTY,0) +
-                              CASE WHEN A.IS_NEW = 1
+                              CASE WHEN :ot = 'TBL'
                                    THEN X.take_pool - CASE WHEN X.take_pool < X.need_ship
                                                            THEN X.take_pool ELSE X.need_ship END
                                    ELSE 0 END,
             A.ALLOC_WAVE    = CONCAT(:ot, '_R', :r),
             A.ALLOC_ROUND   = :r,
+            /* ALLOC_STATUS target:
+               TBL → SZ_MBQ_WH + (I_ROD-1)×SZ_MBQ − SZ_STK  (hold counted once)
+               All others   → I_ROD × SZ_MBQ − SZ_STK */
             A.ALLOC_STATUS  = CASE
-                WHEN ISNULL(A.POOL_CONSUMED,0) + X.take_pool
-                     >= CASE WHEN ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
-                                  - ISNULL(A.SZ_STK,0) > 0
-                             THEN ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
-                                  - ISNULL(A.SZ_STK,0)
-                             ELSE 0 END
-                     THEN 'ALLOCATED'
+                WHEN ISNULL(A.POOL_CONSUMED,0) + X.take_pool >= CASE
+                     WHEN :ot = 'TBL' THEN
+                          CASE WHEN ISNULL(A.SZ_MBQ_WH,0)
+                                    + ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0) > 0
+                               THEN ISNULL(A.SZ_MBQ_WH,0)
+                                    + ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                               ELSE 0 END
+                     ELSE CASE WHEN ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_STK,0) > 0
+                               THEN ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_STK,0)
+                               ELSE 0 END
+                     END
+                THEN 'ALLOCATED'
                 ELSE 'PARTIAL' END
         FROM [{alloc_table}] A WITH (ROWLOCK)
         INNER JOIN Take X
@@ -1048,7 +1303,7 @@ def _run_band_and_revalidate_batched(
             WHERE OPT_TYPE = :ot
               AND OPT_PRIORITY_RANK = :rk
               AND ALLOC_ROUND = :r
-              AND MAJ_CAT = :mc
+              AND MAJ_CAT = :mc{wk_w}
             GROUP BY RDC, MAJ_CAT, GEN_ART_NUMBER, CLR, VAR_ART, SZ
             HAVING SUM(ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0)) > 0
         )
@@ -1064,7 +1319,7 @@ def _run_band_and_revalidate_batched(
         IF EXISTS (
             SELECT 1 FROM [{alloc_table}]
             WHERE OPT_TYPE = :ot AND OPT_PRIORITY_RANK = :rk AND MAJ_CAT = :mc
-              AND ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0) > 0
+              AND ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0) > 0{wk_w}
         )
         BEGIN
             -- (1) MSA_FNL_Q_REM
@@ -1074,7 +1329,7 @@ def _run_band_and_revalidate_batched(
                 FROM [{alloc_table}]
                 WHERE OPT_TYPE = :ot
                   AND OPT_PRIORITY_RANK = :rk
-                  AND MAJ_CAT = :mc
+                  AND MAJ_CAT = :mc{wk_w}
                 GROUP BY WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR
                 HAVING SUM(ISNULL(ROUND_SHIP,0) + ISNULL(ROUND_HOLD,0)) > 0
             )
@@ -1097,7 +1352,7 @@ def _run_band_and_revalidate_batched(
             -- (4) PRI_CT_REM
             {pri_ct_sql}
 
-            -- (5) Skip rules on remaining OPTs (rank > current)
+            -- (5) Skip rules — next band only; REM values in remarks for audit
             UPDATE [{working_table}] WITH (ROWLOCK) SET
                 ALLOC_STATUS = CASE
                     WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0 THEN 'SKIPPED'
@@ -1106,25 +1361,29 @@ def _run_band_and_revalidate_batched(
                     ELSE ALLOC_STATUS END,
                 ALLOC_REMARKS = CASE
                     WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0
-                        THEN ISNULL(ALLOC_REMARKS,'') + ' SKIP_MSA_EXHAUSTED;'
+                        THEN ISNULL(ALLOC_REMARKS,'')
+                             + ' SKIP_MSA_EXHAUSTED(rem='
+                             + CAST(ISNULL(MSA_FNL_Q_REM,0) AS NVARCHAR(20)) + ');'
                     WHEN ISNULL(PRI_CT_REM, 0)    < 100
                          AND ISNULL(OPT_TYPE,'') IN ({pri_opt_in})
-                        THEN ISNULL(ALLOC_REMARKS,'') + ' SKIP_PRI_BROKEN;'
+                        THEN ISNULL(ALLOC_REMARKS,'')
+                             + ' SKIP_PRI_BROKEN(pri_ct='
+                             + CAST(ISNULL(PRI_CT_REM,0) AS NVARCHAR(20)) + '%);'
                     ELSE ALLOC_REMARKS END
             WHERE LISTED_FLAG = 1
               AND MAJ_CAT = :mc
               AND ISNULL(ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED')
-              AND OPT_PRIORITY_RANK > :rk;
+              AND OPT_PRIORITY_RANK BETWEEN :next_rk AND :next_end{wk_w};
 
             -- (5b) Store-broken
             {store_broken_sql}
 
-            -- (6) Propagate SKIP back to alloc_table
+            -- (6) Propagate SKIP back to alloc_table; carry ALLOC_REMARKS as SKIP_REASON
             UPDATE A SET
                 A.ALLOC_STATUS = 'SKIPPED',
                 A.SKIP_REASON  = CASE
                     WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
-                        THEN 'REVALIDATION_SKIP'
+                        THEN LTRIM(ISNULL(W.ALLOC_REMARKS,''))
                     ELSE A.SKIP_REASON END
             FROM [{alloc_table}] A WITH (ROWLOCK)
             INNER JOIN [{working_table}] W
@@ -1133,10 +1392,17 @@ def _run_band_and_revalidate_batched(
                AND ISNULL(A.CLR,'') = ISNULL(W.CLR,'')
             WHERE W.ALLOC_STATUS = 'SKIPPED'
               AND W.MAJ_CAT = :mc AND A.MAJ_CAT = :mc
-              AND ISNULL(A.ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED','PARTIAL');
+              AND ISNULL(A.ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED','PARTIAL'){wk_aw};
         END
     """
-    _run(conn, sql, {"ot": opt_type, "r": r, "rk": rank, "mc": maj_cat})
+    params = {
+        "ot": opt_type, "r": r, "rk": rank, "mc": maj_cat,
+        "next_rk":  rank + 1,
+        "next_end": rank + BAND_SIZE,
+    }
+    if werks:
+        params["wk"] = werks
+    _run(conn, sql, params)
 
 
 # ───────────────────────────────────────────────────────────────
@@ -1161,9 +1427,163 @@ def _stage_c_build_pool(conn, alloc_table):
         pass
 
 
+def _stage_c_apply_mbq_cap(conn, alloc_table: str, working_table: str,
+                            opt_type: str, cap_pct: float) -> None:
+    """Post-waterfall clip: for each (WERKS, MAJ_CAT) whose cumulative SHIP_QTY
+    exceeds cap_pct% of MJ_MBQ, zero out the lowest-priority rows until the
+    total is within budget. Rows that are trimmed are set to SHIP_QTY=0 and
+    ALLOC_STATUS='SKIPPED', SKIP_REASON='MBQ_CAP'.
+    Only used by sequential mode — pandas mode applies the cap inline in _run_band."""
+    try:
+        _run(conn, f"""
+            ;WITH Budget AS (
+                SELECT W.WERKS, W.MAJ_CAT,
+                       ISNULL(MAX(ISNULL(W.MJ_MBQ,0)) * :cap / 100.0
+                              - MAX(ISNULL(W.MJ_STK_TTL,0)), 0) AS budget
+                FROM [{working_table}] W
+                WHERE W.LISTED_FLAG = 1
+                GROUP BY W.WERKS, W.MAJ_CAT
+            ),
+            Ordered AS (
+                SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR, A.VAR_ART, A.SZ,
+                       A.SHIP_QTY,
+                       SUM(A.SHIP_QTY) OVER (
+                           PARTITION BY A.WERKS, A.MAJ_CAT
+                           ORDER BY ISNULL(A.OPT_PRIORITY_RANK,999999) ASC,
+                                    ISNULL(A.ST_RANK,999999) ASC,
+                                    A.GEN_ART_NUMBER ASC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS cum_ship,
+                       B.budget
+                FROM [{alloc_table}] A
+                JOIN Budget B ON A.WERKS = B.WERKS AND A.MAJ_CAT = B.MAJ_CAT
+                WHERE A.OPT_TYPE = :ot
+            )
+            UPDATE A
+               SET A.SHIP_QTY     = CASE
+                       WHEN O.cum_ship <= O.budget THEN O.SHIP_QTY
+                       WHEN O.cum_ship - O.SHIP_QTY >= O.budget THEN 0
+                       ELSE O.budget - (O.cum_ship - O.SHIP_QTY) END,
+                   A.ALLOC_STATUS = CASE
+                       WHEN O.cum_ship - O.SHIP_QTY >= O.budget THEN 'SKIPPED'
+                       ELSE A.ALLOC_STATUS END,
+                   A.SKIP_REASON  = CASE
+                       WHEN O.cum_ship - O.SHIP_QTY >= O.budget THEN 'MBQ_CAP'
+                       ELSE A.SKIP_REASON END
+            FROM [{alloc_table}] A
+            INNER JOIN Ordered O
+                ON A.WERKS          = O.WERKS
+               AND A.MAJ_CAT        = O.MAJ_CAT
+               AND A.GEN_ART_NUMBER = O.GEN_ART_NUMBER
+               AND ISNULL(A.CLR,'') = ISNULL(O.CLR,'')
+               AND A.VAR_ART        = O.VAR_ART
+               AND A.SZ             = O.SZ
+            WHERE A.OPT_TYPE = :ot
+        """, {"cap": float(cap_pct), "ot": opt_type})
+    except Exception as e:
+        logger.warning(f"[C] MBQ cap ({opt_type}) failed: {e}")
+
+
+def _revalidate_cross_type(
+    conn, working_table, alloc_table,
+    completed_ot: str, next_types: List[str],
+    grids: Dict[str, Dict],
+    pri_ct_check_rl: bool = True,
+    pri_ct_check_tbc: bool = True,
+):
+    """
+    After opt_type `completed_ot` finishes ALL its rounds, apply skip rules to
+    ALL pending rows of `next_types` in working_table. This ensures:
+      - TBC/TBL OPTs for stores that RL already filled to MJ_REQ are SKIPPED
+        before those types start, not discovered mid-waterfall.
+      - MJ_REQ_REM / MSA_FNL_Q_REM / PRI_CT_REM already reflect the completed
+        type's deductions (updated by per-band revalidation), so the cross-type
+        check uses current values.
+      - ALLOC_REMARKS record which opt_type's completion triggered each skip.
+    """
+    work_cols = {c.upper() for c in _cols(conn, working_table)}
+
+    # Build the IN list for next types
+    next_in = ", ".join(f"'{t}'" for t in next_types)
+
+    # PRI gate enforcement list for the skip check
+    enforced = ["'TBL'"]
+    if pri_ct_check_rl:  enforced.append("'RL'")
+    if pri_ct_check_tbc: enforced.append("'TBC'")
+    pri_opt_in = ", ".join(enforced)
+
+    # Apply MSA_EXHAUSTED and PRI_BROKEN to all pending next-type rows
+    _run(conn, f"""
+        UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET
+            ALLOC_STATUS = CASE
+                WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0 THEN 'SKIPPED'
+                WHEN ISNULL(PRI_CT_REM, 0) < 100
+                     AND ISNULL(OPT_TYPE,'') IN ({pri_opt_in}) THEN 'SKIPPED'
+                ELSE ALLOC_STATUS END,
+            ALLOC_REMARKS = CASE
+                WHEN ISNULL(MSA_FNL_Q_REM, 0) <= 0
+                    THEN ISNULL(ALLOC_REMARKS,'')
+                         + ' CROSS_SKIP_{completed_ot}_MSA(rem='
+                         + CAST(ISNULL(MSA_FNL_Q_REM,0) AS NVARCHAR(20)) + ');'
+                WHEN ISNULL(PRI_CT_REM, 0) < 100
+                     AND ISNULL(OPT_TYPE,'') IN ({pri_opt_in})
+                    THEN ISNULL(ALLOC_REMARKS,'')
+                         + ' CROSS_SKIP_{completed_ot}_PRI(pri_ct='
+                         + CAST(ISNULL(PRI_CT_REM,0) AS NVARCHAR(20)) + '%);'
+                ELSE ALLOC_REMARKS END
+        WHERE LISTED_FLAG = 1
+          AND ISNULL(OPT_TYPE,'') IN ({next_in})
+          AND ISNULL(ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED')
+    """)
+
+    # Store-broken across types: MJ_REQ_REM < factor × ACS_D after completed type
+    if ENABLE_STORE_BROKEN and "MJ_REQ_REM" in work_cols:
+        _run(conn, f"""
+            UPDATE [{working_table}] WITH (ROWLOCK, UPDLOCK) SET
+                ALLOC_STATUS = 'SKIPPED',
+                ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'')
+                    + ' CROSS_SKIP_{completed_ot}_STORE_BROKEN(req_rem='
+                    + CAST(ISNULL(MJ_REQ_REM,0) AS NVARCHAR(20))
+                    + ',acs_d=' + CAST(ISNULL(ACS_D,0) AS NVARCHAR(20)) + ');'
+            WHERE LISTED_FLAG = 1
+              AND ISNULL(OPT_TYPE,'') IN ({next_in})
+              AND ISNULL(ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED')
+              AND ISNULL(MJ_REQ_REM, 0) < {ACS_SKIP_FACTOR} * ISNULL(ACS_D, 0)
+        """)
+
+    # Propagate SKIP to alloc_table
+    _run(conn, f"""
+        UPDATE A WITH (ROWLOCK, UPDLOCK) SET
+            A.ALLOC_STATUS = 'SKIPPED',
+            A.SKIP_REASON  = CASE
+                WHEN A.SKIP_REASON IS NULL OR A.SKIP_REASON = ''
+                    THEN LTRIM(ISNULL(W.ALLOC_REMARKS,''))
+                ELSE A.SKIP_REASON END
+        FROM [{alloc_table}] A
+        INNER JOIN [{working_table}] W
+            ON A.WERKS=W.WERKS AND A.MAJ_CAT=W.MAJ_CAT
+           AND A.GEN_ART_NUMBER=W.GEN_ART_NUMBER
+           AND ISNULL(A.CLR,'') = ISNULL(W.CLR,'')
+        WHERE W.ALLOC_STATUS = 'SKIPPED'
+          AND W.OPT_TYPE IN ({next_in})
+          AND ISNULL(A.ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','ALLOCATED','PARTIAL')
+    """)
+
+    skipped = conn.execute(text(f"""
+        SELECT COUNT(*) FROM [{working_table}]
+        WHERE OPT_TYPE IN ({next_in})
+          AND ALLOC_STATUS = 'SKIPPED'
+          AND ALLOC_REMARKS LIKE '%CROSS_SKIP_{completed_ot}%'
+    """)).scalar()
+    if int(skipped or 0) > 0:
+        logger.info(f"[C] cross-type after {completed_ot}: {skipped} rows pre-skipped in {next_in}")
+
+
 def _stage_c_waterfall(conn, alloc_table, working_table=None, grids=None,
                         pri_ct_check_rl: bool = True,
-                        pri_ct_check_tbc: bool = True):
+                        pri_ct_check_tbc: bool = True,
+                        size_threshold: float = 0.6,
+                        min_size_count: int = 3):
     """
     For each (OPT_TYPE, round r, rank band) — run one batch SQL that:
       1) computes need_pool / need_ship per eligible row,
@@ -1234,29 +1654,177 @@ def _stage_c_waterfall(conn, alloc_table, working_table=None, grids=None,
             f"hold={float(s[2] or 0):.0f}, filled_rows={s[3]}"
         )
 
+        # Cross-type revalidation: after this opt_type finishes ALL its rounds,
+        # evaluate skip rules against ALL pending rows of subsequent opt_types
+        # in working_table. This prevents TBC/TBL from allocating to stores that
+        # RL already brought to MJ_REQ, or to OPTs whose pool is exhausted.
+        next_types = OPT_TYPE_ORDER[OPT_TYPE_ORDER.index(ot) + 1:]
+        if next_types and working_table and grids and ENABLE_PER_OPT_REVALIDATION:
+            _revalidate_cross_type(
+                conn, working_table, alloc_table,
+                completed_ot=ot, next_types=next_types, grids=grids,
+                pri_ct_check_rl=pri_ct_check_rl,
+                pri_ct_check_tbc=pri_ct_check_tbc,
+            )
+        # Skip OPTs whose live size coverage dropped below threshold, then
+        # re-rank surviving rows using live SIZE_RATIO before their bands start.
+        if next_types:
+            for next_ot in next_types:
+                _rerank_for_next_opt_type(
+                    conn, alloc_table, next_ot,
+                    size_threshold=size_threshold,
+                    min_size_count=min_size_count,
+                )
+
+    # Global MJ_REQ cap: SUM(SHIP_QTY across all OPTs) must not exceed MJ_REQ
+    # per (WERKS, MAJ_CAT). Without this, each OPT allocates independently up
+    # to OPT_MBQ − OPT_STK, and their sum routinely exceeds MJ_MBQ − MJ_STK_TTL.
+    # Excess is trimmed from lowest-priority rows (TBL > TBC > RL, then by
+    # OPT_PRIORITY_RANK DESC, ST_RANK DESC) to preserve high-priority allocations.
+    if working_table:
+        _stage_c_apply_mj_req_cap(conn, alloc_table, working_table)
+
     # Finalise: copy SHIP_QTY to ALLOC_QTY
     _run(conn, f"UPDATE [{alloc_table}] SET ALLOC_QTY = SHIP_QTY")
-    # Classify final status, using the SZ_STK-aware lifetime target.
+    # Classify final status.
+    # Target: TBL → SZ_MBQ_WH + (I_ROD-1)*SZ_MBQ - SZ_STK (hold buffer, counted once)
+    #         RL/TBC → I_ROD * SZ_MBQ - SZ_STK             (no hold buffer)
     _run(conn, f"""
         UPDATE [{alloc_table}] SET
             ALLOC_STATUS = CASE
                 WHEN SHIP_QTY + HOLD_QTY > 0
-                     AND SHIP_QTY + HOLD_QTY
-                         >= CASE WHEN ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
-                                      - ISNULL(SZ_STK,0) > 0
-                                 THEN ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
-                                      - ISNULL(SZ_STK,0)
-                                 ELSE 0 END
+                     AND SHIP_QTY + HOLD_QTY >= CASE
+                         WHEN OPT_TYPE='TBL'
+                         THEN CASE WHEN ISNULL(SZ_MBQ_WH,0)
+                                        + (ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                                        - ISNULL(SZ_STK,0) > 0
+                                   THEN ISNULL(SZ_MBQ_WH,0)
+                                        + (ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                                        - ISNULL(SZ_STK,0)
+                                   ELSE 0 END
+                         ELSE CASE WHEN ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0)
+                                        - ISNULL(SZ_STK,0) > 0
+                                   THEN ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0)
+                                        - ISNULL(SZ_STK,0)
+                                   ELSE 0 END
+                         END
                      THEN 'ALLOCATED'
                 WHEN SHIP_QTY > 0                 THEN 'PARTIAL'
                 ELSE 'SKIPPED' END,
             SKIP_REASON = CASE
                 WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                     AND ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1) - ISNULL(SZ_STK,0) <= 0
+                     AND CASE WHEN OPT_TYPE='TBL'
+                              THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                              ELSE ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0) END
+                          - ISNULL(SZ_STK,0) <= 0
                      THEN 'ALREADY_STOCKED'
                 WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_OR_DEMAND'
                 ELSE SKIP_REASON END
     """)
+
+
+def _stage_c_apply_mj_req_cap(conn, alloc_table: str, working_table: str) -> None:
+    """
+    Global post-waterfall cap: for each (WERKS, MAJ_CAT), ensure
+    SUM(SHIP_QTY across all OPTs and sizes) ≤ MJ_REQ = MJ_MBQ − MJ_STK_TTL.
+
+    Without this, each OPT is allocated to OPT_MBQ − OPT_STK independently.
+    With n OPTs, their sum frequently exceeds the store's net requirement.
+
+    Trim strategy: excess is removed from the lowest-priority rows first
+    (TBL before TBC before RL, then by OPT_PRIORITY_RANK DESC, ST_RANK DESC,
+    GEN_ART_NUMBER DESC) — the same order as allocation priority but reversed,
+    so the first-allocated high-value OPTs are protected.
+
+    Rows trimmed to zero get ALLOC_STATUS='SKIPPED', SKIP_REASON='MJ_REQ_CAP'.
+    Partially trimmed rows keep their partial SHIP_QTY and stay PARTIAL.
+    """
+    try:
+        _run(conn, f"""
+            ;WITH Budget AS (
+                -- MJ_REQ = MJ_MBQ − MJ_STK_TTL (clamped at 0)
+                SELECT W.WERKS, W.MAJ_CAT,
+                       ISNULL(MAX(ISNULL(W.MJ_MBQ, 0)) - MAX(ISNULL(W.MJ_STK_TTL, 0)), 0) AS budget
+                FROM [{working_table}] W
+                WHERE W.LISTED_FLAG = 1
+                GROUP BY W.WERKS, W.MAJ_CAT
+                HAVING MAX(ISNULL(W.MJ_MBQ, 0)) - MAX(ISNULL(W.MJ_STK_TTL, 0)) > 0
+            ),
+            Ordered AS (
+                -- Cumulative SHIP_QTY in reverse-priority order
+                -- (lowest-priority rows eat into the budget last)
+                SELECT A.WERKS, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
+                       A.VAR_ART, A.SZ, A.SHIP_QTY,
+                       SUM(A.SHIP_QTY) OVER (
+                           PARTITION BY A.WERKS, A.MAJ_CAT
+                           ORDER BY
+                               CASE A.OPT_TYPE WHEN 'RL' THEN 1 WHEN 'TBC' THEN 2 ELSE 3 END ASC,
+                               ISNULL(A.OPT_PRIORITY_RANK, 999999) ASC,
+                               ISNULL(A.ST_RANK, 999999) ASC,
+                               A.GEN_ART_NUMBER ASC
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS cum_ship,
+                       B.budget
+                FROM [{alloc_table}] A
+                INNER JOIN Budget B
+                    ON A.WERKS = B.WERKS AND A.MAJ_CAT = B.MAJ_CAT
+                WHERE ISNULL(A.SHIP_QTY, 0) > 0
+            )
+            UPDATE A SET
+                A.SHIP_QTY    = CASE
+                    WHEN O.cum_ship <= O.budget                     THEN O.SHIP_QTY
+                    WHEN O.cum_ship - O.SHIP_QTY >= O.budget        THEN 0
+                    ELSE O.budget - (O.cum_ship - O.SHIP_QTY) END,
+                A.ALLOC_STATUS = CASE
+                    WHEN O.cum_ship - O.SHIP_QTY >= O.budget THEN 'SKIPPED'
+                    ELSE A.ALLOC_STATUS END,
+                A.SKIP_REASON  = CASE
+                    WHEN O.cum_ship - O.SHIP_QTY >= O.budget THEN 'MJ_REQ_CAP'
+                    ELSE A.SKIP_REASON END
+            FROM [{alloc_table}] A
+            INNER JOIN Ordered O
+                ON A.WERKS          = O.WERKS
+               AND A.MAJ_CAT        = O.MAJ_CAT
+               AND A.GEN_ART_NUMBER = O.GEN_ART_NUMBER
+               AND ISNULL(A.CLR,'') = ISNULL(O.CLR,'')
+               AND A.VAR_ART        = O.VAR_ART
+               AND A.SZ             = O.SZ
+            WHERE ISNULL(A.SHIP_QTY, 0) > 0
+        """)
+        capped = conn.execute(text(f"""
+            SELECT COUNT(*) FROM [{alloc_table}] WHERE SKIP_REASON = 'MJ_REQ_CAP'
+        """)).scalar()
+        if int(capped or 0) > 0:
+            logger.info(f"[C] MJ_REQ cap: trimmed {capped} rows")
+
+        # Rows cancelled by the cap (SHIP=0, HOLD=0) must not hold pool consumption.
+        # Reset POOL_CONSUMED so FNL_Q_REM is not wrongly reduced for them.
+        _run(conn, f"""
+            UPDATE [{alloc_table}] SET POOL_CONSUMED = 0
+            WHERE ISNULL(SHIP_QTY,  0) = 0
+              AND ISNULL(HOLD_QTY,  0) = 0
+              AND ISNULL(POOL_CONSUMED, 0) > 0
+        """)
+        # Recompute FNL_Q_REM per pool key from actual (non-zero) pool consumption.
+        _run(conn, f"""
+            UPDATE A SET A.FNL_Q_REM = ISNULL(A.FNL_Q, 0) - ISNULL(B.consumed, 0)
+            FROM [{alloc_table}] A
+            LEFT JOIN (
+                SELECT [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
+                       ISNULL([CLR], '') AS CLR, [VAR_ART], [SZ],
+                       SUM(ISNULL([POOL_CONSUMED], 0)) AS consumed
+                FROM   [{alloc_table}]
+                GROUP  BY [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
+                          ISNULL([CLR], ''), [VAR_ART], [SZ]
+            ) B ON  A.[RDC]            = B.[RDC]
+                AND A.[MAJ_CAT]        = B.[MAJ_CAT]
+                AND A.[GEN_ART_NUMBER] = B.[GEN_ART_NUMBER]
+                AND ISNULL(A.[CLR],'') = B.[CLR]
+                AND A.[VAR_ART]        = B.[VAR_ART]
+                AND A.[SZ]             = B.[SZ]
+        """)
+    except Exception as e:
+        logger.warning(f"[C] MJ_REQ cap failed: {e}")
 
 
 def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
@@ -1285,13 +1853,27 @@ def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
             SELECT A.WERKS, A.RDC, A.MAJ_CAT, A.GEN_ART_NUMBER, A.CLR,
                    A.VAR_ART, A.SZ,
                    A.OPT_PRIORITY_RANK, A.ST_RANK, A.IS_NEW,
-                   /* SZ_STK (store's current stock at this size) is subtracted
-                      once from the round's target. A size that is already
-                      over-stocked (SZ_STK >= r * SZ_MBQ_WH) therefore has
-                      need_pool = 0 and takes nothing from the pool. */
-                   CASE WHEN :r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0)
-                           > ISNULL(A.POOL_CONSUMED,0)
-                        THEN :r * ISNULL(A.SZ_MBQ_WH,0) - ISNULL(A.SZ_STK,0)
+                   /* need_pool rules:
+                      TBL — hold buffer counted ONCE across all rounds (all TBL, not just
+                        IS_NEW=1, since TBL is pre-classified based on IS_NEW).
+                        Cumulative target = SZ_MBQ_WH + (r-1)*SZ_MBQ.
+                        Pure-HOLD guard: suppress when no ship demand remains.
+                      RL/TBC — pool demand = ship demand (no hold buffer). */
+                   CASE
+                        WHEN :ot = 'TBL'
+                             AND (:r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                                  - ISNULL(A.SHIP_QTY,0)) <= 0
+                        THEN 0
+                        WHEN :ot = 'TBL'
+                             AND ISNULL(A.SZ_MBQ_WH,0) + :r*ISNULL(A.SZ_MBQ,0)
+                                 - ISNULL(A.SZ_MBQ,0)
+                                 > ISNULL(A.SZ_STK,0) + ISNULL(A.POOL_CONSUMED,0)
+                        THEN ISNULL(A.SZ_MBQ_WH,0) + :r*ISNULL(A.SZ_MBQ,0)
+                             - ISNULL(A.SZ_MBQ,0)
+                             - ISNULL(A.SZ_STK,0) - ISNULL(A.POOL_CONSUMED,0)
+                        WHEN :r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                                > ISNULL(A.POOL_CONSUMED,0)
+                        THEN :r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
                            - ISNULL(A.POOL_CONSUMED,0)
                         ELSE 0 END AS need_pool,
                    CASE WHEN :r * ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
@@ -1303,8 +1885,6 @@ def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
             WHERE A.OPT_TYPE = :ot
               AND A.OPT_PRIORITY_RANK BETWEEN :bs AND :be
               AND ISNULL(A.ALLOC_STATUS,'PENDING') NOT IN ('SKIPPED','INELIGIBLE')
-              /* Per-row I_ROD gate: a row with I_ROD=1 must not
-                 compete in round 2. */
               AND ISNULL(A.I_ROD, 1) >= :r
               {mc_pred}
         ),
@@ -1312,7 +1892,7 @@ def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
             SELECT T.*, P.FNL_Q_REM,
                    ROW_NUMBER() OVER (
                        PARTITION BY T.RDC, T.MAJ_CAT, T.GEN_ART_NUMBER, T.CLR, T.VAR_ART, T.SZ
-                       ORDER BY T.OPT_PRIORITY_RANK ASC, ISNULL(T.ST_RANK,999999) ASC
+                       ORDER BY ISNULL(T.ST_RANK,999999) ASC, T.OPT_PRIORITY_RANK ASC
                    ) AS ord
             FROM Target T
             INNER JOIN {POOL_TABLE} P
@@ -1341,38 +1921,47 @@ def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
         )
         UPDATE A SET
             A.POOL_CONSUMED = ISNULL(A.POOL_CONSUMED,0) + X.take_pool,
-            A.ROUND_SHIP    = CASE WHEN A.IS_NEW = 1
+            /* All TBL: split at need_ship; excess to warehouse HOLD. RL/TBC 100% SHIP. */
+            A.ROUND_SHIP    = CASE WHEN :ot = 'TBL'
                                    THEN CASE WHEN X.take_pool < X.need_ship
                                              THEN X.take_pool ELSE X.need_ship END
                                    ELSE X.take_pool END,
-            A.ROUND_HOLD    = CASE WHEN A.IS_NEW = 1
+            A.ROUND_HOLD    = CASE WHEN :ot = 'TBL'
                                    THEN X.take_pool - CASE WHEN X.take_pool < X.need_ship
                                                            THEN X.take_pool ELSE X.need_ship END
                                    ELSE 0 END,
             A.SHIP_QTY      = ISNULL(A.SHIP_QTY,0) +
-                              CASE WHEN A.IS_NEW = 1
+                              CASE WHEN :ot = 'TBL'
                                    THEN CASE WHEN X.take_pool < X.need_ship
                                              THEN X.take_pool ELSE X.need_ship END
                                    ELSE X.take_pool END,
             A.HOLD_QTY      = ISNULL(A.HOLD_QTY,0) +
-                              CASE WHEN A.IS_NEW = 1
+                              CASE WHEN :ot = 'TBL'
                                    THEN X.take_pool - CASE WHEN X.take_pool < X.need_ship
                                                            THEN X.take_pool ELSE X.need_ship END
                                    ELSE 0 END,
             A.ALLOC_WAVE    = CONCAT(:ot, '_R', :r),
             A.ALLOC_ROUND   = :r,
+            /* ALLOC_STATUS target:
+               TBL → SZ_MBQ_WH + (I_ROD-1)×SZ_MBQ − SZ_STK  (hold counted once)
+               All others   → I_ROD × SZ_MBQ − SZ_STK                  (no hold buffer) */
             A.ALLOC_STATUS  = CASE
-                /* Row is fully ALLOCATED when POOL_CONSUMED reaches the
-                   lifetime net target: I_ROD * SZ_MBQ_WH - SZ_STK
-                   (clamped at 0 for already over-stocked sizes). Earlier
-                   the row stays PARTIAL so the next round can top it up. */
-                WHEN ISNULL(A.POOL_CONSUMED,0) + X.take_pool
-                     >= CASE WHEN ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
-                                  - ISNULL(A.SZ_STK,0) > 0
-                             THEN ISNULL(A.I_ROD,1) * ISNULL(A.SZ_MBQ_WH,0)
-                                  - ISNULL(A.SZ_STK,0)
-                             ELSE 0 END
-                     THEN 'ALLOCATED'
+                WHEN ISNULL(A.POOL_CONSUMED,0) + X.take_pool >= CASE
+                     WHEN :ot = 'TBL' THEN
+                          CASE WHEN ISNULL(A.SZ_MBQ_WH,0)
+                                    + ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0) > 0
+                               THEN ISNULL(A.SZ_MBQ_WH,0)
+                                    + ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_MBQ,0) - ISNULL(A.SZ_STK,0)
+                               ELSE 0 END
+                     ELSE CASE WHEN ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_STK,0) > 0
+                               THEN ISNULL(A.I_ROD,1)*ISNULL(A.SZ_MBQ,0)
+                                    - ISNULL(A.SZ_STK,0)
+                               ELSE 0 END
+                     END
+                THEN 'ALLOCATED'
                 ELSE 'PARTIAL' END
         FROM [{alloc_table}] A WITH (ROWLOCK, UPDLOCK)
         INNER JOIN Take X
@@ -1411,34 +2000,99 @@ def _stage_c_run_band(conn, alloc_table, opt_type, r, band_start, band_end,
 # STAGE D — REFLECT & AUDIT
 # ───────────────────────────────────────────────────────────────
 def _stage_d_reflect(conn, working_table, alloc_table):
-    _run(conn, f"""
-        ;WITH Agg AS (
-            SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
-                   SUM(ISNULL(SHIP_QTY,0)) AS ship_q,
-                   SUM(ISNULL(HOLD_QTY,0)) AS hold_q,
-                   COUNT(*) AS sz_rows,
-                   SUM(CASE WHEN SHIP_QTY > 0 THEN 1 ELSE 0 END) AS filled_rows
-            FROM [{alloc_table}]
-            GROUP BY WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR
-        )
-        UPDATE W SET
-            W.ALLOC_QTY    = A.ship_q,
-            W.HOLD_QTY     = A.hold_q,
-            W.ALLOC_STATUS = CASE
-                WHEN A.ship_q = 0                 THEN 'NOT_ALLOCATED'
-                WHEN A.filled_rows < A.sz_rows    THEN 'PARTIAL'
-                ELSE 'ALLOCATED' END,
-            W.ALLOC_REMARKS = CONCAT(
-                'ship=', CAST(A.ship_q AS NVARCHAR(20)),
-                '; hold=', CAST(A.hold_q AS NVARCHAR(20)),
-                '; sizes=', CAST(A.filled_rows AS NVARCHAR(10)),
-                '/', CAST(A.sz_rows AS NVARCHAR(10)))
-        FROM [{working_table}] W
-        INNER JOIN Agg A
-            ON W.WERKS=A.WERKS AND W.MAJ_CAT=A.MAJ_CAT
-           AND W.GEN_ART_NUMBER=A.GEN_ART_NUMBER
-           AND ISNULL(W.CLR,'') = ISNULL(A.CLR,'')
-    """)
+    # ALLOC_SEQ is generated at OPT-grain from ARS_LISTING_WORKING so that
+    # the sequence represents execution order of OPTs (one number per store×OPT
+    # pair), not size rows.  ALLOC_ROUND lives at size-grain in alloc_table, so
+    # we aggregate it (MIN) first, then use it in the ROW_NUMBER ordering on
+    # working_table. The resulting seq is then propagated back to every size
+    # row in alloc_table by a join on OPT keys.
+    #
+    # ORDER: OPT_TYPE → first_alloc_round → ST_RANK → OPT_PRIORITY_RANK
+    #   - Round-first so round-1 OPTs precede round-2 OPTs regardless of store.
+    #   - ST_RANK within a round so ST_RANK=1 store is fully listed first.
+    #   - OPT_PRIORITY_RANK as final tie-break within a store.
+    try:
+        _run(conn, f"""
+            ;WITH Agg AS (
+                -- Aggregate alloc_table to OPT grain. MIN(ALLOC_ROUND) gives
+                -- the earliest round this OPT was allocated (0 when no alloc).
+                SELECT WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR,
+                       SUM(ISNULL(SHIP_QTY, 0))  AS ship_q,
+                       SUM(ISNULL(HOLD_QTY, 0))  AS hold_q,
+                       COUNT(*)                   AS sz_rows,
+                       SUM(CASE WHEN ISNULL(SHIP_QTY,0) + ISNULL(HOLD_QTY,0) > 0
+                                THEN 1 ELSE 0 END) AS filled_rows,
+                       MIN(ISNULL(ALLOC_ROUND, 0)) AS first_round
+                FROM [{alloc_table}]
+                GROUP BY WERKS, MAJ_CAT, GEN_ART_NUMBER, CLR
+            ),
+            Seq AS (
+                -- Sequence OPTs using listing-grain attributes (ST_RANK,
+                -- OPT_PRIORITY_RANK, OPT_TYPE live in working_table) plus
+                -- the aggregated first_round from alloc_table.
+                SELECT W.WERKS, W.MAJ_CAT, W.GEN_ART_NUMBER,
+                       ISNULL(W.CLR, '') AS CLR,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY W.MAJ_CAT
+                           ORDER BY
+                               CASE W.OPT_TYPE WHEN 'RL' THEN 1 WHEN 'TBC' THEN 2 ELSE 3 END,
+                               ISNULL(A.first_round, 0),
+                               ISNULL(W.ST_RANK, 999999),
+                               ISNULL(W.OPT_PRIORITY_RANK, 999999)
+                       ) AS seq,
+                       A.ship_q, A.hold_q, A.sz_rows, A.filled_rows
+                FROM [{working_table}] W
+                LEFT JOIN Agg A
+                    ON  A.WERKS           = W.WERKS
+                    AND A.MAJ_CAT         = W.MAJ_CAT
+                    AND A.GEN_ART_NUMBER  = W.GEN_ART_NUMBER
+                    AND ISNULL(A.CLR,'')  = ISNULL(W.CLR,'')
+                WHERE W.LISTED_FLAG = 1
+            )
+            UPDATE W SET
+                W.ALLOC_SEQ    = S.seq,
+                W.ALLOC_QTY    = ISNULL(S.ship_q, 0),
+                W.HOLD_QTY     = ISNULL(S.hold_q, 0),
+                W.ALLOC_STATUS = CASE
+                    WHEN ISNULL(S.ship_q,0) + ISNULL(S.hold_q,0) = 0
+                         THEN 'NOT_ALLOCATED'
+                    WHEN ISNULL(S.filled_rows,0) < ISNULL(S.sz_rows,0)
+                         THEN 'PARTIAL'
+                    ELSE 'ALLOCATED' END,
+                W.ALLOC_REMARKS = CONCAT(
+                    -- Preserve any skip/revalidation remarks written during bands
+                    CASE WHEN LEN(LTRIM(ISNULL(W.ALLOC_REMARKS,''))) > 0
+                         THEN LTRIM(W.ALLOC_REMARKS) + ' | '
+                         ELSE '' END,
+                    'ship=',  CAST(ISNULL(S.ship_q,  0) AS NVARCHAR(20)),
+                    '; hold=', CAST(ISNULL(S.hold_q,  0) AS NVARCHAR(20)),
+                    '; sizes=',CAST(ISNULL(S.filled_rows,0) AS NVARCHAR(10)),
+                    '/',       CAST(ISNULL(S.sz_rows,  0) AS NVARCHAR(10)),
+                    '; seq=',  CAST(S.seq AS NVARCHAR(10)))
+            FROM [{working_table}] W
+            INNER JOIN Seq S
+                ON  S.WERKS          = W.WERKS
+                AND S.MAJ_CAT        = W.MAJ_CAT
+                AND S.GEN_ART_NUMBER = W.GEN_ART_NUMBER
+                AND S.CLR            = ISNULL(W.CLR, '')
+        """)
+    except Exception as e:
+        logger.warning(f"[D] ALLOC_SEQ stamp failed: {e}")
+
+    # Propagate the OPT-grain ALLOC_SEQ from working_table down to every size
+    # row in alloc_table.  All sizes of the same OPT share one sequence number.
+    try:
+        _run(conn, f"""
+            UPDATE A SET A.ALLOC_SEQ = W.ALLOC_SEQ
+            FROM [{alloc_table}] A
+            INNER JOIN [{working_table}] W
+                ON  W.WERKS          = A.WERKS
+                AND W.MAJ_CAT        = A.MAJ_CAT
+                AND W.GEN_ART_NUMBER = A.GEN_ART_NUMBER
+                AND ISNULL(W.CLR,'') = ISNULL(A.CLR,'')
+        """)
+    except Exception as e:
+        logger.warning(f"[D] ALLOC_SEQ propagate to alloc_table failed: {e}")
     _run(conn, f"""
         UPDATE [{working_table}] SET ALLOC_STATUS = 'INELIGIBLE'
         WHERE LISTED_FLAG = 0
@@ -1446,7 +2100,9 @@ def _stage_d_reflect(conn, working_table, alloc_table):
     _run(conn, f"""
         UPDATE [{working_table}] SET ALLOC_STATUS = 'NOT_ALLOCATED',
                ALLOC_REMARKS = ISNULL(ALLOC_REMARKS,'') + ' no pool'
-        WHERE LISTED_FLAG = 1 AND (ALLOC_QTY IS NULL OR ALLOC_QTY = 0)
+        WHERE LISTED_FLAG = 1
+          AND (ALLOC_QTY  IS NULL OR ALLOC_QTY  = 0)
+          AND (HOLD_QTY   IS NULL OR HOLD_QTY   = 0)
     """)
 
 

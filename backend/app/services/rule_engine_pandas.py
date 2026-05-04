@@ -36,6 +36,7 @@ from app.services import rule_engine_new as rne
 from app.services.alloc_queue import (
     claim_next,
     get_done_summary,
+    get_failed_list,
     get_progress,
     make_batch_id,
     mark_done,
@@ -43,7 +44,7 @@ from app.services.alloc_queue import (
     mark_in_progress,
     seed_queue,
 )
-from app.utils.db_helpers import run_sql, retry_on_deadlock
+from app.utils.db_helpers import run_sql, retry_on_deadlock, DeadlockStats
 
 
 # Default 4 (was 8). Pandas operations are CPU-bound and hold Python's GIL,
@@ -83,10 +84,17 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     DataFrames are picklable; the slices we pass are typically a few MB.
     """
     (mc, a_slice, w_slice, grids, batch_id, alloc_table, working_table,
-     pri_ct_check_rl, pri_ct_check_tbc) = args
+     pri_ct_check_rl, pri_ct_check_tbc,
+     rl_mbq_cap_pct, tbc_mbq_cap_pct,
+     size_threshold, min_size_count) = args
 
     t_mc = time.time()
     worker_id = os.getpid()  # surfaced in QUEUE_TABLE.WORKER_ID for diagnostics
+
+    # Reset per-MAJ_CAT deadlock counters so the snapshot we return at the
+    # end of this function describes only this cat's retries (parent sums
+    # them across all cats for the run-level summary log line).
+    DeadlockStats.reset()
 
     # Stamp the row IN_PROGRESS so /listing/alloc-progress reflects active
     # workers in real time. Best-effort — if this fails the run still works,
@@ -98,6 +106,7 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    _write_back_done = False  # declared outside try so except can always read it
     try:
         # Empty slice — mark done and bail.
         if a_slice is None or a_slice.empty:
@@ -113,10 +122,40 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
         a_in = a_slice.copy()
         w_in = w_slice.copy() if w_slice is not None else pd.DataFrame()
 
+        # Load hold tracking for RL/TBC consume-from-hold logic.
+        # Key: (WERKS, VAR_ART, SZ) — matches ARS_NL_TBL_HOLD_TRACKING PK.
+        # RL/TBC rows draw from this warehouse hold before touching the RDC pool.
+        hold_dict: Dict = {}
+        var_arts = set(a_in['VAR_ART'].dropna().astype(str).tolist())
+        if var_arts:
+            try:
+                _heng = get_data_engine()
+                with _heng.connect() as _hc:
+                    _hrows = _hc.execute(text(
+                        "SELECT WERKS, VAR_ART, SZ, ISNULL(HOLD_REM, 0.0) AS hold_rem "
+                        "FROM ARS_NL_TBL_HOLD_TRACKING "
+                        "WHERE IS_CLOSED = 0 AND ISNULL(HOLD_REM, 0.0) > 0"
+                    )).fetchall()
+                    hold_dict = {
+                        (str(r[0]), str(r[1]), str(r[2])): float(r[3])
+                        for r in _hrows
+                        if str(r[1]) in var_arts
+                    }
+            except Exception as _he:
+                logger.warning(
+                    f"[pandas] {mc}: hold_tracking load failed ({_he}) — "
+                    f"hold tracking disabled for this MAJ_CAT"
+                )
+
         a_out, w_out = _run_majcat_waterfall(
             a_in, w_in, grids,
             pri_ct_check_rl=pri_ct_check_rl,
             pri_ct_check_tbc=pri_ct_check_tbc,
+            rl_mbq_cap_pct=rl_mbq_cap_pct,
+            tbc_mbq_cap_pct=tbc_mbq_cap_pct,
+            hold_dict=hold_dict if hold_dict else None,
+            size_threshold=size_threshold,
+            min_size_count=min_size_count,
         )
         ship_mc = float(a_out['SHIP_QTY'].fillna(0).sum())
         hold_mc = float(a_out['HOLD_QTY'].fillna(0).sum())
@@ -140,24 +179,52 @@ def _pandas_run_one_majcat(args: Tuple[Any, ...]) -> Dict[str, Any]:
                 label=f"write_back_working[{mc}]",
             )
         wb_secs = time.time() - t_wb
+        _write_back_done = True  # both write-backs committed to DB
 
         dur = time.time() - t_mc
-        with eng.connect() as upd:
-            mark_done(upd, batch_id, mc, ship_mc, hold_mc, rows_mc, dur)
+        # mark_done in its own try/except: data is already in DB, so a
+        # deadlock here must NOT flip the row to FAILED. Retry once on a
+        # fresh connection; if that also fails, leave the row IN_PROGRESS
+        # rather than trigger a misleading FAILED status.
+        try:
+            with eng.connect() as upd:
+                mark_done(upd, batch_id, mc, ship_mc, hold_mc, rows_mc, dur)
+        except Exception as md_err:
+            try:
+                time.sleep(0.3)
+                with get_data_engine().connect() as c2:
+                    mark_done(c2, batch_id, mc, ship_mc, hold_mc, rows_mc, dur)
+                logger.warning(f"[pandas] {mc}: mark_done retry succeeded ({md_err})")
+            except Exception as md_err2:
+                logger.warning(
+                    f"[pandas] {mc}: mark_done failed twice ({md_err2}) "
+                    f"but write-backs committed — row stays IN_PROGRESS (data saved)"
+                )
 
         return {"mc": mc, "ship": ship_mc, "hold": hold_mc, "rows": rows_mc,
-                "dur": dur, "wb_secs": wb_secs}
+                "dur": dur, "wb_secs": wb_secs,
+                "deadlocks": DeadlockStats.snapshot()}
 
     except Exception as e:
         err = str(e)[:2000]
         dur = time.time() - t_mc
-        try:
-            eng = get_data_engine()
-            with eng.connect() as upd:
-                mark_failed(upd, batch_id, mc, err, dur)
-        except Exception:
-            pass
-        return {"mc": mc, "error": err, "dur": dur}
+        if not _write_back_done:
+            # True failure — waterfall or write-back exhausted retries.
+            try:
+                eng = get_data_engine()
+                with eng.connect() as upd:
+                    mark_failed(upd, batch_id, mc, err, dur)
+            except Exception:
+                pass
+        else:
+            # Shouldn't be reachable (write-back success path only raises
+            # inside the inner mark_done try/except), but guard anyway.
+            logger.warning(
+                f"[pandas] {mc}: post-write-back exception ({err}); "
+                f"NOT marking FAILED — data already committed"
+            )
+        return {"mc": mc, "error": err, "dur": dur,
+                "deadlocks": DeadlockStats.snapshot()}
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +245,8 @@ def run_listing_and_allocation_pandas(
     tbl_trivial_factor: float = 0.5,
     pri_ct_check_rl:  bool = True,
     pri_ct_check_tbc: bool = True,
+    rl_mbq_cap_pct:  float = 0.0,
+    tbc_mbq_cap_pct: float = 0.0,
 ) -> Dict:
     """
     Drop-in replacement for rule_engine_new.run_listing_and_allocation,
@@ -227,7 +296,9 @@ def run_listing_and_allocation_pandas(
                 return result
 
             base_rows = rne._stage_b_explode(
-                conn, listed_table, alloc_table, msa_var_table
+                conn, listed_table, alloc_table, msa_var_table,
+                pri_ct_check_rl=pri_ct_check_rl,
+                pri_ct_check_tbc=pri_ct_check_tbc,
             )
             logger.info(f"[B] alloc rows = {base_rows}")
             if base_rows == 0:
@@ -281,6 +352,12 @@ def run_listing_and_allocation_pandas(
     # MAJ_CAT slice back the moment the waterfall finishes, so the dashboard
     # ticks up live as MAJ_CATs complete.
     wb_total_secs = 0.0
+    # Aggregate deadlock-retry telemetry across every worker; logged at the
+    # end of Stage C so the operator sees one summary line instead of having
+    # to grep the per-worker [deadlock-retry] warnings.
+    dl_caught = 0
+    dl_succeeded = 0
+    dl_exhausted = 0
 
     pool_args = [
         (
@@ -293,6 +370,10 @@ def run_listing_and_allocation_pandas(
             working_table,
             bool(pri_ct_check_rl),
             bool(pri_ct_check_tbc),
+            float(rl_mbq_cap_pct),
+            float(tbc_mbq_cap_pct),
+            float(size_threshold),
+            int(min_size_count),
         )
         for mc in alloc_groups
     ]
@@ -318,6 +399,14 @@ def run_listing_and_allocation_pandas(
                     logger.error(f"[C-pd-pool] MAJ_CAT={mc} subprocess raised: {err}")
                     result["errors"].append({"maj_cat": mc, "error": err})
                     continue
+
+                # Aggregate this worker's deadlock counters for the
+                # end-of-Stage-C summary log line. Done unconditionally —
+                # even FAILED workers may have caught (and exhausted) retries.
+                dl = r.get("deadlocks") or {}
+                dl_caught    += int(dl.get("caught", 0))
+                dl_succeeded += int(dl.get("succeeded", 0))
+                dl_exhausted += int(dl.get("exhausted", 0))
 
                 if r.get("error"):
                     result["errors"].append({"maj_cat": mc, "error": r["error"]})
@@ -349,6 +438,10 @@ def run_listing_and_allocation_pandas(
         for args in pool_args:
             mc = args[0]
             r = _pandas_run_one_majcat(args)
+            dl = r.get("deadlocks") or {}
+            dl_caught    += int(dl.get("caught", 0))
+            dl_succeeded += int(dl.get("succeeded", 0))
+            dl_exhausted += int(dl.get("exhausted", 0))
             if r.get("error"):
                 result["errors"].append({"maj_cat": mc, "error": r["error"]})
             else:
@@ -358,26 +451,114 @@ def run_listing_and_allocation_pandas(
         f"[C-pd] live write-back done — total wb time across workers "
         f"{wb_total_secs:.1f}s"
     )
+    # One-line summary so the operator can tell at a glance whether the
+    # retry path absorbed deadlocks silently or whether real failures slipped
+    # through. `caught - succeeded - exhausted` should be 0 (every caught
+    # event ends one way or the other).
+    logger.info(
+        f"[C-pd] deadlock retries: caught={dl_caught} "
+        f"succeeded={dl_succeeded} exhausted={dl_exhausted}"
+    )
+    result["deadlock_retries"] = {
+        "caught":    dl_caught,
+        "succeeded": dl_succeeded,
+        "exhausted": dl_exhausted,
+    }
+
+    # Retry/failure detail log — operators can see per-MAJ_CAT attempt counts.
+    try:
+        with engine.connect() as conn:
+            q_prog = get_progress(conn, batch_id)
+            failed_list = get_failed_list(conn, batch_id)
+        logger.info(
+            f"[C-pd] batch={batch_id} COMPLETE — "
+            f"total={q_prog['total']} done={q_prog['done']} "
+            f"in_progress={q_prog['in_progress']} failed={q_prog['failed']} "
+            f"pct={q_prog['pct']}%"
+        )
+        if failed_list:
+            total_attempts = sum(f['attempts'] for f in failed_list)
+            logger.warning(
+                f"[C-pd] {len(failed_list)} MAJ_CAT(s) still FAILED "
+                f"after {total_attempts} total attempt(s):"
+            )
+            for f in failed_list:
+                logger.warning(
+                    f"  FAILED maj_cat={f['maj_cat']} attempts={f['attempts']} "
+                    f"error={str(f['error'])[:200]}"
+                )
+        else:
+            logger.info(f"[C-pd] All MAJ_CATs completed successfully (0 failures)")
+    except Exception as log_err:
+        logger.warning(f"[C-pd] post-run progress log failed: {log_err}")
 
     # ── Finalise + Stage D (SQL) ──
     with engine.connect() as conn:
+        # MJ_REQ cap: prevent SUM(SHIP_QTY across all OPTs) > MJ_REQ per store
+        rne._stage_c_apply_mj_req_cap(conn, alloc_table, working_table)
+        # Safety-net: skipped rows must never carry warehouse hold.
+        run_sql(conn, f"""
+            UPDATE [{alloc_table}] SET HOLD_QTY = 0, ROUND_HOLD = 0
+            WHERE ISNULL(HOLD_QTY, 0) > 0
+              AND ALLOC_STATUS = 'SKIPPED'
+        """)
+        # Rows with SHIP=0 AND HOLD=0 consumed pool during the waterfall but were
+        # cancelled afterwards (MJ_REQ_CAP or other post-waterfall zeroing).
+        # Reset POOL_CONSUMED so the pool is not wrongly held against FNL_Q_REM.
+        run_sql(conn, f"""
+            UPDATE [{alloc_table}] SET POOL_CONSUMED = 0
+            WHERE ISNULL(SHIP_QTY,     0) = 0
+              AND ISNULL(HOLD_QTY,     0) = 0
+              AND ISNULL(POOL_CONSUMED, 0) > 0
+        """)
+        # Recompute FNL_Q_REM per pool key: FNL_Q minus only real (non-zero) consumption.
+        run_sql(conn, f"""
+            UPDATE A SET A.FNL_Q_REM = ISNULL(A.FNL_Q, 0) - ISNULL(B.consumed, 0)
+            FROM [{alloc_table}] A
+            LEFT JOIN (
+                SELECT [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
+                       ISNULL([CLR],'') AS CLR, [VAR_ART], [SZ],
+                       SUM(ISNULL([POOL_CONSUMED], 0)) AS consumed
+                FROM   [{alloc_table}]
+                GROUP  BY [RDC], [MAJ_CAT], [GEN_ART_NUMBER],
+                          ISNULL([CLR],''), [VAR_ART], [SZ]
+            ) B ON  A.[RDC]            = B.[RDC]
+                AND A.[MAJ_CAT]        = B.[MAJ_CAT]
+                AND A.[GEN_ART_NUMBER] = B.[GEN_ART_NUMBER]
+                AND ISNULL(A.[CLR],'') = B.[CLR]
+                AND A.[VAR_ART]        = B.[VAR_ART]
+                AND A.[SZ]             = B.[SZ]
+        """)
         run_sql(conn, f"UPDATE [{alloc_table}] SET ALLOC_QTY = SHIP_QTY")
         run_sql(conn, f"""
             UPDATE [{alloc_table}] SET
                 ALLOC_STATUS = CASE
                     WHEN SHIP_QTY + HOLD_QTY > 0
-                         AND SHIP_QTY + HOLD_QTY
-                             >= CASE WHEN ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
-                                          - ISNULL(SZ_STK,0) > 0
-                                     THEN ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
-                                          - ISNULL(SZ_STK,0)
-                                     ELSE 0 END
+                         AND SHIP_QTY + HOLD_QTY >= CASE
+                             -- TBL: hold buffer counted once (applies to all TBL)
+                             WHEN OPT_TYPE='TBL'
+                             THEN CASE WHEN ISNULL(SZ_MBQ_WH,0)
+                                            + (ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                                            - ISNULL(SZ_STK,0) > 0
+                                       THEN ISNULL(SZ_MBQ_WH,0)
+                                            + (ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                                            - ISNULL(SZ_STK,0)
+                                       ELSE 0 END
+                             -- RL/TBC: I_ROD * SZ_MBQ (no hold buffer)
+                             ELSE CASE WHEN ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0)
+                                            - ISNULL(SZ_STK,0) > 0
+                                       THEN ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0)
+                                            - ISNULL(SZ_STK,0)
+                                       ELSE 0 END
+                             END
                          THEN 'ALLOCATED'
-                    WHEN SHIP_QTY > 0                 THEN 'PARTIAL'
+                    WHEN SHIP_QTY + HOLD_QTY > 0      THEN 'PARTIAL'
                     ELSE 'SKIPPED' END,
                 SKIP_REASON = CASE
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0
-                         AND ISNULL(SZ_MBQ_WH,0) * ISNULL(I_ROD,1)
+                         AND CASE WHEN OPT_TYPE='TBL'
+                                  THEN ISNULL(SZ_MBQ_WH,0)+(ISNULL(I_ROD,1)-1)*ISNULL(SZ_MBQ,0)
+                                  ELSE ISNULL(I_ROD,1)*ISNULL(SZ_MBQ,0) END
                              - ISNULL(SZ_STK,0) <= 0
                          THEN 'ALREADY_STOCKED'
                     WHEN SHIP_QTY = 0 AND HOLD_QTY = 0 THEN 'NO_POOL_OR_DEMAND'
@@ -460,19 +641,36 @@ def _load_tables(engine, alloc_table, working_table, grids, only_majcats):
     for c in num_cols:
         if c in alloc_df.columns:
             alloc_df[c] = pd.to_numeric(alloc_df[c], errors='coerce').fillna(0).astype('float64')
-    for c in ['POOL_CONSUMED', 'SHIP_QTY', 'HOLD_QTY', 'ROUND_SHIP', 'ROUND_HOLD']:
+    for c in ['POOL_CONSUMED', 'SHIP_QTY', 'HOLD_QTY', 'ROUND_SHIP', 'ROUND_HOLD',
+              'ALLOC_QTY', 'FROM_HOLD_QTY']:
         if c not in alloc_df.columns:
             alloc_df[c] = 0.0
+
+    # Always reset to PENDING so _run_band processes every row from scratch.
+    # The finalise step from a previous run may have written SKIPPED/ALLOCATED
+    # back to the DB; carrying those stale statuses causes zero allocation.
+    # INELIGIBLE rows are intentionally excluded upstream and must stay excluded.
     if 'ALLOC_STATUS' not in alloc_df.columns:
         alloc_df['ALLOC_STATUS'] = 'PENDING'
     else:
-        alloc_df['ALLOC_STATUS'] = alloc_df['ALLOC_STATUS'].fillna('PENDING').astype(str)
+        alloc_df['ALLOC_STATUS'] = alloc_df['ALLOC_STATUS'].fillna('').astype(str)
+        _non_inelig = alloc_df['ALLOC_STATUS'] != 'INELIGIBLE'
+        alloc_df.loc[_non_inelig, 'ALLOC_STATUS'] = 'PENDING'
     if 'SKIP_REASON' not in alloc_df.columns:
         alloc_df['SKIP_REASON'] = ''
     else:
         alloc_df['SKIP_REASON'] = alloc_df['SKIP_REASON'].fillna('').astype(str)
+        alloc_df.loc[alloc_df['ALLOC_STATUS'] == 'PENDING', 'SKIP_REASON'] = ''
+    # Zero out accumulators so each run starts clean.
+    _non_inelig = alloc_df['ALLOC_STATUS'] != 'INELIGIBLE'
+    for _c in ['POOL_CONSUMED', 'SHIP_QTY', 'HOLD_QTY', 'ROUND_SHIP', 'ROUND_HOLD',
+               'ALLOC_QTY', 'FROM_HOLD_QTY', 'ALLOC_ROUND']:
+        if _c in alloc_df.columns:
+            alloc_df.loc[_non_inelig, _c] = 0.0
     if 'ALLOC_WAVE' not in alloc_df.columns:
         alloc_df['ALLOC_WAVE'] = ''
+    else:
+        alloc_df.loc[_non_inelig, 'ALLOC_WAVE'] = ''
     if 'OPT_TYPE' in alloc_df.columns:
         alloc_df['OPT_TYPE'] = alloc_df['OPT_TYPE'].fillna('').astype(str)
 
@@ -489,11 +687,28 @@ def _load_tables(engine, alloc_table, working_table, grids, only_majcats):
     if 'PRI_CT_REM' in working_df.columns:
         working_df['PRI_CT_REM'] = pd.to_numeric(
             working_df['PRI_CT_REM'], errors='coerce'
-        ).fillna(0).astype('float64')
+        ).fillna(100.0).astype('float64')  # NULL = uninitialized → assume eligible (100%)
     if 'ACS_D' in working_df.columns:
         working_df['ACS_D'] = pd.to_numeric(
             working_df['ACS_D'], errors='coerce'
         ).fillna(0).astype('float64')
+    for _mj_col in ('MJ_MBQ', 'MJ_STK_TTL', 'MJ_REQ'):
+        if _mj_col in working_df.columns:
+            working_df[_mj_col] = pd.to_numeric(
+                working_df[_mj_col], errors='coerce'
+            ).fillna(0).astype('float64')
+    # MJ_REQ_REM: NULL means never initialized — use MJ_REQ as the baseline
+    # (do NOT fill with 0, that would make store-broken fire for every row)
+    if 'MJ_REQ_REM' in working_df.columns:
+        _mj_rem_null = working_df['MJ_REQ_REM'].isna() | (
+            pd.to_numeric(working_df['MJ_REQ_REM'], errors='coerce').isna()
+        )
+        working_df['MJ_REQ_REM'] = pd.to_numeric(
+            working_df['MJ_REQ_REM'], errors='coerce'
+        ).fillna(0).astype('float64')
+        if _mj_rem_null.any() and 'MJ_REQ' in working_df.columns:
+            _fallback = pd.to_numeric(working_df['MJ_REQ'], errors='coerce').fillna(0)
+            working_df.loc[_mj_rem_null, 'MJ_REQ_REM'] = _fallback[_mj_rem_null].values
     for meta in grids.values():
         for col in (meta['req_rem'], meta['h_rem'], meta['gh_col']):
             if col in working_df.columns:
@@ -535,6 +750,8 @@ def _select_working_cols(conn, working_table, grids) -> List[str]:
         'OPT_TYPE', 'OPT_PRIORITY_RANK', 'LISTED_FLAG',
         'ALLOC_STATUS', 'ALLOC_REMARKS', 'ACS_D',
         'MSA_FNL_Q_REM', 'PRI_CT_REM',
+        # MAJ_CAT-level store aggregates — used by the MBQ cap in _run_band
+        'MJ_MBQ', 'MJ_STK_TTL', 'MJ_REQ', 'MJ_REQ_REM',
     ]
     existing = {c.upper() for c in rne._cols(conn, working_table)}
     cols = [c for c in base if c.upper() in existing]
@@ -551,17 +768,69 @@ def _select_working_cols(conn, working_table, grids) -> List[str]:
 # ---------------------------------------------------------------------------
 # Per-MAJ_CAT waterfall (pandas)
 # ---------------------------------------------------------------------------
+def _build_mbq_budget(working_df: pd.DataFrame, cap_pct: float) -> Dict[str, float]:
+    """Per-WERKS allocation budget: max(0, cap_pct/100 * MJ_MBQ - MJ_STK_TTL).
+    MJ_REQ = MJ_MBQ * factor then stock (including excess) is deducted.
+    Returns empty dict (disables cap) when the required columns are absent."""
+    if 'MJ_MBQ' not in working_df.columns or 'MJ_STK_TTL' not in working_df.columns:
+        return {}
+    store_data = (
+        working_df[['WERKS', 'MJ_MBQ', 'MJ_STK_TTL']]
+        .drop_duplicates(subset=['WERKS'])
+    )
+    budget: Dict[str, float] = {}
+    factor = cap_pct / 100.0
+    for _, row in store_data.iterrows():
+        cap = float(row['MJ_MBQ'] or 0) * factor - float(row['MJ_STK_TTL'] or 0)
+        budget[str(row['WERKS'])] = max(0.0, cap)
+    return budget
+
+
+def _snapshot_fnl_q_rem(
+    alloc_df: pd.DataFrame,
+    pool_dict: Dict[Tuple, float],
+    mask: Optional[pd.Series] = None,
+) -> None:
+    """Write current pool_dict values into alloc_df['FNL_Q_REM'].
+    Called before each band so the column captures the pool state
+    *before* that band's allocation runs — useful for debugging skips."""
+    if 'FNL_Q_REM' not in alloc_df.columns:
+        return
+    if mask is not None:
+        idx = alloc_df.index[mask]
+        keys = pd.Series(
+            list(zip(*[alloc_df.loc[idx, c].to_numpy() for c in POOL_KEYS])),
+            index=idx,
+        )
+        alloc_df.loc[idx, 'FNL_Q_REM'] = (
+            keys.map(pool_dict).fillna(0).astype('float64')
+        )
+    else:
+        keys = pd.Series(
+            list(zip(*[alloc_df[c].to_numpy() for c in POOL_KEYS])),
+            index=alloc_df.index,
+        )
+        alloc_df['FNL_Q_REM'] = keys.map(pool_dict).fillna(0).astype('float64')
+
+
 def _run_majcat_waterfall(
     alloc_df: pd.DataFrame,
     working_df: pd.DataFrame,
     grids: Dict[str, Dict],
     pri_ct_check_rl: bool = True,
     pri_ct_check_tbc: bool = True,
+    rl_mbq_cap_pct: float = 0.0,
+    tbc_mbq_cap_pct: float = 0.0,
+    hold_dict: Optional[Dict[Tuple, float]] = None,
+    size_threshold: float = 0.6,
+    min_size_count: int = 3,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run RL → TBC → TBL waterfall in pandas for one MAJ_CAT slice.
     `alloc_df` and `working_df` are pre-sliced to one MAJ_CAT and copies —
     safe to mutate in place. Returns the same frames after mutation.
+    hold_dict: (WERKS, VAR_ART) -> HOLD_REM from ARS_NL_TBL_HOLD_TRACKING.
+    Mutated in place as hold is consumed (safe — each MAJ_CAT has its own copy).
     """
     # Build the per-MAJ_CAT pool dict: max(FNL_Q) per pool key.
     if alloc_df.empty:
@@ -577,14 +846,50 @@ def _run_majcat_waterfall(
     has_working = (working_df is not None) and (not working_df.empty)
     revalidate_enabled = bool(rne.ENABLE_PER_OPT_REVALIDATION) and has_working
 
-    # Pre-extract numpy views for hot fields once per MAJ_CAT.
-    for ot in OPT_TYPE_ORDER:
+    # Build per-WERKS MBQ budget dicts for capped OPT_TYPEs.
+    # Cap is only active when the corresponding PRI gate is OFF (unchecked).
+    # Budget = max(0, cap_pct/100 × MJ_MBQ − MJ_STK_TTL) per WERKS.
+    _rl_budget: Dict[str, float] = (
+        _build_mbq_budget(working_df, rl_mbq_cap_pct)
+        if (not pri_ct_check_rl) and rl_mbq_cap_pct > 0 and has_working
+        else {}
+    )
+    _tbc_budget: Dict[str, float] = (
+        _build_mbq_budget(working_df, tbc_mbq_cap_pct)
+        if (not pri_ct_check_tbc) and tbc_mbq_cap_pct > 0 and has_working
+        else {}
+    )
+
+    # Initial snapshot: all rows get the pre-waterfall pool value so that
+    # SKIPPED rows (which never enter elig_mask) always show a meaningful
+    # FNL_Q_REM rather than NULL.
+    _snapshot_fnl_q_rem(alloc_df, pool_dict)
+
+    for i, ot in enumerate(OPT_TYPE_ORDER):
         ot_mask = (alloc_df['OPT_TYPE'] == ot)
         if not ot_mask.any():
             continue
         max_round = int(alloc_df.loc[ot_mask, 'I_ROD'].max() or 0)
         if max_round == 0:
             continue
+
+        mbq_budget = _rl_budget if ot == 'RL' else (_tbc_budget if ot == 'TBC' else {})
+
+        # Skip low-coverage OPTs and re-rank survivors using live SIZE_RATIO.
+        # Only for TBC and TBL — RL uses the initial rank set at the start.
+        if i > 0:
+            _rerank_opt_priority_pandas(
+                alloc_df, pool_dict, ot,
+                size_threshold=size_threshold,
+                min_size_count=min_size_count,
+            )
+
+        # Pre-band: actively evaluate PRI_CT_REM and MJ_REQ_REM from current
+        # working_df values, mark failing OPTs SKIPPED, then propagate to
+        # alloc_df — before the first round of this OPT_TYPE runs.
+        if revalidate_enabled and has_working:
+            _pre_band_check(alloc_df, working_df, ot,
+                            pri_ct_check_rl, pri_ct_check_tbc)
 
         for r in range(1, max_round + 1):
             # Reset round deltas across the whole opt_type once per round.
@@ -594,25 +899,157 @@ def _run_majcat_waterfall(
             elig_mask = ot_mask & (alloc_df['I_ROD'] >= r)
             if not elig_mask.any():
                 continue
-            ranks = (
-                alloc_df.loc[elig_mask, 'OPT_PRIORITY_RANK']
-                .dropna().astype(int).unique()
-            )
-            ranks.sort()
-            if ranks.size == 0:
-                continue
 
-            for rank in ranks:
-                _run_band(alloc_df, pool_dict, ot, int(r), int(rank))
-                if revalidate_enabled:
-                    _revalidate_after_band(
-                        alloc_df, working_df, grids,
-                        ot, int(rank),
-                        pri_ct_check_rl=pri_ct_check_rl,
-                        pri_ct_check_tbc=pri_ct_check_tbc,
-                    )
+            # Snapshot FNL_Q_REM *before* this band runs so the column reflects
+            # the pool state at the moment each row's allocation is attempted.
+            # This lets users see exactly what pool was available and why skips
+            # fired, rather than the post-waterfall depleted value.
+            _snapshot_fnl_q_rem(alloc_df, pool_dict, mask=elig_mask)
+
+            # All stores compete in one vectorised band call.  Priority order
+            # is enforced by the sort inside _run_band:
+            #   POOL_KEYS → OPT_PRIORITY_RANK ASC → ST_RANK ASC → WERKS
+            # Within each pool key, the highest-priority OPT takes pool first;
+            # ties in OPT_PRIORITY_RANK are broken by ST_RANK (best store wins).
+            # Round N finishes for ALL stores before round N+1 starts.
+            # Cross-type eligibility (R06: MJ_REQ_REM < 0.5×ACS_D) is evaluated
+            # by _pre_band_check before the first round of each OPT_TYPE.
+            _run_band(alloc_df, pool_dict, ot, int(r),
+                      mbq_budget=mbq_budget,
+                      hold_dict=hold_dict,
+                      size_threshold=size_threshold,
+                      min_size_count=min_size_count)
+
+            if revalidate_enabled:
+                _revalidate_after_band(
+                    alloc_df, working_df, grids, ot, int(r),
+                    pri_ct_check_rl=pri_ct_check_rl,
+                    pri_ct_check_tbc=pri_ct_check_tbc,
+                )
+
+            logger.info(
+                f"[C-pd] {ot} round={r}/{max_round} — "
+                f"ship={int(alloc_df.loc[ot_mask,'SHIP_QTY'].sum())} "
+                f"hold={int(alloc_df.loc[ot_mask,'HOLD_QTY'].sum())}"
+            )
 
     return alloc_df, working_df
+
+
+def _rerank_opt_priority_pandas(
+    alloc_df: pd.DataFrame,
+    pool_dict: Dict[Tuple, float],
+    target_ot: str,
+    size_threshold: float = 0.6,
+    min_size_count: int = 3,
+) -> None:
+    """Skip low-coverage OPTs then re-rank survivors using live SIZE_RATIO.
+
+    Step 1 — SKIP: for each (WERKS, GEN_ART_NUMBER, CLR) in target_ot,
+    compute live SIZE_RATIO from pool_dict.  If SIZE_RATIO < size_threshold
+    AND live_VAR_FNL_COUNT < min_size_count → mark all their rows SKIPPED
+    with SKIP_REASON 'R07_SIZE_RATIO_LIVE'.
+
+    Step 2 — RERANK: surviving (ALLOC_STATUS is NaN) rows get fresh
+    OPT_PRIORITY_RANK.  ORDER BY same as _stage_a_assign_rank but using
+    live SIZE_RATIO:  TIER ASC → SIZE_RATIO DESC → SEC_CT% DESC
+                      → MAX_DAILY_SALE DESC → OPT_REQ_WH DESC
+
+    Mutates alloc_df in-place for target_ot rows only.
+    """
+    mask = (alloc_df['OPT_TYPE'] == target_ot) & alloc_df['ALLOC_STATUS'].isna()
+    if not mask.any():
+        return
+
+    sub = alloc_df.loc[mask].copy()
+
+    # Build live pool availability per size row.
+    pool_keys_arr = list(zip(
+        sub['RDC'].astype(str),
+        sub['MAJ_CAT'].astype(str),
+        sub['GEN_ART_NUMBER'].astype(str),
+        sub['CLR'].astype(str),
+        sub['VAR_ART'].astype(str),
+        sub['SZ'].astype(str),
+    ))
+    sub['_has_pool'] = pd.array(
+        [1 if pool_dict.get(k, 0.0) > 0.0 else 0 for k in pool_keys_arr],
+        dtype='int8',
+    )
+
+    # Aggregate to (GEN_ART_NUMBER, CLR, VAR_ART) to get live SIZE_RATIO.
+    grp = sub.groupby(['GEN_ART_NUMBER', 'CLR', 'VAR_ART'], sort=False).agg(
+        _var_count=('SZ', 'count'),
+        _var_fnl=('_has_pool', 'sum'),
+    ).reset_index()
+    grp['SIZE_RATIO'] = np.where(
+        grp['_var_count'] > 0,
+        grp['_var_fnl'].astype(float) / grp['_var_count'],
+        0.0,
+    )
+
+    sub = sub.merge(
+        grp[['GEN_ART_NUMBER', 'CLR', 'VAR_ART', 'SIZE_RATIO', '_var_fnl']],
+        on=['GEN_ART_NUMBER', 'CLR', 'VAR_ART'],
+        how='left',
+    )
+    sub['SIZE_RATIO'] = sub['SIZE_RATIO'].fillna(0.0)
+    sub['_var_fnl']   = sub['_var_fnl'].fillna(0)
+
+    # ------------------------------------------------------------------ #
+    # Step 1: mark low-coverage OPTs as SKIPPED in the original alloc_df. #
+    # ------------------------------------------------------------------ #
+    low_cov = (sub['SIZE_RATIO'] < size_threshold) & (sub['_var_fnl'] < min_size_count)
+    if low_cov.any():
+        skip_idx = sub.index[low_cov]
+        alloc_df.loc[skip_idx, 'ALLOC_STATUS'] = 'SKIPPED'
+        alloc_df.loc[skip_idx, 'ALLOC_REMARKS'] = (
+            alloc_df.loc[skip_idx, 'ALLOC_REMARKS'].fillna('') + ' R07_SIZE_RATIO_LIVE;'
+        )
+        logger.debug(
+            f"[C-pd] {target_ot}: skipped {low_cov.sum()} rows "
+            f"with live SIZE_RATIO < {size_threshold} and fnl_count < {min_size_count}"
+        )
+        # Refresh mask — survivors only.
+        mask = (alloc_df['OPT_TYPE'] == target_ot) & alloc_df['ALLOC_STATUS'].isna()
+        if not mask.any():
+            return
+        sub = sub.loc[~low_cov].copy()
+
+    # ------------------------------------------------------------------ #
+    # Step 2: re-rank survivors.                                          #
+    # ------------------------------------------------------------------ #
+    for col in ['OPT_PRIORITY_TIER', 'SEC_CT%', 'MAX_DAILY_SALE', 'OPT_REQ_WH']:
+        if col in sub.columns:
+            sub[col] = pd.to_numeric(sub[col], errors='coerce').fillna(0.0)
+
+    opt_cols = ['WERKS', 'GEN_ART_NUMBER', 'CLR', 'OPT_PRIORITY_TIER',
+                'SIZE_RATIO', 'SEC_CT%', 'MAX_DAILY_SALE', 'OPT_REQ_WH']
+    opt_level = sub[opt_cols].drop_duplicates(
+        subset=['WERKS', 'GEN_ART_NUMBER', 'CLR']
+    ).copy()
+
+    opt_level = opt_level.sort_values(
+        by=['WERKS', 'OPT_PRIORITY_TIER', 'SIZE_RATIO', 'SEC_CT%', 'MAX_DAILY_SALE', 'OPT_REQ_WH'],
+        ascending=[True, True, False, False, False, False],
+        kind='mergesort',
+    )
+    opt_level['_new_rank'] = opt_level.groupby('WERKS', sort=False).cumcount() + 1
+
+    rank_map = dict(zip(
+        zip(opt_level['WERKS'], opt_level['GEN_ART_NUMBER'], opt_level['CLR']),
+        opt_level['_new_rank'],
+    ))
+
+    new_ranks = alloc_df.loc[mask, ['WERKS', 'GEN_ART_NUMBER', 'CLR']].apply(
+        lambda row: rank_map.get((row['WERKS'], row['GEN_ART_NUMBER'], row['CLR'])),
+        axis=1,
+    )
+    alloc_df.loc[mask, 'OPT_PRIORITY_RANK'] = new_ranks
+    logger.debug(
+        f"[C-pd] {target_ot}: live SIZE_RATIO skip+rerank done "
+        f"(thr={size_threshold}, min_sz={min_size_count})"
+    )
 
 
 def _run_band(
@@ -620,14 +1057,27 @@ def _run_band(
     pool_dict: Dict[Tuple, float],
     ot: str,
     r: int,
-    rank: int,
+    mbq_budget: Optional[Dict[str, float]] = None,
+    hold_dict: Optional[Dict[Tuple, float]] = None,
+    size_threshold: float = 0.6,
+    min_size_count: int = 3,
 ) -> None:
-    """One rank-band × one round × one opt_type — pandas equivalent of
-    rule_engine_new._stage_c_run_band."""
+    """One round × one opt_type — all stores compete simultaneously.
+
+    Sort order inside each pool key: OPT_PRIORITY_RANK ASC → ST_RANK ASC → WERKS.
+    The cumulative-window pool-take drains the pool in this order, so:
+      - OPT_PRIORITY_RANK=1 OPT wins over rank=2 within the same pool key
+      - Ties in OPT_PRIORITY_RANK are broken by ST_RANK (best store first)
+    Processing sequence: RL (all rounds) → TBC (all rounds) → TBL (all rounds).
+    Cross-type store eligibility checked via _pre_band_check before each type.
+
+    mbq_budget: per-WERKS cap (active when PRI gate is OFF and cap_pct > 0).
+    hold_dict: keyed by (WERKS, VAR_ART, SZ) — matches ARS_NL_TBL_HOLD_TRACKING PK.
+               RL/TBC: draw from hold_rem first; only shortfall pulls from pool.
+               TBL: draws from pool; HOLD_QTY recorded only when fully ALLOCATED."""
     # 1) Eligible rows
     mask = (
         (alloc_df['OPT_TYPE'] == ot)
-        & (alloc_df['OPT_PRIORITY_RANK'] == rank)
         & (alloc_df['I_ROD'] >= r)
         & (~alloc_df['ALLOC_STATUS'].isin(['SKIPPED', 'INELIGIBLE']))
     )
@@ -647,10 +1097,67 @@ def _run_band(
     pool_cons = sub['POOL_CONSUMED'].to_numpy()
     ship_qty  = sub['SHIP_QTY'].to_numpy()
 
-    need_pool = np.maximum(r * sz_mbq_wh - sz_stk - pool_cons, 0.0)
-    need_ship = np.maximum(r * sz_mbq    - sz_stk - ship_qty,  0.0)
+    need_ship = np.maximum(r * sz_mbq - sz_stk - ship_qty, 0.0)
+
+    if ot == 'TBL':
+        # TBL: warehouse hold buffer counted once (SZ_MBQ_WH), then rolling SZ_MBQ.
+        # Suppress pool when no shipping demand to avoid pure-HOLD pool consumption.
+        tbl_cum = sz_mbq_wh + (r - 1) * sz_mbq
+        need_pool = np.maximum(tbl_cum - sz_stk - pool_cons, 0.0)
+        need_pool = np.where(need_ship == 0, 0.0, need_pool)
+    else:
+        # RL/TBC: pool demand = net shipping need (hold draw handled in step 1b).
+        need_pool = np.maximum(r * sz_mbq - sz_stk - pool_cons, 0.0)
+
     sub['need_pool'] = need_pool
     sub['need_ship'] = need_ship
+
+    # 1b) RL/TBC: consume warehouse hold (hold_rem) first; only shortfall from pool.
+    # hold_dict keyed (WERKS, VAR_ART, SZ) — sized grain matching table PK.
+    # TBL does NOT draw from hold here; new TBL hold is created by Part 8.6 Step B.
+    sub['FROM_HOLD_QTY'] = 0.0
+    if ot in ('RL', 'TBC') and hold_dict:
+        hold_keys_3 = list(zip(
+            sub['WERKS'].tolist(), sub['VAR_ART'].tolist(), sub['SZ'].tolist()
+        ))
+        hold_avail = np.array(
+            [hold_dict.get((str(w), str(v), str(s)), 0.0)
+             for w, v, s in hold_keys_3],
+            dtype='float64',
+        )
+        from_hold = np.minimum(sub['need_pool'].to_numpy(), hold_avail)
+        sub['FROM_HOLD_QTY'] = from_hold
+        sub['need_pool'] = np.maximum(sub['need_pool'].to_numpy() - from_hold, 0.0)
+        need_pool = sub['need_pool'].to_numpy()
+
+    # Early write-back for hold draws BEFORE the pool filter.
+    # Rows fully covered by hold have need_pool=0 and won't reach step 7.
+    hold_rows = sub[sub['FROM_HOLD_QTY'] > 0]
+    if not hold_rows.empty:
+        h_idx  = hold_rows.index
+        h_take = hold_rows['FROM_HOLD_QTY'].to_numpy()
+        new_pc_h = alloc_df.loc[h_idx, 'POOL_CONSUMED'].to_numpy() + h_take
+        alloc_df.loc[h_idx, 'POOL_CONSUMED']   = new_pc_h
+        alloc_df.loc[h_idx, 'SHIP_QTY']        = alloc_df.loc[h_idx, 'SHIP_QTY'].to_numpy() + h_take
+        alloc_df.loc[h_idx, 'FROM_HOLD_QTY']   = alloc_df.loc[h_idx, 'FROM_HOLD_QTY'].to_numpy() + h_take
+        alloc_df.loc[h_idx, 'ALLOC_WAVE']       = f"{ot}_R{r}"
+        alloc_df.loc[h_idx, 'ALLOC_ROUND']      = float(r)
+        # Update ALLOC_STATUS for hold-only rows (they may not reach step 7)
+        i_rod_h  = alloc_df.loc[h_idx, 'I_ROD'].to_numpy()
+        smbq_h   = alloc_df.loc[h_idx, 'SZ_MBQ'].to_numpy()
+        sstk_h   = alloc_df.loc[h_idx, 'SZ_STK'].to_numpy()
+        target_h = np.maximum(i_rod_h * smbq_h - sstk_h, 0.0)
+        alloc_df.loc[h_idx, 'ALLOC_STATUS'] = np.where(
+            new_pc_h >= target_h, 'ALLOCATED', 'PARTIAL'
+        )
+        # Decrement hold_dict in-memory so later rounds see reduced hold_rem.
+        for (w, va, sz_val), amt in (
+            hold_rows.groupby(['WERKS', 'VAR_ART', 'SZ'])['FROM_HOLD_QTY'].sum().items()
+        ):
+            if amt > 0:
+                key = (str(w), str(va), str(sz_val))
+                if key in hold_dict:
+                    hold_dict[key] = max(0.0, hold_dict[key] - float(amt))
 
     sub = sub[sub['need_pool'] > 0]
     if sub.empty:
@@ -663,23 +1170,34 @@ def _run_band(
     )
     fnl_q_rem = pool_keys_series.map(pool_dict).fillna(0).astype('float64')
     sub['FNL_Q_REM'] = fnl_q_rem.to_numpy()
+
+    # TBL size-completeness gate — mirrors R07_VAR_RATIO_TBL from Stage A but
+    # applied to the LIVE pool so that stores which arrive late (after other
+    # stores have drained most sizes) don't get a partial-size allocation.
+    # Skip an OPT for this store when: (sizes_with_pool < min_size_count)
+    #   AND (sizes_with_pool / total_sizes_needed < size_threshold).
+    # If EITHER condition is false the OPT passes (same "both must be true to
+    # skip" semantics as R07).
+    if ot == 'TBL' and (size_threshold > 0 or min_size_count > 0):
+        _tbl_grp = ['WERKS', 'GEN_ART_NUMBER', 'CLR', 'VAR_ART']
+        sub['_has_pool'] = (sub['FNL_Q_REM'] > 0).astype(float)
+        _total = sub.groupby(_tbl_grp, observed=True, dropna=False)['SZ'].transform('count').astype(float)
+        _avail = sub.groupby(_tbl_grp, observed=True, dropna=False)['_has_pool'].transform('sum').astype(float)
+        _ratio = _avail / _total.where(_total > 0, other=np.inf)
+        _too_few = (_avail < min_size_count) & (_ratio < size_threshold)
+        sub = sub[~_too_few]
+        if sub.empty:
+            return
+
     sub = sub[sub['FNL_Q_REM'] > 0]
     if sub.empty:
         return
 
-    # 3) Stable sort within pool key by (OPT_PRIORITY_RANK, ST_RANK, WERKS).
-    #    The SQL equivalent is ROW_NUMBER() OVER (PARTITION BY pool_key
-    #    ORDER BY OPT_PRIORITY_RANK, ST_RANK, WERKS). WERKS is the final
-    #    tiebreaker — without it, two stores with identical OPT_PRIORITY_RANK
-    #    and ST_RANK would race for the pool in whatever order pandas saw
-    #    them, which in turn depends on SQL Server's row order. Adding
-    #    WERKS makes the allocation reproducible run-to-run on the same data.
+    # 3) Stable sort within pool key — OPT priority first, then store rank.
+    # OPT_PRIORITY_RANK=1 OPT takes pool before rank=2 OPT; ties broken by ST_RANK.
     sub['_st_rank_fill'] = sub['ST_RANK'].fillna(999999).astype('float64')
-    sub.sort_values(
-        POOL_KEYS + ['OPT_PRIORITY_RANK', '_st_rank_fill', 'WERKS'],
-        kind='mergesort',
-        inplace=True,
-    )
+    sort_cols = POOL_KEYS + ['OPT_PRIORITY_RANK', '_st_rank_fill', 'WERKS']
+    sub.sort_values(sort_cols, kind='mergesort', inplace=True)
 
     # 4) Cumulative demand within pool key
     sub['cum_demand'] = (
@@ -698,20 +1216,74 @@ def _run_band(
     if sub.empty:
         return
 
-    # 6) SHIP / HOLD split
-    is_new    = (sub['IS_NEW'].to_numpy() == 1)
-    take      = sub['take_pool'].to_numpy()
-    n_ship    = sub['need_ship'].to_numpy()
-    round_ship = np.where(is_new, np.minimum(take, n_ship), take)
-    round_hold = np.where(is_new, np.maximum(take - n_ship, 0.0), 0.0)
+    # 5a) Per-WERKS MBQ cap — only when mbq_budget is provided (PRI gate OFF).
+    # Budget = max(0, cap_pct/100 × MJ_MBQ − MJ_STK_TTL) computed once per
+    # waterfall run. Here we subtract whatever was already shipped for this
+    # OPT_TYPE in previous rounds, then cap within-batch take in priority order.
+    if mbq_budget:
+        ot_shipped = (
+            alloc_df.loc[alloc_df['OPT_TYPE'] == ot, ['WERKS', 'SHIP_QTY']]
+            .groupby('WERKS', sort=False)['SHIP_QTY'].sum()
+        )
+        budg_ser = pd.Series(mbq_budget, dtype='float64')
+        shipped_ser = ot_shipped.reindex(budg_ser.index).fillna(0.0)
+        budget_before = (budg_ser - shipped_ser).clip(lower=0.0)
+
+        sub['_budg_before'] = sub['WERKS'].map(budget_before.to_dict()).fillna(0.0)
+
+        # Sort by (WERKS, OPT_PRIORITY_RANK) so highest-priority rows eat
+        # the per-WERKS budget first.
+        idx_orig = sub.index.copy()
+        sub_s = sub.sort_values(['WERKS', 'OPT_PRIORITY_RANK', *POOL_KEYS], kind='mergesort')
+        sub_s['_cum_w'] = sub_s.groupby('WERKS', sort=False)['take_pool'].cumsum()
+        sub_s['_prev_w'] = sub_s['_cum_w'] - sub_s['take_pool']
+        sub_s['_row_rem'] = np.maximum(
+            sub_s['_budg_before'].to_numpy() - sub_s['_prev_w'].to_numpy(), 0.0
+        )
+        sub_s['take_pool'] = np.minimum(sub_s['take_pool'].to_numpy(), sub_s['_row_rem'].to_numpy())
+
+        sub = sub_s.reindex(idx_orig)
+        sub = sub[sub['take_pool'] > 0]
+        if sub.empty:
+            return
+
+    # 6) SHIP / HOLD split (pool-take only; FROM_HOLD_QTY already written in step 1b)
+    # TBL (IS_NEW=0 and IS_NEW=1): split pool take by need_ship; excess → HOLD.
+    # RL/TBC: pool take 100% ships (hold draw was already shipped in step 1b).
+    take   = sub['take_pool'].to_numpy()
+    n_ship = sub['need_ship'].to_numpy()
+    if ot == 'TBL':
+        round_ship = np.minimum(take, n_ship)
+        round_hold = np.maximum(take - n_ship, 0.0)
+    else:
+        round_ship = take
+        round_hold = np.zeros_like(take)
     sub['ROUND_SHIP_NEW'] = round_ship
     sub['ROUND_HOLD_NEW'] = round_hold
 
-    # 7) Write back to alloc_df by preserved index
+    # 7) Write back pool results to alloc_df by preserved index.
+    # POOL_CONSUMED += pool take (FROM_HOLD_QTY was already added in step 1b).
     idx = sub.index
-    alloc_df.loc[idx, 'POOL_CONSUMED'] = (
-        alloc_df.loc[idx, 'POOL_CONSUMED'].to_numpy() + take
-    )
+
+    # Read per-row size params once for ALLOC_STATUS and TBL hold gate.
+    i_rod   = alloc_df.loc[idx, 'I_ROD'].to_numpy()
+    sstk    = alloc_df.loc[idx, 'SZ_STK'].to_numpy()
+    smbq    = alloc_df.loc[idx, 'SZ_MBQ'].to_numpy()
+    prev_pc = alloc_df.loc[idx, 'POOL_CONSUMED'].to_numpy()
+
+    # ALLOCATED = store ship requirement (I_ROD × SZ_MBQ) is fully met.
+    # Hold is separate: allowed whenever ship demand is covered, even partially.
+    target = np.maximum(i_rod * smbq - sstk, 0.0)   # ship-only, same for all types
+    if ot == 'TBL':
+        # Allow hold only when this round's pool take covers the ship demand.
+        # If pool was too small to fully ship, there is nothing left to hold.
+        is_ship_met = take >= n_ship
+        round_hold  = np.where(is_ship_met, round_hold, 0.0)
+        pool_take   = round_ship + round_hold
+    else:
+        pool_take = take                   # RL/TBC: all pool take ships
+
+    alloc_df.loc[idx, 'POOL_CONSUMED'] = prev_pc + pool_take
     alloc_df.loc[idx, 'ROUND_SHIP'] = round_ship
     alloc_df.loc[idx, 'ROUND_HOLD'] = round_hold
     alloc_df.loc[idx, 'SHIP_QTY']   = (
@@ -723,18 +1295,16 @@ def _run_band(
     alloc_df.loc[idx, 'ALLOC_WAVE']  = f"{ot}_R{r}"
     alloc_df.loc[idx, 'ALLOC_ROUND'] = float(r)
 
-    # ALLOC_STATUS: ALLOCATED iff POOL_CONSUMED ≥ lifetime net target.
-    new_pc = alloc_df.loc[idx, 'POOL_CONSUMED'].to_numpy()
-    i_rod  = alloc_df.loc[idx, 'I_ROD'].to_numpy()
-    smbqwh = alloc_df.loc[idx, 'SZ_MBQ_WH'].to_numpy()
-    sstk   = alloc_df.loc[idx, 'SZ_STK'].to_numpy()
-    target = np.maximum(i_rod * smbqwh - sstk, 0.0)
+    # ALLOC_STATUS: compare cumulative SHIP_QTY (not ship+hold) against ship target.
+    new_ship = alloc_df.loc[idx, 'SHIP_QTY'].to_numpy()
     alloc_df.loc[idx, 'ALLOC_STATUS'] = np.where(
-        new_pc >= target, 'ALLOCATED', 'PARTIAL'
+        new_ship >= target, 'ALLOCATED', 'PARTIAL'
     )
 
-    # 8) Decrement pool by sum(ROUND_SHIP + ROUND_HOLD) per pool key.
-    sub['_taken'] = round_ship + round_hold
+    # 8) Decrement pool by pool_take only (FROM_HOLD_QTY does not consume RDC pool).
+    # TBL PARTIAL rows have their cancelled hold returned to pool automatically
+    # because pool_take = round_ship only (hold was zeroed above).
+    sub['_taken'] = pool_take
     band_take = (
         sub.groupby(POOL_KEYS, sort=False, observed=True)['_taken'].sum()
     )
@@ -742,8 +1312,140 @@ def _run_band(
         if taken <= 0:
             continue
         cur = pool_dict.get(key, 0.0)
-        new = cur - float(taken)
-        pool_dict[key] = new if new > 0 else 0.0
+        pool_dict[key] = max(cur - float(taken), 0.0)
+
+    # FNL_Q_REM refresh is deferred to the end of _run_majcat_waterfall.
+    # _run_band reads pool_dict directly (not alloc_df['FNL_Q_REM']), so
+    # in-flight bands stay correct without a full-table refresh here.
+
+
+def _propagate_skips_to_alloc(
+    alloc_df: pd.DataFrame,
+    working_df: pd.DataFrame,
+) -> None:
+    """Propagate SKIPPED OPTs from working_df (OPT-level) into alloc_df (size-level).
+    Called before each OPT_TYPE's first band so that cross-type store_broken and
+    PRI_CT skips from prior types are visible to _run_band before it starts.
+    SKIP_REASON is set to the ALLOC_REMARKS from working_df so the trigger value
+    (e.g. 'SKIP_PRI_BROKEN(pri=85.0)') is preserved at the size level."""
+    skipped_df = working_df.loc[
+        working_df['ALLOC_STATUS'] == 'SKIPPED',
+        OPT_KEYS + ['ALLOC_REMARKS'],
+    ].drop_duplicates(subset=OPT_KEYS)
+    if skipped_df.empty:
+        return
+    # Build OPT_KEYS tuple → ALLOC_REMARKS mapping for O(1) lookup
+    remarks_map: dict = dict(
+        zip(
+            zip(*[skipped_df[c].to_numpy() for c in OPT_KEYS]),
+            skipped_df['ALLOC_REMARKS'].fillna('').astype(str),
+        )
+    )
+    alloc_keys = list(zip(*[alloc_df[c].to_numpy() for c in OPT_KEYS]))
+    m_in = np.array([k in remarks_map for k in alloc_keys], dtype=bool)
+    prop_mask = (
+        m_in
+        & (~alloc_df['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED', 'PARTIAL'])).to_numpy()
+    )
+    if prop_mask.any():
+        prop_series = pd.Series(prop_mask, index=alloc_df.index)
+        alloc_df.loc[prop_series, 'ALLOC_STATUS'] = 'SKIPPED'
+        no_reason = prop_series & (alloc_df['SKIP_REASON'].fillna('').astype(str) == '')
+        if no_reason.any():
+            reason_vals = pd.Series(alloc_keys, index=alloc_df.index).map(remarks_map)
+            alloc_df.loc[no_reason, 'SKIP_REASON'] = (
+                reason_vals[no_reason].fillna('REVALIDATION_SKIP')
+            )
+
+    # Zero HOLD_QTY for ALL rows in the skip set, including any that were
+    # previously ALLOCATED/PARTIAL.  A store-broken skip (MJ_REQ_REM < 0.5×ACS_D)
+    # means the store has no meaningful remaining need — warehouse hold is wasted.
+    hold_clear = pd.Series(
+        m_in & (alloc_df['HOLD_QTY'].fillna(0).to_numpy() > 0),
+        index=alloc_df.index,
+    )
+    if hold_clear.any():
+        alloc_df.loc[hold_clear, 'HOLD_QTY']    = 0.0
+        alloc_df.loc[hold_clear, 'ROUND_HOLD']  = 0.0
+
+
+def _pre_band_check(
+    alloc_df: pd.DataFrame,
+    working_df: pd.DataFrame,
+    ot: str,
+    pri_ct_check_rl: bool,
+    pri_ct_check_tbc: bool,
+) -> None:
+    """Actively evaluate PRI_CT_REM and MJ_REQ_REM before the first band of
+    each OPT_TYPE and mark failing OPTs SKIPPED in working_df, then propagate
+    those skips into alloc_df.
+
+    Rules (applied in order):
+      1. PRI_CT_REM < 100  → SKIP for enforced types (TBL always; RL/TBC when
+         their primary-count gates are on). "alloc only pri_ct% is 1" means
+         only OPTs where every primary grid still needs stock are eligible.
+      2. MJ_REQ_REM < ACS_SKIP_FACTOR × ACS_D  → SKIP for the current type
+         AND all later types (cross-type store-broken propagation).
+    Finally propagates SKIPPED OPTs from working_df → alloc_df."""
+    if working_df is None or working_df.empty:
+        return
+    work_cols = set(working_df.columns)
+
+    # Types where PRI_CT_REM < 100 is a hard gate.
+    enforced: set = {'TBL'}
+    if pri_ct_check_rl:
+        enforced.add('RL')
+    if pri_ct_check_tbc:
+        enforced.add('TBC')
+
+    ot_idx = OPT_TYPE_ORDER.index(ot) if ot in OPT_TYPE_ORDER else 0
+    remaining_types = OPT_TYPE_ORDER[ot_idx:]
+
+    pending_mask = (
+        (working_df['LISTED_FLAG'].fillna(0) == 1)
+        & (~working_df['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED']))
+    )
+    if not pending_mask.any():
+        return
+
+    # Rule 1 — PRI_CT_REM < 100 for enforced types
+    if 'PRI_CT_REM' in work_cols:
+        pri_dead = (
+            (working_df['PRI_CT_REM'].fillna(0) < 100)
+            & (working_df['OPT_TYPE'].isin(enforced))
+        )
+        m_pri = pending_mask & pri_dead
+        if m_pri.any():
+            working_df.loc[m_pri, 'ALLOC_STATUS'] = 'SKIPPED'
+            pri_vals = working_df.loc[m_pri, 'PRI_CT_REM'].fillna(0)
+            suffix = pri_vals.apply(lambda v: f' SKIP_PRI_BROKEN(pri={v:.1f});')
+            working_df.loc[m_pri, 'ALLOC_REMARKS'] = (
+                working_df.loc[m_pri, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
+            )
+
+    # Rule 2 — store-broken cross-type (MJ_REQ_REM < threshold)
+    if rne.ENABLE_STORE_BROKEN and 'MJ_REQ_REM' in work_cols and 'ACS_D' in work_cols:
+        # Re-derive pending_mask after Rule 1 may have updated ALLOC_STATUS
+        pending_mask2 = (
+            (working_df['LISTED_FLAG'].fillna(0) == 1)
+            & (~working_df['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED']))
+        )
+        sb_mask = (
+            pending_mask2
+            & (working_df['OPT_TYPE'].isin(remaining_types))
+            & (working_df['MJ_REQ_REM'].fillna(0)
+               < rne.ACS_SKIP_FACTOR * working_df['ACS_D'].fillna(0))
+        )
+        if sb_mask.any():
+            working_df.loc[sb_mask, 'ALLOC_STATUS'] = 'SKIPPED'
+            mj_vals = working_df.loc[sb_mask, 'MJ_REQ_REM'].fillna(0)
+            suffix = mj_vals.apply(lambda v: f' SKIP_STORE_BROKEN(mj_rem={v:.1f});')
+            working_df.loc[sb_mask, 'ALLOC_REMARKS'] = (
+                working_df.loc[sb_mask, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
+            )
+
+    # Propagate all SKIPPED OPTs from working_df into alloc_df
+    _propagate_skips_to_alloc(alloc_df, working_df)
 
 
 def _revalidate_after_band(
@@ -751,17 +1453,16 @@ def _revalidate_after_band(
     working_df: pd.DataFrame,
     grids: Dict[str, Dict],
     ot: str,
-    rank: int,
+    r: int,
     pri_ct_check_rl: bool,
     pri_ct_check_tbc: bool,
 ) -> None:
     """pandas equivalent of rule_engine_new._revalidate_after_band, scoped
     to one MAJ_CAT (alloc_df / working_df are already MAJ_CAT slices).
-    Steps mirror the SQL one-for-one."""
-    band_mask = (
-        (alloc_df['OPT_TYPE'] == ot)
-        & (alloc_df['OPT_PRIORITY_RANK'] == rank)
-    )
+    Called once per (OPT_TYPE × round) after all stores have competed.
+    r: the round just completed — skip-marking is limited to OPTs that have
+    at least one alloc_df row with I_ROD >= r+1 (i.e. a next band coming)."""
+    band_mask = (alloc_df['OPT_TYPE'] == ot)
     if not band_mask.any():
         return
     band = alloc_df.loc[band_mask, [
@@ -863,15 +1564,31 @@ def _revalidate_after_band(
             )
         working_df['PRI_CT_REM'] = pri
 
-    # (5) Skip rules on remaining OPTs (rank > current)
+    # (5) Skip rules — scoped to OPTs that have a next band (I_ROD >= r+1).
+    # Skipping OPTs with no remaining rounds is meaningless for the user and
+    # creates confusing SKIP_REASON values on already-finished rows.
     enforced = {'TBL'}
     if pri_ct_check_rl:  enforced.add('RL')
     if pri_ct_check_tbc: enforced.add('TBC')
 
+    # Compute the set of OPT_KEYS tuples that still have rounds left.
+    next_round_alloc = alloc_df[alloc_df['I_ROD'] >= r + 1]
+    if not next_round_alloc.empty:
+        next_opt_tuples: set = set(
+            zip(*[next_round_alloc[c].to_numpy() for c in OPT_KEYS])
+        )
+        nxt_working = pd.Series(
+            [tuple(row) in next_opt_tuples
+             for row in zip(*[working_df[c].to_numpy() for c in OPT_KEYS])],
+            index=working_df.index,
+        )
+    else:
+        nxt_working = pd.Series(False, index=working_df.index)
+
     pending_mask = (
         (working_df['LISTED_FLAG'].fillna(0) == 1)
         & (~working_df['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED']))
-        & (working_df['OPT_PRIORITY_RANK'] > rank)
+        & nxt_working
     )
     if pending_mask.any():
         msa_dead = (working_df['MSA_FNL_Q_REM'].fillna(0) <= 0)
@@ -879,58 +1596,82 @@ def _revalidate_after_band(
             (working_df['PRI_CT_REM'].fillna(0) < 100)
             & (working_df['OPT_TYPE'].isin(enforced))
         )
-        # MSA_EXHAUSTED branch
+        # MSA_EXHAUSTED — include remaining qty in the remark for debuggability
         m_msa = pending_mask & msa_dead
         if m_msa.any():
             working_df.loc[m_msa, 'ALLOC_STATUS'] = 'SKIPPED'
+            rem_vals = working_df.loc[m_msa, 'MSA_FNL_Q_REM'].fillna(0)
+            suffix = rem_vals.apply(lambda v: f' SKIP_MSA_EXHAUSTED(rem={v:.1f});')
             working_df.loc[m_msa, 'ALLOC_REMARKS'] = (
-                working_df.loc[m_msa, 'ALLOC_REMARKS'].fillna('') + ' SKIP_MSA_EXHAUSTED;'
+                working_df.loc[m_msa, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
             )
-        # PRI_BROKEN branch (only on OPTs not already SKIPPED above)
+        # PRI_BROKEN — include PRI_CT_REM value
         m_pri = pending_mask & pri_dead & (~msa_dead)
         if m_pri.any():
             working_df.loc[m_pri, 'ALLOC_STATUS'] = 'SKIPPED'
+            pri_vals = working_df.loc[m_pri, 'PRI_CT_REM'].fillna(0)
+            suffix = pri_vals.apply(lambda v: f' SKIP_PRI_BROKEN(pri={v:.1f});')
             working_df.loc[m_pri, 'ALLOC_REMARKS'] = (
-                working_df.loc[m_pri, 'ALLOC_REMARKS'].fillna('') + ' SKIP_PRI_BROKEN;'
+                working_df.loc[m_pri, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
             )
 
-    # (5b) Store-broken: MJ_REQ_REM < factor × ACS_D → skip rest of store/OPT
+    # (5b) Store-broken — scoped to next-band OPTs only.
     if rne.ENABLE_STORE_BROKEN and 'MJ_REQ_REM' in work_cols:
+        ot_idx = OPT_TYPE_ORDER.index(ot) if ot in OPT_TYPE_ORDER else 0
+        remaining_types = OPT_TYPE_ORDER[ot_idx:]
         sb_mask = (
             (working_df['LISTED_FLAG'].fillna(0) == 1)
             & (~working_df['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED']))
-            & (working_df['OPT_TYPE'] == ot)
-            & (working_df['OPT_PRIORITY_RANK'] > rank)
+            & nxt_working
+            & (working_df['OPT_TYPE'].isin(remaining_types))
             & (working_df['MJ_REQ_REM'].fillna(0)
                < rne.ACS_SKIP_FACTOR * working_df['ACS_D'].fillna(0))
         )
         if sb_mask.any():
             working_df.loc[sb_mask, 'ALLOC_STATUS'] = 'SKIPPED'
+            mj_vals = working_df.loc[sb_mask, 'MJ_REQ_REM'].fillna(0)
+            suffix = mj_vals.apply(lambda v: f' SKIP_STORE_BROKEN(mj_rem={v:.1f});')
             working_df.loc[sb_mask, 'ALLOC_REMARKS'] = (
-                working_df.loc[sb_mask, 'ALLOC_REMARKS'].fillna('') + ' SKIP_STORE_BROKEN;'
+                working_df.loc[sb_mask, 'ALLOC_REMARKS'].fillna('').astype(str) + suffix
             )
 
-    # (6) Propagate SKIP back to alloc_df: every alloc row whose OPT was
-    # just SKIPPED → mark SKIPPED + REVALIDATION_SKIP.
-    skipped_opts = working_df.loc[
+    # (6) Propagate SKIP back to alloc_df — scoped to next-band alloc rows.
+    # Build OPT_KEYS → ALLOC_REMARKS mapping so SKIP_REASON carries the
+    # exact trigger value (e.g. "SKIP_PRI_BROKEN(pri=85.0)") instead of
+    # the generic 'REVALIDATION_SKIP'.
+    newly_skipped = working_df.loc[
         working_df['ALLOC_STATUS'] == 'SKIPPED',
-        OPT_KEYS,
-    ].drop_duplicates()
-    if not skipped_opts.empty:
-        skipped_keys = set(map(tuple, skipped_opts.to_numpy()))
-        keys_alloc = list(zip(*[alloc_df[c].to_numpy() for c in OPT_KEYS]))
-        m_in = pd.Series(
-            [k in skipped_keys for k in keys_alloc], index=alloc_df.index
+        OPT_KEYS + ['ALLOC_REMARKS'],
+    ].drop_duplicates(subset=OPT_KEYS)
+    if not newly_skipped.empty:
+        remarks_map: dict = dict(
+            zip(
+                zip(*[newly_skipped[c].to_numpy() for c in OPT_KEYS]),
+                newly_skipped['ALLOC_REMARKS'].fillna('').astype(str),
+            )
         )
-        prop_mask = (
-            m_in
-            & (~alloc_df['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED', 'PARTIAL']))
-        )
-        if prop_mask.any():
-            alloc_df.loc[prop_mask, 'ALLOC_STATUS'] = 'SKIPPED'
-            sr = alloc_df.loc[prop_mask, 'SKIP_REASON'].fillna('').astype(str)
-            blank = (sr == '')
-            alloc_df.loc[prop_mask & blank, 'SKIP_REASON'] = 'REVALIDATION_SKIP'
+        # Only propagate to alloc rows that have a next band.
+        next_alloc_mask = alloc_df['I_ROD'] >= r + 1
+        if next_alloc_mask.any():
+            sub = alloc_df.loc[next_alloc_mask]
+            alloc_keys_next = list(zip(*[sub[c].to_numpy() for c in OPT_KEYS]))
+            m_in_next = np.array([k in remarks_map for k in alloc_keys_next], dtype=bool)
+            prop_idx = sub.index[
+                m_in_next
+                & (~sub['ALLOC_STATUS'].isin(['SKIPPED', 'ALLOCATED', 'PARTIAL'])).to_numpy()
+            ]
+            if len(prop_idx):
+                alloc_df.loc[prop_idx, 'ALLOC_STATUS'] = 'SKIPPED'
+                opt_keys_series = pd.Series(
+                    [tuple(row) for row in zip(*[alloc_df.loc[prop_idx, c].to_numpy()
+                                                  for c in OPT_KEYS])],
+                    index=prop_idx,
+                )
+                reason_series = opt_keys_series.map(remarks_map).fillna('REVALIDATION_SKIP')
+                sr_existing = alloc_df.loc[prop_idx, 'SKIP_REASON'].fillna('').astype(str)
+                alloc_df.loc[prop_idx, 'SKIP_REASON'] = np.where(
+                    sr_existing == '', reason_series, sr_existing
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -938,8 +1679,10 @@ def _revalidate_after_band(
 # ---------------------------------------------------------------------------
 _ALLOC_WRITE_COLS = [
     'WERKS', 'RDC', 'MAJ_CAT', 'GEN_ART_NUMBER', 'CLR', 'VAR_ART', 'SZ',
-    'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'ALLOC_STATUS', 'SKIP_REASON',
+    'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'FROM_HOLD_QTY',
+    'ALLOC_STATUS', 'SKIP_REASON',
     'POOL_CONSUMED', 'ALLOC_WAVE', 'ALLOC_ROUND',
+    'FNL_Q_REM',
 ]
 
 
@@ -966,9 +1709,34 @@ def _write_back_alloc(engine, alloc_table: str, df: pd.DataFrame) -> None:
         except Exception:
             pass
 
+        # Make this session the designated deadlock victim. When 8 workers
+        # contend on tempdb metadata / memory grants, SQL Server picks ONE
+        # to kill — by setting LOW we ensure the writer (which has a tiny
+        # rollback cost) loses, not auth/login/progress-poll requests. The
+        # outer retry_on_deadlock then reruns the writer cleanly.
+        try:
+            cur.execute("SET DEADLOCK_PRIORITY LOW")
+        except Exception:
+            pass
+
+        # DDL guard: ensure FROM_HOLD_QTY column exists in target table.
+        try:
+            cur.execute(f"""
+                IF NOT EXISTS (
+                    SELECT 1 FROM sys.columns
+                    WHERE object_id = OBJECT_ID('{alloc_table}')
+                      AND name = 'FROM_HOLD_QTY'
+                )
+                ALTER TABLE [{alloc_table}] ADD [FROM_HOLD_QTY] FLOAT NULL
+            """)
+            raw.commit()
+        except Exception:
+            pass
+
         col_defs = []
         for c in cols:
-            if c in {'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'POOL_CONSUMED', 'ALLOC_ROUND'}:
+            if c in {'SHIP_QTY', 'HOLD_QTY', 'ALLOC_QTY', 'FROM_HOLD_QTY',
+                     'POOL_CONSUMED', 'ALLOC_ROUND', 'FNL_Q_REM'}:
                 col_defs.append(f"[{c}] FLOAT NULL")
             else:
                 col_defs.append(f"[{c}] NVARCHAR(200) NULL")
@@ -1035,6 +1803,13 @@ def _write_back_working(engine, working_table: str, df: pd.DataFrame,
         cur = raw.cursor()
         try:
             cur.fast_executemany = True
+        except Exception:
+            pass
+
+        # See _write_back_alloc — designate this session as deadlock victim
+        # so the retry path (not unrelated requests) absorbs any contention.
+        try:
+            cur.execute("SET DEADLOCK_PRIORITY LOW")
         except Exception:
             pass
 

@@ -47,11 +47,13 @@ _FINAL_KEEP_COLS = {
     "ACS_D", "ALC_D", "AUTO_GEN_ART_SALE", "AGE",
     "LISTING", "I_ROD", "CLR_MIN", "CLR_MAX",
     "FOCUS_W_CAP", "FOCUS_WO_CAP",
-    "MSA_FNL_Q", "VAR_COUNT", "VAR_FNL_COUNT",
+    "RL_HOLD_QTY", "MSA_FNL_Q", "VAR_COUNT", "VAR_FNL_COUNT",
     "PER_OPT_SALE", "OPT_MBQ", "OPT_REQ", "OPT_MBQ_WH", "OPT_REQ_WH", "EXCESS_STK",
-    "ST_RANK", "MAX_DAILY_SALE", "HOLD_QTY",
+    "ST_RANK", "MAX_DAILY_SALE",
     "FINAL_OPT_TYPE", "ALLOC_BATCH_ID", "ALLOC_TYPE",
     "OPT_TYPE_REASON", "FOCUS_FLAG", "CLR_CAP_MODE", "STR_BOOST_PCT",
+    # MAJ_CAT-level store aggregates — used by the MBQ cap in Stage C
+    "MJ_MBQ", "MJ_STK_TTL",
     # Hierarchy category values (primary-grid keys — needed by rule_engine
     # revalidation to deduct grid REQ at correct grain)
     "M_VND_CD", "RNG_SEG", "MACRO_MVGR", "MICRO_MVGR", "FAB",
@@ -97,15 +99,19 @@ class GenerateRequest(BaseModel):
     # When False, the opt_type is allowed in even if primary grid coverage is < 100%.
     pri_ct_check_rl: bool = True
     pri_ct_check_tbc: bool = True
-    # Allocation parallelism (Part 8 only). Default = python_parallel (~7x faster
-    # than sequential, identical SHIP_QTY/HOLD_QTY). Sequential is preserved as
-    # a safety fallback. SQL Parallel routes to a stored proc (Phase 2).
-    allocation_mode:  str = "python_parallel"  # "sequential" | "python_parallel" | "sql_parallel" | "pandas"
-    parallel_workers: int = 8                  # 2..16, used only by parallel modes
+    # MBQ cap (only active when the corresponding pri_ct_check is False).
+    # Prevents over-allocation by capping total SHIP_QTY per (WERKS, OPT_TYPE) at
+    # cap_pct% of MJ_MBQ. e.g. 110 → store can receive at most 110% of its MAJ_CAT target.
+    rl_mbq_cap_pct:  float = 110.0
+    tbc_mbq_cap_pct: float = 110.0
+    # Allocation mode. pandas = multi-process per MAJ_CAT (fast). sequential = single-thread fallback.
+    allocation_mode:  str = "pandas"  # "sequential" | "pandas"
+    parallel_workers: int = 8        # used only by pandas mode
     # Source tables:
     msa_table: str = "ARS_MSA_GEN_ART"
     grid_table: str = "ARS_GRID_MJ_GEN_ART"
     st_master_table: str = "Master_ALC_INPUT_ST_MASTER"
+    ssn_values: List[str] = []  # restrict run to MAJ_CATs whose articles belong to selected seasons
 
 
 # ── Helpers — delegating to shared db_helpers ───────────────────────────────
@@ -243,6 +249,16 @@ def get_config(current_user: User = Depends(get_current_user)):
         # Load saved listing variables from AppSettings
         result["settings"] = _load_listing_settings(conn)
 
+        # Distinct seasons for SSN filter
+        try:
+            ssn_rows = conn.execute(text(
+                "SELECT DISTINCT [SSN] FROM [vw_master_product] WITH (NOLOCK) "
+                "WHERE [SSN] IS NOT NULL ORDER BY [SSN]"
+            )).scalars().all()
+            result["ssns"] = [str(r).strip() for r in ssn_rows if r]
+        except Exception:
+            result["ssns"] = []
+
     return {"success": True, "data": result}
 
 
@@ -264,6 +280,10 @@ _SETTING_DEFAULTS = {
     "str_tiers": "30:150,45:130,60:120,90:110",
     "default_acs_d": "18",
     "min_size_count": "3",
+    "pri_ct_check_rl": "false",
+    "pri_ct_check_tbc": "false",
+    "rl_mbq_cap_pct": "110.0",
+    "tbc_mbq_cap_pct": "110.0",
 }
 _SETTING_PREFIX = "listing."
 
@@ -332,6 +352,28 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
     from app.services.listing_sessions import (
         make_session_id, start_session,
     )
+    from app.services import parked_history
+
+    # Refuse a second concurrent run — listing tables (ARS_ALLOC_WORKING in
+    # particular) are dropped+recreated each run, so two overlapping calls
+    # can race on DDL and corrupt each other's snapshot.
+    if parked_history.has_running_session():
+        raise HTTPException(
+            409,
+            "Another listing run is already in progress. Wait for it to finish "
+            "or kill it from the Sessions page before starting a new one."
+        )
+
+    # Enforce one-parked-at-a-time: block new runs while a session is
+    # awaiting approve/reject. Running a new listing would overwrite
+    # ARS_ALLOC_WORKING and ARS_LISTING_WORKING, making the parked
+    # snapshot unrecoverable.
+    if parked_history.has_pending_parked():
+        raise HTTPException(
+            409,
+            "A parked session is awaiting review. Please approve or reject it "
+            "from the Parked Runs page before generating a new one."
+        )
 
     session_id = make_session_id()
     user_name  = getattr(current_user, "username", None)
@@ -445,8 +487,14 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     preset_batch_id: if set, parallel orchestrators reuse this id (so it
     matches the session_id returned to the UI). Sequential mode ignores it.
     """
+    from app.services import parked_history
+
     start = time.time()
     de = get_data_engine()
+
+    # Snapshot which tracked tables existed before the run started, so the
+    # post-run sweep can label each one CREATED vs. RECREATED/TRUNCATED.
+    pre_existence = parked_history.capture_pre_existence()
 
     # Cancel-check helper. Stage A/B can run for many minutes; without these
     # checkpoints the thread keeps grinding even after kill_session sets the
@@ -458,7 +506,18 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     _cancel_key = preset_batch_id or session_id
 
     def _check_cancel(stage: str = "") -> None:
-        if _cancel_key and _cancel_svc.is_cancelled(_cancel_key):
+        # Robust check: in-memory event OR DB session STATUS='CANCELLED'.
+        # The DB fallback survives cleanup() of the in-memory event and
+        # works for ProcessPool subprocesses that can't see the parent's
+        # _CANCEL_EVENTS dict at all.
+        cancelled = _cancel_svc.is_cancelled_anywhere(_cancel_key) \
+            if _cancel_key else False
+        # Always also probe the session row directly (covers the case
+        # where the cancel arrived via /sessions/{sid}/kill before any
+        # batch_id was minted).
+        if not cancelled and session_id:
+            cancelled = _cancel_svc.is_session_cancelled(session_id)
+        if cancelled:
             logger.warning(f"[generate] cancel detected at stage={stage} — aborting")
             raise InterruptedError(f"cancelled by user (stage={stage})")
 
@@ -483,6 +542,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "min_size_count": str(req.min_size_count),
                 "pri_ct_check_rl": str(req.pri_ct_check_rl).lower(),
                 "pri_ct_check_tbc": str(req.pri_ct_check_tbc).lower(),
+                "rl_mbq_cap_pct": str(req.rl_mbq_cap_pct),
+                "tbc_mbq_cap_pct": str(req.tbc_mbq_cap_pct),
             })
     except Exception:
         pass  # non-critical
@@ -582,10 +643,51 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             raise HTTPException(400, "ST_MASTER missing RDC column")
 
         # ── Filters ─────────────────────────────────────────────────────
+        # When SSN is selected but no explicit MAJ_CAT, resolve SSN→MAJ_CATs
+        # once here so every downstream query benefits (grid, MSA, var, etc.).
+        _effective_majcats: List[str] = list(req.maj_cat_values or [])
+        if not _effective_majcats and req.ssn_values:
+            try:
+                _ssn_safe = ', '.join(
+                    chr(39) + v.replace(chr(39), chr(39)*2) + chr(39)
+                    for v in req.ssn_values
+                )
+                _effective_majcats = [
+                    str(r[0]) for r in conn.execute(text(
+                        f"SELECT DISTINCT [MAJ_CAT] FROM [vw_master_product] WITH (NOLOCK) "
+                        f"WHERE [SSN] IN ({_ssn_safe}) AND [MAJ_CAT] IS NOT NULL "
+                        f"ORDER BY [MAJ_CAT]"
+                    )) if r[0]
+                ]
+                if _effective_majcats:
+                    logger.info(
+                        f"SSN filter {req.ssn_values} → {len(_effective_majcats)} MAJ_CATs: "
+                        f"{_effective_majcats[:5]}{'...' if len(_effective_majcats) > 5 else ''}"
+                    )
+            except Exception as _ssn_err:
+                logger.warning(f"SSN→MAJ_CAT resolution failed: {_ssn_err}")
+
         mc_where = ""
-        if req.maj_cat_values:
-            mc_list = ", ".join(f"'{v}'" for v in req.maj_cat_values)
+        if _effective_majcats:
+            mc_list = ", ".join(f"'{v}'" for v in _effective_majcats)
             mc_where = f" AND [MAJ_CAT] IN ({mc_list})"
+
+        # SSN filter — keep subquery fallback for grid/MSA alias forms
+        if req.ssn_values:
+            _ssn_list = ', '.join(
+                chr(39) + v.replace(chr(39), chr(39)*2) + chr(39)
+                for v in req.ssn_values
+            )
+            _mp_subq = (
+                f"SELECT DISTINCT [MAJ_CAT] FROM [vw_master_product] WITH (NOLOCK) "
+                f"WHERE [SSN] IN ({_ssn_list})"
+            )
+            mp_majcat_filter   = f" AND [MAJ_CAT] IN ({_mp_subq})"
+            mp_majcat_filter_g = f" AND G.[MAJ_CAT] IN ({_mp_subq})"
+            logger.info(f"SSN filter active: {req.ssn_values}")
+        else:
+            mp_majcat_filter   = ""
+            mp_majcat_filter_g = ""
 
         # Active stores
         has_listing = "LISTING" in st_cols
@@ -622,7 +724,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         msa_sql = f"""
             SELECT DISTINCT {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')}
             FROM [{req.msa_table}]
-            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{msa_rdc_filter}
+            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}
         """
 
         # ── Create listing table ────────────────────────────────────────
@@ -664,7 +766,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
         # ── Diagnostic: source counts ───────────────────────────────────
         diag_stores = conn.execute(text(f"SELECT COUNT(*) FROM ({stores_sql}) X")).scalar()
-        grid_mc = f"AND [MAJ_CAT] IN ({', '.join(f'{chr(39)}{v}{chr(39)}' for v in req.maj_cat_values)})" if req.maj_cat_values else ""
+        grid_mc = f"AND [MAJ_CAT] IN ({', '.join(f'{chr(39)}{v}{chr(39)}' for v in _effective_majcats)})" if _effective_majcats else ""
         diag_grid = conn.execute(text(
             f"SELECT COUNT(*) FROM [{req.grid_table}] WITH (NOLOCK) "
             f"WHERE [WERKS] IN (SELECT [ST_CD] FROM ({stores_sql}) X) {grid_mc}"
@@ -674,7 +776,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
 
         # ── PART 1: Grid data (existing stock) → IS_NEW = 0 ────────────
         t0 = time.time()
-        grid_mc_g = f"AND G.[MAJ_CAT] IN ({', '.join(f'{chr(39)}{v}{chr(39)}' for v in req.maj_cat_values)})" if req.maj_cat_values else ""
+        grid_mc_g = f"AND G.[MAJ_CAT] IN ({', '.join(f'{chr(39)}{v}{chr(39)}' for v in _effective_majcats)})" if _effective_majcats else ""
 
         _run(conn, f"""
             INSERT INTO [{LISTING_TABLE}] ({all_cols})
@@ -686,7 +788,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 {stk_sel_str}, {stk_ttl} AS STK_TTL, {str_ttl} AS STR, 0 AS IS_NEW, NULL AS OPT_TYPE
             FROM [{req.grid_table}] G WITH (NOLOCK)
             INNER JOIN ({stores_sql}) S ON G.[WERKS] = S.[ST_CD]
-            WHERE 1=1 {grid_mc_g}
+            WHERE 1=1 {grid_mc_g}{mp_majcat_filter_g}
         """)
         grid_count = conn.execute(text(f"SELECT COUNT(*) FROM [{LISTING_TABLE}]")).scalar()
         logger.info(f"Part 1 (Grid data): {grid_count} rows")
@@ -702,7 +804,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 LTRIM(RTRIM(CAST([{msa_rdc_col}] AS NVARCHAR(50)))) AS RDC,
                 {_msa_col('MAJ_CAT')}, {_msa_col('GEN_ART_NUMBER')}, {_msa_col('CLR')}
             FROM [{req.msa_table}]
-            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{msa_rdc_filter}
+            WHERE [MAJ_CAT] IS NOT NULL AND [GEN_ART_NUMBER] IS NOT NULL{mc_where}{mp_majcat_filter}{msa_rdc_filter}
         """
         _run(conn, f"""
             INSERT INTO [{LISTING_TABLE}] ({all_cols})
@@ -883,6 +985,52 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             logger.warning("Part 3.5c: MASTER_GEN_ART_AGE table not found — AGE will remain NULL")
         t0 = _time_step("Part 3.5 (ACS_D/ALC_D/AUTO_GEN_ART_SALE/AGE)", t0)
 
+        # ── PART 3.54: Populate RL_HOLD_QTY from ARS_NL (before MSA_FNL_Q) ────────
+        # ARS_NL holds stock already allocated in a prior run but still in transit.
+        # Stored as RL_HOLD_QTY (separate from HOLD_QTY which is the current-run
+        # allocation hold written by Stage C).  Must be populated BEFORE Part 3.6
+        # OPT_TYPE classification — RL rule includes RL_HOLD_QTY > 0 as an
+        # alternative to STK_TTL >= threshold × ACS_D.
+        try:
+            _run(conn, f"ALTER TABLE [{LISTING_TABLE}] ADD [RL_HOLD_QTY] FLOAT NULL DEFAULT 0")
+        except Exception:
+            pass  # column may already exist
+        if _table_exists(conn, "ARS_NL"):
+            nl_cols = _get_columns(conn, "ARS_NL")
+            nl_hq_col = next((c for c in ["HOLD_QTY", "HOLD_Q", "HLD_QTY"] if c in nl_cols), None)
+            nl_werks   = next((c for c in ["WERKS", "ST_CD"] if c in nl_cols), None)
+            nl_art     = next((c for c in ["GEN_ART_NUMBER", "GEN_ART", "ARTICLE_NUMBER"] if c in nl_cols), None)
+            nl_clr     = "CLR" if "CLR" in nl_cols else None
+            nl_maj     = "MAJ_CAT" if "MAJ_CAT" in nl_cols else None
+            if nl_hq_col and nl_werks and nl_art:
+                join_parts = [
+                    f"L.[WERKS] = N.[{nl_werks}]",
+                    f"TRY_CAST(L.[GEN_ART_NUMBER] AS BIGINT) = TRY_CAST(TRY_CAST(N.[{nl_art}] AS FLOAT) AS BIGINT)",
+                ]
+                if nl_maj:
+                    join_parts.append(f"L.[MAJ_CAT] = N.[{nl_maj}]")
+                if nl_clr:
+                    join_parts.append(f"ISNULL(L.[CLR],'') = ISNULL(N.[{nl_clr}],'')")
+                try:
+                    _run(conn, f"""
+                        UPDATE L SET L.[RL_HOLD_QTY] = ISNULL(TRY_CAST(N.[{nl_hq_col}] AS FLOAT), 0)
+                        FROM [{LISTING_TABLE}] L
+                        INNER JOIN [ARS_NL] N WITH (NOLOCK)
+                            ON {' AND '.join(join_parts)}
+                        WHERE ISNULL(TRY_CAST(N.[{nl_hq_col}] AS FLOAT), 0) > 0
+                    """)
+                    hq_cnt = conn.execute(text(
+                        f"SELECT COUNT(*) FROM [{LISTING_TABLE}] WHERE ISNULL([RL_HOLD_QTY],0) > 0"
+                    )).scalar() or 0
+                    logger.info(f"Part 3.54: RL_HOLD_QTY from ARS_NL populated for {hq_cnt} rows")
+                except Exception as e:
+                    logger.warning(f"Part 3.54: RL_HOLD_QTY from ARS_NL failed: {str(e)[:150]}")
+            else:
+                logger.info("Part 3.54: ARS_NL missing expected columns — RL_HOLD_QTY stays 0")
+        else:
+            logger.info("Part 3.54: ARS_NL not found — RL_HOLD_QTY stays 0")
+        t0 = _time_step("Part 3.54 (RL_HOLD_QTY from ARS_NL)", t0)
+
         # ── PART 3.55: Populate MSA_FNL_Q early (needed by Part 3.6 for TBL/TBC tagging)
         # Part 5c re-populates the same value later — idempotent.
         try:
@@ -975,49 +1123,40 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         # OPT_TYPE classification — evaluated top-to-bottom, first match wins.
         # Order: MIX first (catch bad options early) → RL → TBC → TBL.
         #
-        #   MIX — (a) low stock + no MSA:  STK < threshold%*ACS_D AND MSA_FNL_Q = 0
-        #         (b) poor color fill:     VAR_FNL_COUNT / VAR_COUNT < threshold%
-        #         Either condition → MIX (applies to ALL rows, both IS_NEW=0 and IS_NEW=1)
-        #   RL  — STK_TTL >= threshold% * ACS_D  (adequate stock, regardless of MSA)
-        #   TBC — 0 < STK < threshold%*ACS_D AND MSA_FNL_Q > 0  (To Be Check)
-        #   TBL — STK_TTL <= 0 AND MSA_FNL_Q > 0              (To Be Listed)
+        #   MIX (a): low stock + no MSA + no RL_HOLD_QTY (nothing to send)
+        #   MIX (b): poor color fill (VAR ratio < threshold)
+        #   RL:  adequate stock (STK >= threshold × ACS_D)
+        #        OR RL_HOLD_QTY > 0 (stock already dispatched from a prior run)
+        #   TBC: low stock, MSA or NL hold available
+        #   TBL: zero stock, MSA or NL hold available
         threshold = req.stock_threshold_pct
         default_acs = float(req.default_acs_d or 18)
         def _classify_opt_type(label="OPT_TYPE"):
-            # Use actual ACS_D when available, fall back to default_acs_d (configurable, default 18)
             _run(conn, f"""
                 UPDATE [{LISTING_TABLE}]
                 SET [OPT_TYPE] = CASE
-                    -- Effective ACS_D: use actual if > 0, else default ({default_acs})
-                    -- MIX (a): low stock + no MSA backup
+                    -- MIX (a): low stock + no MSA AND no prior-run NL hold — nothing to send
                     WHEN ISNULL([STK_TTL], 0) < {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                     AND ISNULL([MSA_FNL_Q], 0) = 0
+                     AND ISNULL([MSA_FNL_Q], 0)    = 0
+                     AND ISNULL([RL_HOLD_QTY], 0)  = 0
                         THEN 'MIX'
-                    -- MIX (b): poor color fill — ratio < threshold {f'OR count < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else '(MinSz off)'}
+                    -- MIX (b): poor color fill {f'OR count < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else '(MinSz off)'}
                     WHEN ISNULL([VAR_COUNT], 0) > 0
                      AND (CAST(ISNULL([VAR_FNL_COUNT], 0) AS FLOAT) / [VAR_COUNT] < {threshold}
                           {f'OR ISNULL([VAR_FNL_COUNT], 0) < {int(req.min_size_count)}' if int(req.min_size_count) > 0 else ''})
                         THEN 'MIX'
-                    -- RL: adequate stock
+                    -- RL: adequate stock OR prior-run NL hold already dispatched
                     WHEN ISNULL([STK_TTL], 0) >= {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
+                      OR ISNULL([RL_HOLD_QTY], 0) > 0
                         THEN 'RL'
-                    -- TBC: low stock but MSA available
+                    -- TBC: low stock but MSA or NL hold available
                     WHEN ISNULL([STK_TTL], 0) > 0
                      AND [STK_TTL] < {threshold} * ISNULL(NULLIF([ACS_D], 0), {default_acs})
-                     AND ISNULL([MSA_FNL_Q], 0) > 0
+                     AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)
                         THEN 'TBC'
-                    -- TBL: zero/negative stock + MSA available
+                    -- TBL: zero/negative stock + MSA or NL hold available
                     WHEN ISNULL([STK_TTL], 0) <= 0
-                     AND ISNULL([MSA_FNL_Q], 0) > 0
-                        THEN 'TBL'
-                    -- Catch-all
-                    WHEN ISNULL([MSA_FNL_Q], 0) = 0 AND ISNULL([STK_TTL], 0) = 0
-                        THEN 'MIX'
-                    WHEN ISNULL([MSA_FNL_Q], 0) = 0 AND ISNULL([STK_TTL], 0) > 0
-                        THEN 'RL'
-                    WHEN ISNULL([MSA_FNL_Q], 0) > 0 AND ISNULL([STK_TTL], 0) > 0
-                        THEN 'TBC'
-                    WHEN ISNULL([MSA_FNL_Q], 0) > 0 AND ISNULL([STK_TTL], 0) <= 0
+                     AND (ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)
                         THEN 'TBL'
                     ELSE 'MIX'
                 END
@@ -1698,7 +1837,11 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 _run(wc, f"IF OBJECT_ID('{FINAL_TABLE}','U') IS NOT NULL DROP TABLE [{FINAL_TABLE}]")
 
                 where = []
-                if "MSA_FNL_Q" in all_upper:
+                # Keep rows with a fresh MSA pool OR pending hold from a prior run.
+                # Both conditions together mean there is something to work with.
+                if "MSA_FNL_Q" in all_upper and "RL_HOLD_QTY" in all_upper:
+                    where.append("(ISNULL([MSA_FNL_Q], 0) > 0 OR ISNULL([RL_HOLD_QTY], 0) > 0)")
+                elif "MSA_FNL_Q" in all_upper:
                     where.append("ISNULL([MSA_FNL_Q], 0) > 0")
                 if "OPT_REQ_WH" in all_upper:
                     where.append("ISNULL([OPT_REQ_WH], 0) >= 1")
@@ -1725,7 +1868,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     {where_sql}
                 """)
                 working_rows = wc.execute(text(f"SELECT COUNT(*) FROM [{FINAL_TABLE}]")).scalar()
-                logger.info(f"{FINAL_TABLE}: {working_rows} rows (MSA_FNL_Q>0, OPT_REQ_WH>=1)")
+                logger.info(f"{FINAL_TABLE}: {working_rows} rows (MSA_FNL_Q>0 OR HOLD_QTY>0, OPT_REQ_WH>=1)")
 
                 # ── Add ARS_GRID_HIERARCHY columns to working table ────────
                 # For each hierarchy column (RNG_SEG, MACRO_MVGR, etc.):
@@ -1915,27 +2058,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     alloc_rows = 0
     alloc_batch_id = None
     alloc_failed_count = 0
-    mode = (req.allocation_mode or "python_parallel").lower()
-    # Cap at 8 (was 16). Higher counts saturate the GIL in a single-process
-    # uvicorn and freeze auth / poll endpoints — see the orchestrator headers.
+    mode = (req.allocation_mode or "pandas").lower()
     n_workers = max(2, min(8, int(req.parallel_workers or 4)))
     try:
-        if mode == "python_parallel":
-            from app.services.rule_engine_parallel_python import (
-                run_listing_and_allocation_python_parallel,
-            )
-            alloc_result = run_listing_and_allocation_python_parallel(
-                working_table=FINAL_TABLE,
-                listed_table="ARS_LISTED_OPT",
-                alloc_table=ALLOC_TABLE,
-                n_workers=n_workers,
-                batch_id=preset_batch_id,
-                size_threshold=req.stock_threshold_pct,
-                min_size_count=req.min_size_count,
-                pri_ct_check_rl=req.pri_ct_check_rl,
-                pri_ct_check_tbc=req.pri_ct_check_tbc,
-            )
-        elif mode == "pandas":
+        if mode == "pandas":
             from app.services.rule_engine_pandas import (
                 run_listing_and_allocation_pandas,
             )
@@ -1949,23 +2075,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 min_size_count=req.min_size_count,
                 pri_ct_check_rl=req.pri_ct_check_rl,
                 pri_ct_check_tbc=req.pri_ct_check_tbc,
+                rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+                tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
             )
-        elif mode == "sql_parallel":
-            from app.services.rule_engine_parallel_sql import (
-                run_listing_and_allocation_sql_parallel,
-            )
-            alloc_result = run_listing_and_allocation_sql_parallel(
-                working_table=FINAL_TABLE,
-                listed_table="ARS_LISTED_OPT",
-                alloc_table=ALLOC_TABLE,
-                n_workers=n_workers,
-                batch_id=preset_batch_id,
-                size_threshold=req.stock_threshold_pct,
-                min_size_count=req.min_size_count,
-                pri_ct_check_rl=req.pri_ct_check_rl,
-                pri_ct_check_tbc=req.pri_ct_check_tbc,
-            )
-        else:  # "sequential" — original behaviour preserved
+        else:  # "sequential" — single-thread fallback
             from app.services.rule_engine_new import run_listing_and_allocation
             with de.connect() as ac:
                 alloc_result = run_listing_and_allocation(
@@ -1977,6 +2090,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                     min_size_count=req.min_size_count,
                     pri_ct_check_rl=req.pri_ct_check_rl,
                     pri_ct_check_tbc=req.pri_ct_check_tbc,
+                    rl_mbq_cap_pct=req.rl_mbq_cap_pct,
+                    tbc_mbq_cap_pct=req.tbc_mbq_cap_pct,
                 )
         alloc_rows = alloc_result.get("alloc_rows", 0)
         alloc_batch_id = alloc_result.get("batch_id")
@@ -1988,6 +2103,40 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         f"failed={alloc_failed_count}, batch={alloc_batch_id})",
         t0,
     )
+
+    # ── Part 8.4 — Park ARS_ALLOC_WORKING + ARS_LISTING_WORKING for review ──
+    # Snapshot the freshly-built allocation AND the working listing into
+    # their parked tables tagged with this session_id. The user reviews
+    # them in the UI and either promotes both to history (Approve) or
+    # marks both as REJECTED.
+    # Failures here do NOT fail the run — listing succeeded, parking is
+    # bookkeeping. The session row carries PARKED_STATUS so the UI can
+    # surface a warning when the snapshot was skipped.
+    parked_status = "PARKED"
+    try:
+        snap = parked_history.snapshot_session_to_parked(session_id)
+        # Aggregate result: at least one target parked rows → PARKED;
+        # all targets had errors → SKIPPED_ERROR; all targets were empty
+        # or already parked with zero rows → SKIPPED_EMPTY.
+        if not snap.get("any_parked"):
+            parked_status = (
+                "SKIPPED_ERROR" if snap.get("any_error") else "SKIPPED_EMPTY"
+            )
+        elif snap.get("any_error"):
+            # Partial success — at least one target parked, but another
+            # failed. Treat as SKIPPED_ERROR so the UI surfaces a warning;
+            # the partial parked rows are still safely recorded under
+            # this session_id.
+            parked_status = "SKIPPED_ERROR"
+        logger.info(
+            f"[generate] parked snapshot: total_rows={snap.get('total_parked_rows')} "
+            f"by_table={snap.get('by_table')} parked_status={parked_status}"
+        )
+    except Exception as e:
+        logger.warning(f"[generate] parked snapshot failed: {e}")
+        parked_status = "SKIPPED_ERROR"
+    summary["parked_status"] = parked_status
+    t0 = _time_step("Part 8.4 (park alloc + listing snapshots)", t0)
 
     # ── Part 8.5 — OPT_STATUS post-alloc classification + TBL_LISTED_DATE ──
     # Rule (evaluated on post-alloc stock = STK_TTL + ALLOC_QTY):
@@ -2039,10 +2188,16 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     t0 = _time_step("Part 8.5 (OPT_STATUS + TBL_LISTED_DATE)", t0)
 
     # ── Part 8.6 — NL/TBL hold-tracking table (persistent, WERKS × VAR_ART × SZ) ─
-    # Maintains remaining hold qty per size across allocation runs.
-    # - Existing open rows: HOLD_REM -= MIN(this_run.ALLOC_QTY, HOLD_REM)
-    # - Close (IS_CLOSED=1) when HOLD_REM reaches 0 — soft delete
-    # - New rows inserted for NL/TBL SKUs first appearing in this run
+    # Step A: RL/TBC rows consumed from warehouse hold → decrement HOLD_REM.
+    #         Uses FROM_HOLD_QTY written by the allocation engine.
+    # Step B: TBL rows created new warehouse hold → MERGE (re-open / accumulate / insert).
+    #
+    # Snapshot the current state BEFORE we modify it so that reject_parked()
+    # can restore ARS_NL_TBL_HOLD_TRACKING to its pre-run values.
+    try:
+        parked_history.snapshot_hold_tracking(session_id)
+    except Exception as _she:
+        logger.warning(f"[generate] hold tracking pre-snapshot failed: {_she}")
     try:
         with de.connect() as ac:
             _run(ac, """
@@ -2077,98 +2232,99 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             except Exception:
                 pass
 
-            # STEP A — decrement HOLD_REM on open rows based on THIS run's alloc qty
+            # DDL guard — FROM_HOLD_QTY written by the allocation engine.
+            try:
+                _run(ac, f"""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.columns
+                        WHERE object_id = OBJECT_ID('{ALLOC_TABLE}')
+                          AND name = 'FROM_HOLD_QTY'
+                    )
+                    ALTER TABLE [{ALLOC_TABLE}] ADD [FROM_HOLD_QTY] FLOAT NULL
+                """)
+            except Exception:
+                pass
+
+            # STEP A — RL/TBC consumed from warehouse hold → decrement HOLD_REM.
+            # FROM_HOLD_QTY is set by the allocation engine for RL/TBC rows only.
             _run(ac, f"""
-                ;WITH RunAlloc AS (
+                ;WITH RunHold AS (
                     SELECT A.[WERKS],
                            TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
                            A.[SZ],
-                           SUM(ISNULL(TRY_CAST(A.[ALLOC_QTY] AS FLOAT), 0)) AS alloc_qty
+                           SUM(ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0)) AS from_hold_qty
                     FROM [{ALLOC_TABLE}] A
-                    WHERE ISNULL(TRY_CAST(A.[ALLOC_QTY] AS FLOAT), 0) > 0
+                    WHERE A.[OPT_TYPE] IN ('RL', 'TBC')
+                      AND ISNULL(TRY_CAST(A.[FROM_HOLD_QTY] AS FLOAT), 0) > 0
                     GROUP BY A.[WERKS], TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
                 )
                 UPDATE T SET
                     T.[HOLD_REM] = CASE
-                        WHEN R.alloc_qty >= T.[HOLD_REM] THEN 0
-                        ELSE T.[HOLD_REM] - R.alloc_qty
+                        WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 0
+                        ELSE T.[HOLD_REM] - R.from_hold_qty
                     END,
-                    T.[LAST_UPDATED] = GETDATE(),
                     T.[IS_CLOSED] = CASE
-                        WHEN R.alloc_qty >= T.[HOLD_REM] THEN 1
+                        WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN 1
                         ELSE 0
                     END,
                     T.[CLOSED_DATE] = CASE
-                        WHEN R.alloc_qty >= T.[HOLD_REM] THEN GETDATE()
-                        ELSE T.[CLOSED_DATE]
-                    END
+                        WHEN T.[HOLD_REM] - R.from_hold_qty <= 0 THEN GETDATE()
+                        ELSE NULL
+                    END,
+                    T.[LAST_UPDATED] = GETDATE()
                 FROM [ARS_NL_TBL_HOLD_TRACKING] T
-                INNER JOIN RunAlloc R
+                INNER JOIN RunHold R
                     ON  T.[WERKS]   = R.[WERKS]
                     AND T.[VAR_ART] = R.[VAR_ART]
                     AND T.[SZ]      = R.[SZ]
                 WHERE T.[IS_CLOSED] = 0
             """)
 
-            # STEP A.5 — refresh HOLD_QTY_INITIAL / HOLD_REM for SKUs that were
-            # already tracked (still open) AND show up again in this run with
-            # a NEW hold qty. Without this, re-running with a different stock
-            # situation would leave HOLD_QTY_INITIAL frozen at the original
-            # value and SUM(HOLD_REM) would drift away from the dashboard.
+            # STEP B — TBL rows created new warehouse hold → MERGE.
+            # Handles: re-open a closed row, accumulate onto an open row, insert new.
+            # Covers both IS_NEW=0 and IS_NEW=1 (identical TBL hold behaviour).
             _run(ac, f"""
-                ;WITH RunHold AS (
-                    SELECT A.[WERKS],
+                MERGE [ARS_NL_TBL_HOLD_TRACKING] AS T
+                USING (
+                    SELECT A.[WERKS], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
                            TRY_CAST(A.[VAR_ART] AS BIGINT) AS VAR_ART,
                            A.[SZ],
                            SUM(ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0)) AS hold_qty
                     FROM [{ALLOC_TABLE}] A
-                    WHERE ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
-                    GROUP BY A.[WERKS], TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
-                )
-                UPDATE T SET
-                    T.[HOLD_QTY_INITIAL] = R.hold_qty,
-                    T.[HOLD_REM]         = R.hold_qty,
-                    T.[LAST_UPDATED]     = GETDATE(),
-                    T.[IS_CLOSED]        = 0,
-                    T.[CLOSED_DATE]      = NULL
-                FROM [ARS_NL_TBL_HOLD_TRACKING] T
-                INNER JOIN RunHold R
-                    ON  T.[WERKS]   = R.[WERKS]
-                    AND T.[VAR_ART] = R.[VAR_ART]
-                    AND T.[SZ]      = R.[SZ]
-            """)
-
-            # STEP B — insert new rows for NL/TBL SKUs first appearing in this
-            # run. The criterion is HOLD_QTY > 0 (this row has hold qty worth
-            # tracking), NOT ALLOC_QTY > 0 — the previous filter dropped every
-            # size row whose pool went entirely to HOLD with nothing shipped,
-            # which is exactly the case that needs to carry forward.
-            _run(ac, f"""
-                INSERT INTO [ARS_NL_TBL_HOLD_TRACKING]
-                    ([WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR], [VAR_ART], [SZ],
-                     [OPT_STATUS], [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM], [LAST_UPDATED])
-                SELECT
-                    A.[WERKS], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
-                    TRY_CAST(A.[VAR_ART] AS BIGINT),
-                    A.[SZ],
-                    W.[OPT_STATUS],
-                    GETDATE(),
-                    ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0),
-                    ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0),
-                    GETDATE()
-                FROM [{ALLOC_TABLE}] A
-                INNER JOIN [{FINAL_TABLE}] W
-                    ON  W.[WERKS]          = A.[WERKS]
-                    AND W.[MAJ_CAT]        = A.[MAJ_CAT]
-                    AND W.[GEN_ART_NUMBER] = A.[GEN_ART_NUMBER]
-                    AND ISNULL(W.[CLR],'') = ISNULL(A.[CLR],'')
-                LEFT JOIN [ARS_NL_TBL_HOLD_TRACKING] T
-                    ON  T.[WERKS]   = A.[WERKS]
-                    AND T.[VAR_ART] = TRY_CAST(A.[VAR_ART] AS BIGINT)
-                    AND T.[SZ]      = A.[SZ]
-                WHERE W.[OPT_STATUS] IN ('NL', 'TBL')
-                  AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
-                  AND T.[WERKS] IS NULL
+                    WHERE A.[OPT_TYPE] = 'TBL'
+                      AND ISNULL(TRY_CAST(A.[HOLD_QTY] AS FLOAT), 0) > 0
+                    GROUP BY A.[WERKS], A.[MAJ_CAT], A.[GEN_ART_NUMBER], A.[CLR],
+                             TRY_CAST(A.[VAR_ART] AS BIGINT), A.[SZ]
+                ) AS R
+                    ON T.[WERKS]   = R.[WERKS]
+                   AND T.[VAR_ART] = R.[VAR_ART]
+                   AND T.[SZ]      = R.[SZ]
+                WHEN MATCHED THEN
+                    UPDATE SET
+                        T.[HOLD_QTY_INITIAL] = CASE
+                            WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
+                            ELSE T.[HOLD_QTY_INITIAL] + R.hold_qty
+                        END,
+                        T.[HOLD_REM] = CASE
+                            WHEN T.[IS_CLOSED] = 1 THEN R.hold_qty
+                            ELSE T.[HOLD_REM] + R.hold_qty
+                        END,
+                        T.[IS_CLOSED]        = 0,
+                        T.[CLOSED_DATE]      = NULL,
+                        T.[LAST_UPDATED]     = GETDATE()
+                WHEN NOT MATCHED THEN
+                    INSERT (
+                        [WERKS], [MAJ_CAT], [GEN_ART_NUMBER], [CLR],
+                        [VAR_ART], [SZ], [OPT_STATUS],
+                        [LISTED_DATE], [HOLD_QTY_INITIAL], [HOLD_REM],
+                        [LAST_UPDATED], [IS_CLOSED]
+                    )
+                    VALUES (
+                        R.[WERKS], R.[MAJ_CAT], R.[GEN_ART_NUMBER], R.[CLR],
+                        R.[VAR_ART], R.[SZ], 'TBL',
+                        GETDATE(), R.hold_qty, R.hold_qty,
+                        GETDATE(), 0
+                    );
             """)
     except Exception as e:
         logger.warning(f"NL/TBL hold tracking failed: {e}")
@@ -2185,6 +2341,16 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     logger.info(f"  {'TOTAL':<45} {duration:>7}s")
     logger.info("="*60)
 
+    # Post-run sweep: count rows in each tracked table and classify the
+    # action relative to its pre-run existence. Single chokepoint — no
+    # per-stage instrumentation. Surfaced in the session row's
+    # TABLES_AFFECTED column for the UI's completion panel.
+    tables_affected: List[Dict[str, Any]] = []
+    try:
+        tables_affected = parked_history.tables_affected_summary(pre_existence)
+    except Exception as e:
+        logger.warning(f"[generate] tables_affected sweep failed: {e}")
+
     # Feed the session record before returning so the UI's session list
     # shows correct totals + step timings.
     summary.update({
@@ -2198,6 +2364,7 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                            if 'alloc_result' in locals() else None),
         "failed_majcats": alloc_failed_count,
         "step_timings":   step_timings,
+        "tables_affected": tables_affected,
     })
 
     return {
@@ -2251,7 +2418,7 @@ def alloc_progress(batch_id: str,
 
 class RetryFailedRequest(BaseModel):
     batch_id:         str
-    allocation_mode:  str = "python_parallel"  # "python_parallel" | "sql_parallel" | "pandas"
+    allocation_mode:  str = "pandas"  # "sequential" | "pandas"
     parallel_workers: int = 8
 
 
@@ -2310,34 +2477,12 @@ def retry_failed(req: RetryFailedRequest,
     )
 
     n_workers = max(2, min(8, int(req.parallel_workers or 4)))
-    mode = (req.allocation_mode or "python_parallel").lower()
-    if mode == "sql_parallel":
-        from app.services.rule_engine_parallel_sql import (
-            run_listing_and_allocation_sql_parallel,
-        )
-        result = run_listing_and_allocation_sql_parallel(
-            n_workers=n_workers,
-            batch_id=req.batch_id,
-            only_majcats=failed_mcs,
-        )
-    elif mode == "pandas":
-        from app.services.rule_engine_pandas import (
-            run_listing_and_allocation_pandas,
-        )
-        result = run_listing_and_allocation_pandas(
-            n_workers=n_workers,
-            batch_id=req.batch_id,
-            only_majcats=failed_mcs,
-        )
-    else:
-        from app.services.rule_engine_parallel_python import (
-            run_listing_and_allocation_python_parallel,
-        )
-        result = run_listing_and_allocation_python_parallel(
-            n_workers=n_workers,
-            batch_id=req.batch_id,
-            only_majcats=failed_mcs,
-        )
+    from app.services.rule_engine_pandas import run_listing_and_allocation_pandas
+    result = run_listing_and_allocation_pandas(
+        n_workers=n_workers,
+        batch_id=req.batch_id,
+        only_majcats=failed_mcs,
+    )
 
     # Re-read progress so the UI can update without a separate poll round-trip.
     with de.connect() as conn:
@@ -2370,6 +2515,124 @@ def alloc_batches(limit: int = 20,
             "success": True,
             "batches": list_recent_batches(conn, limit=limit),
         }
+
+
+# ---------------------------------------------------------------------------
+# Parked alloc runs — review queue (snapshot of ARS_ALLOC_WORKING per session)
+# ---------------------------------------------------------------------------
+class _RejectParkedRequest(BaseModel):
+    note: Optional[str] = None
+
+
+@router.get("/parked-runs")
+def list_parked_runs(include_rejected: bool = False,
+                     current_user: User = Depends(get_current_user)):
+    """List sessions whose alloc snapshot is still parked (awaiting review).
+    Pass `include_rejected=true` to also see sessions the user already
+    rejected (kept for audit until TTL purge)."""
+    from app.services import parked_history
+    return {
+        "success": True,
+        "runs": parked_history.list_parked_runs(
+            include_rejected=bool(include_rejected)
+        ),
+    }
+
+
+@router.get("/parked-runs/{session_id}")
+def get_parked_run_detail(session_id: str,
+                          page: int = 1,
+                          page_size: int = 100,
+                          which: str = "alloc",
+                          current_user: User = Depends(get_current_user)):
+    """Paginated detail rows for one parked session (for review UI).
+    `which` selects which parked table to read:
+      - 'alloc'   → ARS_ALLOC_PARKED (default)
+      - 'listing' → ARS_LISTING_WORKING_PARKED
+    """
+    from app.services import parked_history
+    return {
+        "success": True,
+        "data": parked_history.get_parked_detail(
+            session_id, page=page, page_size=page_size, which=which
+        ),
+    }
+
+
+@router.post("/parked-runs/{session_id}/approve")
+def approve_parked_run(session_id: str,
+                       current_user: User = Depends(get_current_user)):
+    """Promote a parked session into ARS_ALLOC_HISTORY. Idempotent — a
+    duplicate call returns `{already_approved: true}` without inserting."""
+    from app.services import parked_history
+    user = getattr(current_user, "username", None) or "user"
+    result = parked_history.approve_parked(session_id, user=user)
+    if result.get("error") and not result.get("already_approved"):
+        raise HTTPException(400, result["error"])
+    return {"success": True, **result}
+
+
+@router.post("/parked-runs/{session_id}/reject")
+def reject_parked_run(session_id: str,
+                      body: _RejectParkedRequest,
+                      current_user: User = Depends(get_current_user)):
+    """Mark a parked session as REJECTED. Rows stay in ARS_ALLOC_PARKED
+    (kept for audit until TTL purge)."""
+    from app.services import parked_history
+    user = getattr(current_user, "username", None) or "user"
+    result = parked_history.reject_parked(
+        session_id, user=user, note=body.note
+    )
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    return {"success": True, **result}
+
+
+@router.get("/alloc-history")
+def alloc_history(session_id: Optional[str] = None,
+                  date_from: Optional[str] = None,
+                  date_to:   Optional[str] = None,
+                  page: int = 1, page_size: int = 100,
+                  current_user: User = Depends(get_current_user)):
+    """Query approved alloc history (ARS_ALLOC_HISTORY). Filter by
+    session_id (exact) OR APPROVED_AT date range."""
+    from app.services import parked_history
+    return {
+        "success": True,
+        "data": parked_history.list_alloc_history(
+            session_id=session_id,
+            date_from=date_from, date_to=date_to,
+            page=page, page_size=page_size,
+        ),
+    }
+
+
+@router.get("/listing-history")
+def listing_history(session_id: Optional[str] = None,
+                    date_from: Optional[str] = None,
+                    date_to:   Optional[str] = None,
+                    page: int = 1, page_size: int = 100,
+                    current_user: User = Depends(get_current_user)):
+    """Query approved listing-working history (ARS_LISTING_WORKING_HISTORY).
+    Filter by session_id (exact) OR APPROVED_AT date range."""
+    from app.services import parked_history
+    return {
+        "success": True,
+        "data": parked_history.list_listing_history(
+            session_id=session_id,
+            date_from=date_from, date_to=date_to,
+            page=page, page_size=page_size,
+        ),
+    }
+
+
+@router.post("/parked-runs/purge")
+def purge_parked_runs(current_user: User = Depends(get_current_user)):
+    """Maintenance: delete PARKED rows older than 14d, REJECTED rows older
+    than 30d, and approved history rows older than allocation.history_retention_days
+    (default 30d, 0 = keep forever). Configurable via Settings → Allocation."""
+    from app.services import parked_history
+    return {"success": True, **parked_history.purge_old_parked()}
 
 
 # ---------------------------------------------------------------------------
@@ -2496,22 +2759,30 @@ def cancel_batch(req: CancelBatchRequest,
 
     de = get_data_engine()
     with de.connect() as conn:
-        # Step 3: mark queue rows
+        # Step 3: mark queue rows CANCELLED (terminal state).
+        # Crucially NOT 'FAILED' — a 'FAILED' row would be re-claimable by
+        # claim_next (STATUS='FAILED' AND ATTEMPTS<MAX) and resurrectable
+        # by mark_in_progress, defeating the cancel. CANCELLED is excluded
+        # from both filters so workers can never pick the rows back up.
+        # Also covers FAILED rows in the same batch (if a deadlock-failed
+        # row was about to be auto-retried, freeze it permanently too).
         res = conn.execute(text(f"""
             UPDATE {QUEUE_TABLE}
-               SET STATUS       = 'FAILED',
+               SET STATUS       = 'CANCELLED',
                    COMPLETED_AT = GETDATE(),
                    ERROR_MSG    = :msg
              WHERE BATCH_ID = :b
-               AND STATUS IN ('PENDING','IN_PROGRESS')
+               AND STATUS IN ('PENDING','IN_PROGRESS','FAILED')
         """), {"b": req.batch_id, "msg": f"cancelled by {user}"})
         cancelled = int(res.rowcount or 0)
 
-        # Step 4: mark session row (batch_id == session_id in async path).
+        # Step 4: mark session row CANCELLED so the orchestrator's post-
+        # Part-8 check sees it and short-circuits before Part 8.4 / 8.5 /
+        # 8.6 / parking. (batch_id == session_id in async path.)
         try:
             conn.execute(text(f"""
                 UPDATE {SESSIONS_TABLE}
-                   SET STATUS       = 'FAILED',
+                   SET STATUS       = 'CANCELLED',
                        COMPLETED_AT = GETDATE(),
                        ERROR_MSG    = :msg
                  WHERE SESSION_ID = :sid
@@ -3052,28 +3323,47 @@ def _compute_listing_summary(conn):
         wk_cols = _get_columns(conn, WORKING_TABLE)
         if "ALLOC_QTY" in wk_cols and "RDC" in wk_cols:
             hold_expr = "ISNULL(SUM(TRY_CAST([HOLD_QTY] AS FLOAT)), 0)" if "HOLD_QTY" in wk_cols else "0"
+            fnl_expr  = "ISNULL(MAX(TRY_CAST([FNL_Q] AS FLOAT)), 0)"     if "FNL_Q"    in wk_cols else "0"
             alloc_rows = conn.execute(text(f"""
-                SELECT [RDC],
-                       ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0) AS aq,
-                       {hold_expr} AS hq
-                FROM [{WORKING_TABLE}] WITH (NOLOCK)
-                GROUP BY [RDC]
+                ;WITH AllocByRdc AS (
+                    SELECT [RDC],
+                           ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0) AS aq,
+                           {hold_expr} AS hq
+                    FROM [{WORKING_TABLE}] WITH (NOLOCK)
+                    GROUP BY [RDC]
+                ),
+                PoolByRdc AS (
+                    SELECT [RDC], SUM(pool_sz) AS stock_avail
+                    FROM (
+                        SELECT [RDC], [MAJ_CAT], [GEN_ART_NUMBER], [CLR], [VAR_ART], [SZ],
+                               MAX(TRY_CAST([FNL_Q] AS FLOAT)) AS pool_sz
+                        FROM [{WORKING_TABLE}] WITH (NOLOCK)
+                        GROUP BY [RDC],[MAJ_CAT],[GEN_ART_NUMBER],[CLR],[VAR_ART],[SZ]
+                    ) T
+                    GROUP BY [RDC]
+                )
+                SELECT A.[RDC], A.aq, A.hq, ISNULL(P.stock_avail, 0) AS stock_avail
+                FROM AllocByRdc A
+                LEFT JOIN PoolByRdc P ON P.[RDC] = A.[RDC]
             """)).fetchall()
             for ar in alloc_rows:
                 rdc_key = ar[0]
                 aq = round(ar[1] or 0)
                 hq = round(ar[2] or 0)
+                sa = round(ar[3] or 0)
                 if rdc_key in by_rdc:
-                    by_rdc[rdc_key]["alloc_qty"] = aq
-                    by_rdc[rdc_key]["hold_qty"] = hq
+                    by_rdc[rdc_key]["alloc_qty"]   = aq
+                    by_rdc[rdc_key]["hold_qty"]    = hq
+                    by_rdc[rdc_key]["stock_avail"] = sa
                 else:
                     by_rdc[rdc_key] = {"rdc": rdc_key, "total": 0, "new": 0, "existing": 0,
-                                        "alloc_qty": aq, "hold_qty": hq}
+                                        "alloc_qty": aq, "hold_qty": hq, "stock_avail": sa}
 
-    # Ensure every row has hold_qty key
+    # Ensure every row has hold_qty / stock_avail keys
     for v in by_rdc.values():
         v.setdefault("hold_qty", 0)
         v.setdefault("alloc_qty", 0)
+        v.setdefault("stock_avail", 0)
 
     summary["by_rdc"] = sorted(by_rdc.values(), key=lambda x: x["rdc"])
 
@@ -3125,6 +3415,43 @@ def _compute_listing_summary(conn):
                 pass
 
     summary["by_maj_cat"] = by_maj_cat
+
+    # by_maj_cat_rdc: (MAJ_CAT × RDC) breakdown — stock available and alloc qty.
+    # Used by the MAJ_CAT modal to pivot one row per MAJ_CAT with per-RDC columns.
+    if _table_exists(conn, WORKING_TABLE):
+        wk_cols = _get_columns(conn, WORKING_TABLE)
+        if "ALLOC_QTY" in wk_cols and "MAJ_CAT" in wk_cols and "RDC" in wk_cols and "FNL_Q" in wk_cols:
+            try:
+                mr_rows = conn.execute(text(f"""
+                    ;WITH PoolPerSize AS (
+                        SELECT [MAJ_CAT], [RDC], [GEN_ART_NUMBER], [CLR], [VAR_ART], [SZ],
+                               MAX(TRY_CAST([FNL_Q] AS FLOAT)) AS pool_sz
+                        FROM [{WORKING_TABLE}] WITH (NOLOCK)
+                        GROUP BY [MAJ_CAT],[RDC],[GEN_ART_NUMBER],[CLR],[VAR_ART],[SZ]
+                    )
+                    SELECT A.[MAJ_CAT], A.[RDC],
+                           ROUND(ISNULL(SUM(TRY_CAST(A.[ALLOC_QTY] AS FLOAT)), 0), 0) AS aq,
+                           ROUND(ISNULL(P.stock_avail, 0), 0) AS stock_avail
+                    FROM [{WORKING_TABLE}] A WITH (NOLOCK)
+                    LEFT JOIN (
+                        SELECT [MAJ_CAT], [RDC], SUM(pool_sz) AS stock_avail
+                        FROM PoolPerSize
+                        GROUP BY [MAJ_CAT], [RDC]
+                    ) P ON P.[MAJ_CAT] = A.[MAJ_CAT] AND P.[RDC] = A.[RDC]
+                    WHERE A.[MAJ_CAT] IS NOT NULL AND A.[RDC] IS NOT NULL
+                    GROUP BY A.[MAJ_CAT], A.[RDC], P.stock_avail
+                    ORDER BY A.[MAJ_CAT], A.[RDC]
+                """)).fetchall()
+                summary["by_maj_cat_rdc"] = [
+                    {"maj_cat": r[0], "rdc": r[1], "alloc_qty": int(r[2] or 0), "stock_avail": int(r[3] or 0)}
+                    for r in mr_rows if r[0] and r[1]
+                ]
+            except Exception:
+                summary["by_maj_cat_rdc"] = []
+        else:
+            summary["by_maj_cat_rdc"] = []
+    else:
+        summary["by_maj_cat_rdc"] = []
 
     # GEN_ART_NUMBER is BIGINT — must CAST for string concatenation
     opt_key = "ISNULL([MAJ_CAT],'') + '|' + ISNULL(CAST([GEN_ART_NUMBER] AS NVARCHAR(50)),'') + '|' + ISNULL([CLR],'')"
@@ -3242,6 +3569,48 @@ def _compute_listing_summary(conn):
     # Listed-store count (distinct WERKS in current listing) — for "5 / 346 active"
     summary["listed_store_count"] = summary.get("totals", {}).get("stores", 0)
 
+    # Alloc + Hold by SSN and DIV — drives the new season/division charts
+    if _table_exists(conn, WORKING_TABLE):
+        wk_cols = _get_columns(conn, WORKING_TABLE)
+        if "ALLOC_QTY" in wk_cols and "GEN_ART_NUMBER" in wk_cols:
+            hold_col = "ROUND(ISNULL(SUM(TRY_CAST(W.[HOLD_QTY] AS FLOAT)),0),0)" if "HOLD_QTY" in wk_cols else "0"
+            try:
+                rows = conn.execute(text(f"""
+                    SELECT MP.[SSN],
+                           ROUND(ISNULL(SUM(TRY_CAST(W.[ALLOC_QTY] AS FLOAT)),0),0) AS aq,
+                           {hold_col} AS hq
+                    FROM [{WORKING_TABLE}] W WITH (NOLOCK)
+                    LEFT JOIN [vw_master_product] MP WITH (NOLOCK)
+                          ON W.[GEN_ART_NUMBER] = MP.[ARTICLE_NUMBER]
+                    WHERE MP.[SSN] IS NOT NULL
+                    GROUP BY MP.[SSN]
+                    ORDER BY aq DESC
+                """)).fetchall()
+                summary["by_ssn"] = [
+                    {"ssn": r[0], "alloc_qty": int(r[1] or 0), "hold_qty": int(r[2] or 0)}
+                    for r in rows if r[0]
+                ]
+            except Exception:
+                summary["by_ssn"] = []
+            try:
+                rows = conn.execute(text(f"""
+                    SELECT MP.[DIV],
+                           ROUND(ISNULL(SUM(TRY_CAST(W.[ALLOC_QTY] AS FLOAT)),0),0) AS aq,
+                           {hold_col} AS hq
+                    FROM [{WORKING_TABLE}] W WITH (NOLOCK)
+                    LEFT JOIN [vw_master_product] MP WITH (NOLOCK)
+                          ON W.[GEN_ART_NUMBER] = MP.[ARTICLE_NUMBER]
+                    WHERE MP.[DIV] IS NOT NULL
+                    GROUP BY MP.[DIV]
+                    ORDER BY aq DESC
+                """)).fetchall()
+                summary["by_div"] = [
+                    {"div": r[0], "alloc_qty": int(r[1] or 0), "hold_qty": int(r[2] or 0)}
+                    for r in rows if r[0]
+                ]
+            except Exception:
+                summary["by_div"] = []
+
     # Top stores by allocated qty — drives the new Top/Bottom N stores chart
     if _table_exists(conn, FINAL_TABLE):
         fc = _get_columns(conn, FINAL_TABLE)
@@ -3249,19 +3618,57 @@ def _compute_listing_summary(conn):
             try:
                 hold_sel = ("ROUND(ISNULL(SUM(TRY_CAST([HOLD_QTY] AS FLOAT)), 0), 0)"
                             if "HOLD_QTY" in fc else "0")
-                rows = conn.execute(text(f"""
-                    SELECT [WERKS],
-                           ROUND(ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0), 0) AS aq,
-                           {hold_sel} AS hq,
-                           COUNT(*) AS rows_cnt
-                    FROM [{FINAL_TABLE}]
-                    GROUP BY [WERKS]
-                """)).fetchall()
-                summary["by_store"] = [
-                    {"werks": r[0], "alloc_qty": int(r[1] or 0),
-                     "hold_qty": int(r[2] or 0), "rows": int(r[3] or 0)}
-                    for r in rows if r[0]
-                ]
+                # Join ARS_LISTING_WORKING for MJ_REQ (total store requirement
+                # across all MAJ_CATs in this run).
+                wt_exists = _table_exists(conn, "ARS_LISTING_WORKING")
+                wt_cols   = _get_columns(conn, "ARS_LISTING_WORKING") if wt_exists else []
+                has_req   = wt_exists and "MJ_REQ" in wt_cols and "WERKS" in wt_cols
+                hold_sel_f = ("ROUND(ISNULL(SUM(TRY_CAST(f.[HOLD_QTY] AS FLOAT)), 0), 0)"
+                              if "HOLD_QTY" in fc else "0")
+                if has_req:
+                    rows = conn.execute(text(f"""
+                        SELECT f.[WERKS],
+                               ROUND(ISNULL(SUM(TRY_CAST(f.[ALLOC_QTY] AS FLOAT)), 0), 0) AS aq,
+                               {hold_sel_f} AS hq,
+                               COUNT(*) AS rows_cnt,
+                               ROUND(ISNULL(MAX(w.mj_req_store), 0), 0) AS mj_req
+                        FROM [{FINAL_TABLE}] f
+                        LEFT JOIN (
+                            -- MAX per (WERKS, MAJ_CAT) de-duplicates OPT rows that share
+                            -- the same MAJ_CAT-level MJ_REQ, then SUM across MAJ_CATs.
+                            SELECT [WERKS],
+                                   SUM(mj_req_per_mc) AS mj_req_store
+                            FROM (
+                                SELECT [WERKS], [MAJ_CAT],
+                                       MAX(ISNULL(TRY_CAST([MJ_REQ] AS FLOAT), 0)) AS mj_req_per_mc
+                                FROM [ARS_LISTING_WORKING]
+                                GROUP BY [WERKS], [MAJ_CAT]
+                            ) mc
+                            GROUP BY [WERKS]
+                        ) w ON w.[WERKS] = f.[WERKS]
+                        GROUP BY f.[WERKS]
+                    """)).fetchall()
+                    summary["by_store"] = [
+                        {"werks": r[0], "alloc_qty": int(r[1] or 0),
+                         "hold_qty": int(r[2] or 0), "rows": int(r[3] or 0),
+                         "mj_req": int(r[4] or 0)}
+                        for r in rows if r[0]
+                    ]
+                else:
+                    rows = conn.execute(text(f"""
+                        SELECT [WERKS],
+                               ROUND(ISNULL(SUM(TRY_CAST([ALLOC_QTY] AS FLOAT)), 0), 0) AS aq,
+                               {hold_sel} AS hq,
+                               COUNT(*) AS rows_cnt
+                        FROM [{FINAL_TABLE}]
+                        GROUP BY [WERKS]
+                    """)).fetchall()
+                    summary["by_store"] = [
+                        {"werks": r[0], "alloc_qty": int(r[1] or 0),
+                         "hold_qty": int(r[2] or 0), "rows": int(r[3] or 0),
+                         "mj_req": 0}
+                        for r in rows if r[0]
+                    ]
             except Exception:
                 summary["by_store"] = []
 
