@@ -584,14 +584,41 @@ def calculate_msa(
         # Use provided date and filters, or load all data if not provided
         date_filter = body.date if body.date else ""
         filters = body.filters if body.filters else {}
-        
-        logger.info(f"Loading data with filters - date: '{date_filter}', filters: {filters}")
-        df, _ = data_service.apply_filters(date_filter, filters)
-        
+
+        # ST_CD is used ONLY as a cascading parent to narrow the SLOC dropdown
+        # in the frontend.  It must NOT be passed as a SQL WHERE clause here —
+        # doing so restricts data to a single RDC warehouse even when the user
+        # selects SLOCs across multiple RDCs.  The SLOC filter already constrains
+        # the data to the correct warehouses.
+        filters_for_sql = {k: v for k, v in filters.items() if k != "ST_CD"}
+        if "ST_CD" in filters:
+            logger.info(
+                f"[msa] ST_CD filter ({filters['ST_CD']}) stripped from SQL — "
+                f"SLOC selection already constrains data to correct RDC(s)"
+            )
+
+        logger.info(f"Loading data with filters - date: '{date_filter}', filters: {filters_for_sql}")
+        df, _ = data_service.apply_filters(date_filter, filters_for_sql)
+
+        # Detect which requested RDCs actually have data for the chosen SLOCs
+        requested_rdcs = filters.get("ST_CD", [])
+        covered_rdcs = []
+        missing_rdcs = []
+        if requested_rdcs and "ST_CD" in df.columns:
+            covered_rdcs = sorted(df["ST_CD"].dropna().unique().tolist())
+            missing_rdcs = [r for r in requested_rdcs if r not in covered_rdcs]
+            if missing_rdcs:
+                logger.warning(
+                    f"[msa] RDC(s) {missing_rdcs} have no data for SLOC(s) {body.slocs} "
+                    f"on date '{date_filter}' — they will be absent from results"
+                )
+
         # Calculate MSA
         results = data_service.calculate(df, body.slocs, body.threshold)
-        
+
         logger.info(f"✅ MSA calculation complete: {results['row_counts']}")
+        results["covered_rdcs"] = covered_rdcs
+        results["missing_rdcs"] = missing_rdcs
         
         # ================================================================
         # CREATE SEQUENCE RECORD AND QUEUE BACKGROUND STORAGE JOB (IF ENABLED)
@@ -761,10 +788,13 @@ def run_msa_legacy(
     """
     try:
         service = MSAService(db)
-        
+
+        # Strip ST_CD — only a UI cascading parent, must not restrict SQL to one RDC
+        legacy_filters = {k: v for k, v in (body.filters or {}).items() if k != "ST_CD"}
+
         # Apply filters
-        df, _ = service.apply_filters("", body.filters)
-        
+        df, _ = service.apply_filters("", legacy_filters)
+
         # Calculate
         results = service.calculate(df, body.slocs, body.threshold)
         

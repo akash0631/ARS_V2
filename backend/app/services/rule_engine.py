@@ -237,6 +237,7 @@ def _discover_primary_grids(conn) -> Dict[str, List[str]]:
             SELECT grid_name, hierarchy_columns, ISNULL(grid_group, 'Primary')
             FROM [ARS_GRID_BUILDER]
             WHERE UPPER(status) = 'ACTIVE'
+            ORDER BY grid_name
         """)).fetchall()
     except Exception as e:
         logger.warning(f"_discover_primary_grids: {e}")

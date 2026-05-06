@@ -244,8 +244,8 @@ def run_listing_and_allocation_pandas(
     size_threshold: float = 0.6,
     min_size_count: int = 3,
     tbl_trivial_factor: float = 0.5,
-    pri_ct_check_rl:  bool = True,
-    pri_ct_check_tbc: bool = True,
+    pri_ct_check_rl:  bool = False,
+    pri_ct_check_tbc: bool = False,
     rl_mbq_cap_pct:  float = 0.0,
     tbc_mbq_cap_pct: float = 0.0,
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only
@@ -258,6 +258,14 @@ def run_listing_and_allocation_pandas(
     n_workers = max(MIN_WORKERS, min(MAX_WORKERS, int(n_workers or DEFAULT_WORKERS)))
     batch_id = batch_id or make_batch_id()
     engine = get_data_engine()
+
+    # Audit-log the PRI/MBQ-cap gate state actually received by the engine.
+    # Helps diagnose UI-toggle vs. server-state mismatches.
+    logger.info(
+        f"[engine] batch={batch_id} | "
+        f"RL: {'PRI>=100 strict' if pri_ct_check_rl else f'MBQ-cap {rl_mbq_cap_pct}%'} | "
+        f"TBC: {'PRI>=100 strict' if pri_ct_check_tbc else f'MBQ-cap {tbc_mbq_cap_pct}%'}"
+    )
 
     result: Dict = {
         "batch_id":       batch_id,
@@ -301,6 +309,7 @@ def run_listing_and_allocation_pandas(
                 conn, listed_table, alloc_table, msa_var_table,
                 pri_ct_check_rl=pri_ct_check_rl,
                 pri_ct_check_tbc=pri_ct_check_tbc,
+                opt_types=opt_types,
             )
             logger.info(f"[B] alloc rows = {base_rows}")
             if base_rows == 0:
@@ -778,8 +787,11 @@ def _build_mbq_budget(working_df: pd.DataFrame, cap_pct: float) -> Dict[str, flo
     Returns empty dict (disables cap) when the required columns are absent."""
     if 'MJ_MBQ' not in working_df.columns or 'MJ_STK_TTL' not in working_df.columns:
         return {}
+    # Deterministic: sort by WERKS first so drop_duplicates always keeps the
+    # same row across runs even if upstream input order varies.
     store_data = (
         working_df[['WERKS', 'MJ_MBQ', 'MJ_STK_TTL']]
+        .sort_values(['WERKS', 'MJ_MBQ', 'MJ_STK_TTL'], kind='mergesort')
         .drop_duplicates(subset=['WERKS'])
     )
     budget: Dict[str, float] = {}
@@ -821,8 +833,8 @@ def _run_majcat_waterfall(
     alloc_df: pd.DataFrame,
     working_df: pd.DataFrame,
     grids: Dict[str, Dict],
-    pri_ct_check_rl: bool = True,
-    pri_ct_check_tbc: bool = True,
+    pri_ct_check_rl: bool = False,
+    pri_ct_check_tbc: bool = False,
     rl_mbq_cap_pct: float = 0.0,
     tbc_mbq_cap_pct: float = 0.0,
     hold_dict: Optional[Dict[Tuple, float]] = None,
@@ -1031,13 +1043,23 @@ def _rerank_opt_priority_pandas(
 
     opt_cols = ['WERKS', 'GEN_ART_NUMBER', 'CLR', 'OPT_PRIORITY_TIER',
                 'SIZE_RATIO', 'SEC_CT%', 'MAX_DAILY_SALE', 'OPT_REQ_WH']
-    opt_level = sub[opt_cols].drop_duplicates(
-        subset=['WERKS', 'GEN_ART_NUMBER', 'CLR']
-    ).copy()
+    # Deterministic: pre-sort by the OPT identity columns BEFORE drop_duplicates,
+    # so that "first row of each (WERKS, GEN_ART, CLR)" is reproducible regardless
+    # of upstream input order.
+    opt_level = (
+        sub[opt_cols]
+        .sort_values(['WERKS', 'GEN_ART_NUMBER', 'CLR'], kind='mergesort')
+        .drop_duplicates(subset=['WERKS', 'GEN_ART_NUMBER', 'CLR'])
+        .copy()
+    )
 
+    # Final sort for rank assignment. The trailing tie-breakers
+    # (GEN_ART_NUMBER, CLR) guarantee no two rows share a complete sort key,
+    # so cumcount produces stable ranks across runs.
     opt_level = opt_level.sort_values(
-        by=['WERKS', 'OPT_PRIORITY_TIER', 'SIZE_RATIO', 'SEC_CT%', 'MAX_DAILY_SALE', 'OPT_REQ_WH'],
-        ascending=[True, True, False, False, False, False],
+        by=['WERKS', 'OPT_PRIORITY_TIER', 'SIZE_RATIO', 'SEC_CT%',
+            'MAX_DAILY_SALE', 'OPT_REQ_WH', 'GEN_ART_NUMBER', 'CLR'],
+        ascending=[True, True, False, False, False, False, True, True],
         kind='mergesort',
     )
     opt_level['_new_rank'] = opt_level.groupby('WERKS', sort=False).cumcount() + 1
@@ -1334,10 +1356,16 @@ def _propagate_skips_to_alloc(
     PRI_CT skips from prior types are visible to _run_band before it starts.
     SKIP_REASON is set to the ALLOC_REMARKS from working_df so the trigger value
     (e.g. 'SKIP_PRI_BROKEN(pri=85.0)') is preserved at the size level."""
-    skipped_df = working_df.loc[
-        working_df['ALLOC_STATUS'] == 'SKIPPED',
-        OPT_KEYS + ['ALLOC_REMARKS'],
-    ].drop_duplicates(subset=OPT_KEYS)
+    # Deterministic: sort by OPT_KEYS + ALLOC_REMARKS so the kept row for any
+    # duplicated OPT key is reproducible across runs.
+    skipped_df = (
+        working_df.loc[
+            working_df['ALLOC_STATUS'] == 'SKIPPED',
+            OPT_KEYS + ['ALLOC_REMARKS'],
+        ]
+        .sort_values(OPT_KEYS + ['ALLOC_REMARKS'], kind='mergesort')
+        .drop_duplicates(subset=OPT_KEYS)
+    )
     if skipped_df.empty:
         return
     # Build OPT_KEYS tuple → ALLOC_REMARKS mapping for O(1) lookup
@@ -1515,8 +1543,11 @@ def _revalidate_after_band(
         # Bring extras onto band rows by joining on OPT_KEYS (one row per OPT
         # in working_df, so this maps each alloc row to its extras values).
         if extras:
+            # Deterministic: sort by OPT_KEYS + extras before drop_duplicates
+            # so first-row-wins is reproducible across runs.
             opt_extras = (
                 working_df[OPT_KEYS + extras]
+                .sort_values(OPT_KEYS + extras, kind='mergesort')
                 .drop_duplicates(subset=OPT_KEYS)
             )
             joined = band_ship.merge(opt_extras, on=OPT_KEYS, how='inner')
@@ -1540,7 +1571,10 @@ def _revalidate_after_band(
         new_req = (working_df[req_rem].to_numpy() - decrement.to_numpy())
         working_df[req_rem] = np.maximum(new_req, 0.0)
 
-    # (3) Recompute H_<grid>_REM = (REQ_REM > ACS_SKIP_FACTOR*ACS_D) AND (GH=1)
+    # (3) Recompute H_<grid>_REM = (REQ_REM >= ACS_SKIP_FACTOR*ACS_D) AND (GH=1)
+    # Inclusive threshold (>=): a slot at exactly half-display still counts as
+    # eligible — matches the all-or-nothing dispatch model where an OPT keeps
+    # going as long as MJ_REQ_REM hasn't dropped strictly below the floor.
     acs = working_df['ACS_D'].to_numpy() if 'ACS_D' in work_cols else \
           np.zeros(len(working_df), dtype='float64')
     pri_h_cols: List[str] = []
@@ -1553,7 +1587,7 @@ def _revalidate_after_band(
             continue
         req = working_df[req_rem].to_numpy()
         gh  = working_df[gh_col].to_numpy()
-        new_h = ((req > rne.ACS_SKIP_FACTOR * acs) & (gh == 1)).astype('float64')
+        new_h = ((req >= rne.ACS_SKIP_FACTOR * acs) & (gh == 1)).astype('float64')
         working_df[h_rem] = new_h
         pri_h_cols.append(h_rem)
         pri_gh_cols.append(gh_col)
@@ -1645,10 +1679,16 @@ def _revalidate_after_band(
     # Build OPT_KEYS → ALLOC_REMARKS mapping so SKIP_REASON carries the
     # exact trigger value (e.g. "SKIP_PRI_BROKEN(pri=85.0)") instead of
     # the generic 'REVALIDATION_SKIP'.
-    newly_skipped = working_df.loc[
-        working_df['ALLOC_STATUS'] == 'SKIPPED',
-        OPT_KEYS + ['ALLOC_REMARKS'],
-    ].drop_duplicates(subset=OPT_KEYS)
+    # Deterministic: sort by OPT_KEYS + ALLOC_REMARKS before drop_duplicates
+    # so the kept ALLOC_REMARKS string is reproducible across runs.
+    newly_skipped = (
+        working_df.loc[
+            working_df['ALLOC_STATUS'] == 'SKIPPED',
+            OPT_KEYS + ['ALLOC_REMARKS'],
+        ]
+        .sort_values(OPT_KEYS + ['ALLOC_REMARKS'], kind='mergesort')
+        .drop_duplicates(subset=OPT_KEYS)
+    )
     if not newly_skipped.empty:
         remarks_map: dict = dict(
             zip(

@@ -40,7 +40,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from app.database.session import get_data_engine
-from app.services.pend_alc_service import write_pend_alc
+from app.services.pend_alc_service import write_pend_alc, adjust_msa_after_pend_insert
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +531,25 @@ def approve_parked(session_id: str, user: str) -> Dict[str, Any]:
                 logger.warning(f"[pend_alc] write failed for {session_id}: {pe}")
                 approved_by_table["pend_alc_rows"] = 0
 
+            # Immediately adjust ARS_MSA_TOTAL/GEN_ART/VAR_ART FNL_Q so the
+            # next alloc run sees the updated available stock without requiring
+            # a full MSA recalculation. Only runs after PEND_ALC INSERTs.
+            try:
+                msa_adjusted = adjust_msa_after_pend_insert(conn, session_id=session_id)
+                logger.info(
+                    f"[pend_alc] msa_adjusted session={session_id}: "
+                    f"total={msa_adjusted['msa_total']} "
+                    f"var={msa_adjusted['msa_var_art']} gen={msa_adjusted['msa_gen_art']}"
+                )
+                approved_by_table["msa_adjusted"] = msa_adjusted
+            except Exception as mp:
+                logger.warning(f"[pend_alc] msa_adjusted failed (non-fatal): {mp}")
+                approved_by_table["msa_adjusted"] = {"error": str(mp)}
+
         # Sum new + pre-existing for the headline number.
+        # Skip non-int values (e.g. msa_patch dict, pend_alc_rows dict).
         total = (
-            sum(v for k, v in approved_by_table.items() if k != "pend_alc_rows") +
+            sum(v for v in approved_by_table.values() if isinstance(v, int)) +
             sum(already_in_history.values())
         )
         # Merge for the by_table response so the caller always sees both.

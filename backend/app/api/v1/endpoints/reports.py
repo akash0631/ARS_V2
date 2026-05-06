@@ -16,24 +16,38 @@ from app.models.rbac import User
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
-_ALLOWED_COLS = {'RDC','ST_CD','MATNR','QTY','MAJ_CAT','DIV','SUB_DIV','SEG',
-                 'GEN_ART_NUMBER','CLR','SZ','SSN','RNG_SEG','MACRO_MVGR','MICRO_MVGR','FAB'}
+_ALLOWED_COLS = {'SESSION_ID','RDC','ST_CD','MATNR','QTY','MAJ_CAT',
+                 'GEN_ART_NUMBER','CLR','ALLOC_MODE','SOURCE',
+                 'BDC_QTY','DO_QTY','PEND_QTY','DO_NUMBER','IS_CLOSED'}
 
 _BASE_SQL = """
     SELECT
-        PA.RDC, PA.ST_CD, PA.MATNR, PA.QTY,
-        MP.MAJ_CAT, MP.DIV, MP.SUB_DIV, MP.SEG,
-        MP.GEN_ART_NUMBER, MP.CLR, MP.SZ, MP.SSN, MP.RNG_SEG,
-        MP.MACRO_MVGR, MP.MICRO_MVGR, MP.FAB
-    FROM dbo.ARS_pend_alc PA WITH (NOLOCK)
-    LEFT JOIN dbo.VW_MASTER_PRODUCT MP WITH (NOLOCK)
-        ON CAST(PA.MATNR AS NVARCHAR(50)) = MP.ARTICLE_NUMBER
+        PA.SESSION_ID,
+        PA.RDC,
+        PA.ST_CD,
+        PA.ARTICLE_NUMBER       AS MATNR,
+        PA.ALLOC_QTY            AS QTY,
+        PA.MAJ_CAT,
+        PA.GEN_ART_NUMBER,
+        PA.CLR,
+        PA.ALLOC_MODE,
+        PA.SOURCE,
+        PA.BDC_QTY,
+        PA.DO_QTY,
+        PA.PEND_QTY,
+        PA.DO_NUMBER,
+        PA.IS_CLOSED,
+        PA.APPROVED_AT,
+        PA.LAST_BDC_AT,
+        PA.LAST_DO_AT,
+        PA.REMARKS
+    FROM dbo.ARS_PEND_ALC PA WITH (NOLOCK)
 """
 
 def _check_table(engine):
     with engine.connect() as conn:
         return conn.execute(text(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_pend_alc'"
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME='ARS_PEND_ALC'"
         )).scalar() > 0
 
 

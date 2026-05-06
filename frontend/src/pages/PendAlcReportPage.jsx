@@ -8,8 +8,8 @@ import toast from 'react-hot-toast'
 import { Download, RefreshCw, Table2, Search, X, Filter, Eye, EyeOff } from 'lucide-react'
 import { C } from '@/theme/colors'
 
-// Default visible columns
-const DEFAULT_VISIBLE = ['RDC','ST_CD','MATNR','QTY','MAJ_CAT','DIV','SEG','GEN_ART_NUMBER','CLR']
+// Default visible columns (ARS_PEND_ALC table only — no master product join)
+const DEFAULT_VISIBLE = ['RDC','ST_CD','MATNR','QTY','MAJ_CAT','GEN_ART_NUMBER','CLR','ALLOC_MODE','PEND_QTY']
 
 export default function PendAlcReportPage() {
   const [data, setData] = useState(null)
@@ -113,7 +113,7 @@ export default function PendAlcReportPage() {
           <h1 style={{fontSize:20,fontWeight:800,margin:0,display:'flex',alignItems:'center',gap:10}}>
             <Table2 size={20} color={C.primary}/> Pending Allocation Report
           </h1>
-          <p style={{fontSize:12,color:C.textMuted,margin:'4px 0 0'}}>ARS_pend_alc + VW_MASTER_PRODUCT</p>
+          <p style={{fontSize:12,color:C.textMuted,margin:'4px 0 0'}}>ARS_PEND_ALC</p>
         </div>
         <div style={{display:'flex',gap:8}}>
           <button onClick={()=>setShowColPicker(!showColPicker)} style={{

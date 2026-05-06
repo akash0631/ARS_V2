@@ -37,7 +37,28 @@
       "Bash(pip install:*)",
       "Bash(node --check ../frontend/src/pages/UploadPage.jsx)",
       "mcp__claude_ai_sap_hht__ars_jobs",
-      "Bash(xargs ls *)"
+      "Bash(xargs ls *)",
+      "Bash(npx --no-install eslint src/pages/ListingPage.jsx)",
+      "Bash(npx --no-install esbuild --loader=jsx --bundle=false src/pages/ListingPage.jsx)",
+      "Bash(echo \"exit=$?\")",
+      "Read(//tmp/**)",
+      "Bash(npx --no-install esbuild --loader=jsx --bundle=false --log-level=error src/pages/ListingPage.jsx)",
+      "Bash(npx --no-install esbuild --loader:.jsx=jsx --bundle=false --log-level=error src/pages/ListingPage.jsx)",
+      "Bash(./venv/Scripts/python -c \"from app.services import parked_history; print\\('OK'\\); print\\('public funcs:', [n for n in dir\\(parked_history\\) if not n.startswith\\('_'\\) and callable\\(getattr\\(parked_history,n\\)\\)]\\)\")",
+      "Bash(./venv/Scripts/python -c \"from app.api.v1.endpoints import listing; print\\('listing.py imports OK'\\); print\\('router:', listing.router.prefix\\)\")",
+      "Bash(./venv/Scripts/python -c \"from app.services import listing_sessions as ls; print\\('OK'\\); print\\('get_session has tables_affected key:', 'tables_affected' in ls.get_session.__code__.co_consts.__str__\\(\\) if hasattr\\(ls.get_session,'__code__'\\) else 'unknown'\\)\")",
+      "Bash(backend/venv/Scripts/python doc/generate_parked_alloc_doc.py)",
+      "Bash(/e/ARS/backend/venv/Scripts/python /e/ARS/doc/generate_parked_alloc_doc.py)",
+      "Bash(/e/ARS/backend/venv/Scripts/python -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(/e/ARS/backend/venv/Scripts/pip list *)",
+      "Bash(/c/Users/Administrator/AppData/Local/Programs/Python/Python314/python /e/ARS/doc/generate_parked_alloc_doc.py)",
+      "Bash(/c/Users/Administrator/AppData/Local/Programs/Python/Python314/python /e/ARS/doc/generate_listing_process_doc.py)",
+      "Bash(/e/ARS/backend/venv/Scripts/python -c \"from app.services import parked_history; print\\('OK'\\); print\\('targets:', [t['label'] for t in parked_history._SNAPSHOT_TARGETS]\\); print\\('public:', sorted\\(n for n in dir\\(parked_history\\) if not n.startswith\\('_'\\) and callable\\(getattr\\(parked_history,n\\)\\)\\)\\)\")",
+      "Bash(/e/ARS/backend/venv/Scripts/python -c \"from app.api.v1.endpoints import listing; print\\('listing.py imports OK'\\)\")",
+      "Bash(/e/ARS/backend/venv/Scripts/python *)",
+      "Bash(npx --no-install esbuild --loader:.jsx=jsx --bundle=false --log-level=error /e/ARS/frontend/src/pages/ListingPage.jsx)",
+      "Bash(/e/ARS/frontend/node_modules/.bin/esbuild --loader:.jsx=jsx --bundle=false --log-level=error /e/ARS/frontend/src/pages/ListingPage.jsx)",
+      "Bash(echo \"JSX exit=$?\")"
     ]
   }
 }

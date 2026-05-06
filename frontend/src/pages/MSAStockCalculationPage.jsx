@@ -75,6 +75,7 @@ export default function MSAStockCalculationPage() {
   
   const [cascadingFilterSelection, setCascadingFilterSelection] = useState({});
   const [autoStoreResults, setAutoStoreResults] = useState(true); // Auto-store checkbox
+  const [missingRdcs, setMissingRdcs] = useState([]); // RDCs with no data for chosen SLOCs
   
   // Ref to track if initialization is complete (prevents auto-load on mount)
   const isInitializedRef = useRef(false);
@@ -595,6 +596,7 @@ export default function MSAStockCalculationPage() {
     }
 
     setLoading(true);
+    setMissingRdcs([]); // Clear previous RDC coverage warning
     const threshold = parseInt(document.getElementById('msa-threshold')?.value || 25);
 
     console.log('🧮 Calculating MSA:', { slocs: slocList, threshold, date, filters, autoStore: autoStoreResults });
@@ -650,8 +652,21 @@ export default function MSAStockCalculationPage() {
           setSaveStatus(`✅ Calculation complete! Rows: ${result.row_counts.msa}`);
         }
         
+        // Warn about RDCs that had no data for the selected SLOCs
+        const newMissing = result.missing_rdcs || [];
+        setMissingRdcs(newMissing);
+        if (newMissing.length > 0) {
+          const missingList = newMissing.join(', ');
+          const coveredList = (result.covered_rdcs || []).join(', ') || 'none';
+          toast.error(
+            `RDC(s) ${missingList} have NO data for the selected SLOC(s) — they are absent from MSA results. Only ${coveredList} contributed data. Select SLOCs that exist for all RDCs.`,
+            { duration: 8000 }
+          );
+          console.warn(`[msa] Missing RDCs: ${missingList} | Covered: ${coveredList}`);
+        }
+
         setLoading(false);
-        
+
         // Scroll to results with a small delay to ensure DOM is updated
         setTimeout(() => {
           const resultsElement = document.querySelector('[id*="msa-results"]');
@@ -663,7 +678,7 @@ export default function MSAStockCalculationPage() {
       })
       .catch(err => {
         console.error('❌ Error calculating MSA:', err);
-        const timeoutMsg = err.code === 'ECONNABORTED' 
+        const timeoutMsg = err.code === 'ECONNABORTED'
           ? 'Calculation timed out. Try with fewer filters or a smaller date range.'
           : err.response?.data?.detail || err.message;
         setSaveStatus(`❌ Error: ${timeoutMsg}`);
@@ -1063,15 +1078,42 @@ export default function MSAStockCalculationPage() {
 
         <div className="card-body">
           {/* Show selected SLOCs from filter */}
-          {(filters['SLOC']?.length > 0 || cascadingFilterSelection['SLOC']?.length > 0) && (
-            <div className="mb-4 p-3 bg-primary-50 rounded-lg border border-primary-200">
-              <div className="text-[10px] font-semibold text-primary-700 uppercase mb-1.5">SLOCs to Calculate</div>
-              <div className="flex flex-wrap gap-1.5">
-                {(filters['SLOC'] || cascadingFilterSelection['SLOC'] || []).map(slocCode => (
-                  <span key={slocCode} className="inline-flex items-center bg-primary-500 text-white px-2 py-0.5 rounded-full text-[10px] font-medium">
-                    {slocCode}
-                  </span>
-                ))}
+          {(filters['SLOC']?.length > 0 || cascadingFilterSelection['SLOC']?.length > 0) && (() => {
+            const selectedSlocs = filters['SLOC'] || cascadingFilterSelection['SLOC'] || []
+            const fewSlocs = selectedSlocs.length < 3
+            return (
+              <div className={`mb-4 p-3 rounded-lg border ${fewSlocs ? 'bg-amber-50 border-amber-300' : 'bg-primary-50 border-primary-200'}`}>
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className={`text-[10px] font-semibold uppercase ${fewSlocs ? 'text-amber-700' : 'text-primary-700'}`}>
+                    SLOCs to Calculate ({selectedSlocs.length})
+                  </div>
+                  {fewSlocs && (
+                    <span className="text-[9px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded-full border border-amber-300">
+                      ⚠ Only {selectedSlocs.length} SLOC{selectedSlocs.length > 1 ? 's' : ''} — MSA will cover limited warehouses. Use "Select All" to include all SLOCs.
+                    </span>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {selectedSlocs.map(slocCode => (
+                    <span key={slocCode} className={`inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium ${fewSlocs ? 'bg-amber-500 text-white' : 'bg-primary-500 text-white'}`}>
+                      {slocCode}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* Missing RDC warning banner */}
+          {missingRdcs.length > 0 && (
+            <div className="mb-4 p-3 rounded-lg border bg-red-50 border-red-300 flex items-start gap-2">
+              <AlertTriangle size={14} className="text-red-600 mt-0.5 shrink-0" />
+              <div>
+                <div className="text-[10px] font-bold text-red-700 uppercase mb-0.5">RDC Coverage Warning</div>
+                <div className="text-[11px] text-red-700">
+                  <strong>{missingRdcs.join(', ')}</strong> {missingRdcs.length === 1 ? 'has' : 'have'} no data for the selected SLOC(s) and {missingRdcs.length === 1 ? 'is' : 'are'} absent from MSA results.
+                  Select SLOCs that exist in all chosen RDCs, or use "Select All" SLOCs.
+                </div>
               </div>
             </div>
           )}

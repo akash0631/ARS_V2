@@ -67,8 +67,8 @@ def run_listing_and_allocation(
     size_threshold: float = 0.6,
     min_size_count: int = 3,
     tbl_trivial_factor: float = 0.5,
-    pri_ct_check_rl: bool = True,    # apply PRI_CT%>=100 gate to RL?
-    pri_ct_check_tbc: bool = True,   # apply PRI_CT%>=100 gate to TBC?
+    pri_ct_check_rl: bool = False,   # apply PRI_CT%>=100 gate to RL? Default False = MBQ-cap mode
+    pri_ct_check_tbc: bool = False,  # apply PRI_CT%>=100 gate to TBC? Default False = MBQ-cap mode
     rl_mbq_cap_pct: float = 0.0,     # when pri_ct_check_rl=False, cap RL at X% of MJ_MBQ
     tbc_mbq_cap_pct: float = 0.0,    # when pri_ct_check_tbc=False, cap TBC at X% of MJ_MBQ
     opt_types: Optional[List[str]] = None,  # restrict waterfall to these OPT_TYPEs only (default = all)
@@ -77,6 +77,13 @@ def run_listing_and_allocation(
     Orchestrates Stages A–D. See docs/NEW_RULE_ENGINE_SPEC.md.
     """
     t0 = time.time()
+    # Audit-log the PRI/MBQ-cap gate state actually received by the engine.
+    # Helps diagnose UI-toggle vs. server-state mismatches.
+    logger.info(
+        f"[rule_engine_new] "
+        f"RL: {'PRI>=100 strict' if pri_ct_check_rl else f'MBQ-cap {rl_mbq_cap_pct}%'} | "
+        f"TBC: {'PRI>=100 strict' if pri_ct_check_tbc else f'MBQ-cap {tbc_mbq_cap_pct}%'}"
+    )
     result = {
         "listed_opts": 0,
         "dropped_opts": 0,
@@ -113,7 +120,8 @@ def run_listing_and_allocation(
     # STAGE B — explode to VAR_ART × SZ
     base_rows = _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
                                   pri_ct_check_rl=pri_ct_check_rl,
-                                  pri_ct_check_tbc=pri_ct_check_tbc)
+                                  pri_ct_check_tbc=pri_ct_check_tbc,
+                                  opt_types=opt_types)
     logger.info(f"[B] alloc rows = {base_rows}")
     if base_rows == 0:
         result["duration_sec"] = round(time.time() - t0, 1)
@@ -203,8 +211,8 @@ def _stage_a_add_columns(conn, working_table):
 
 def _stage_a_apply_rules(conn, working_table, size_threshold, min_size_count,
                           tbl_trivial_factor,
-                          pri_ct_check_rl: bool = True,
-                          pri_ct_check_tbc: bool = True,
+                          pri_ct_check_rl: bool = False,
+                          pri_ct_check_tbc: bool = False,
                           rl_mbq_cap_pct: float = 0.0,
                           tbc_mbq_cap_pct: float = 0.0):
     """
@@ -354,7 +362,13 @@ def _stage_a_assign_rank(conn, working_table):
                          ISNULL([SIZE_RATIO], 0)                    DESC,
                          ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0)   DESC,
                          ISNULL([MAX_DAILY_SALE], 0)               DESC,
-                         ISNULL([OPT_REQ_WH], 0)                   DESC
+                         ISNULL([OPT_REQ_WH], 0)                   DESC,
+                         -- Deterministic tie-breakers: identity columns so two
+                         -- OPTs that tie on all priority columns still get a
+                         -- reproducible rank across runs.
+                         [MAJ_CAT]                                  ASC,
+                         [GEN_ART_NUMBER]                           ASC,
+                         ISNULL([CLR], '')                          ASC
                    ) AS rk
             FROM Base
         )
@@ -464,7 +478,12 @@ def _rerank_for_next_opt_type(
                          ISNULL([SIZE_RATIO], 0)                   DESC,
                          ISNULL(TRY_CAST([SEC_CT%] AS FLOAT), 0)  DESC,
                          ISNULL([MAX_DAILY_SALE], 0)              DESC,
-                         ISNULL([OPT_REQ_WH], 0)                  DESC
+                         ISNULL([OPT_REQ_WH], 0)                  DESC,
+                         -- Deterministic tie-breakers — identity columns
+                         -- guarantee a reproducible rank across runs.
+                         [MAJ_CAT]                                ASC,
+                         [GEN_ART_NUMBER]                         ASC,
+                         ISNULL([CLR], '')                        ASC
                    ) AS rk
             FROM Base
         )
@@ -516,12 +535,19 @@ def _stage_a_materialize_listed(conn, working_table, listed_table) -> int:
 # ───────────────────────────────────────────────────────────────
 def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
                      pri_ct_check_rl: bool = True,
-                     pri_ct_check_tbc: bool = True) -> int:
+                     pri_ct_check_tbc: bool = True,
+                     opt_types: Optional[List[str]] = None) -> int:
     # Build the OPT_TYPE list that must enforce PRI_CT%=100 — mirrors R06.
     enforced = ["'TBL'"]
     if pri_ct_check_rl:  enforced.append("'RL'")
     if pri_ct_check_tbc: enforced.append("'TBC'")
     enforced_in = ", ".join(enforced)
+
+    # OPT_TYPE subset filter — only explode selected types when running a subset.
+    ot_filter = ""
+    if opt_types:
+        ot_in = ", ".join(f"'{ot}'" for ot in opt_types)
+        ot_filter = f"AND ISNULL(L.[OPT_TYPE],'') IN ({ot_in})"
 
     _run(conn, f"IF OBJECT_ID('{alloc_table}','U') IS NOT NULL DROP TABLE [{alloc_table}]")
     _run(conn, f"""
@@ -579,6 +605,7 @@ def _stage_b_explode(conn, listed_table, alloc_table, msa_var_table,
           -- consuming RDC pool in Stage C and being zeroed post-waterfall.
           AND ISNULL(TRY_CAST(L.[MJ_REQ] AS FLOAT), 0)
               > 0.5 * ISNULL(NULLIF(TRY_CAST(L.[ACS_D] AS FLOAT), 0), 18.0)
+          {ot_filter}
     """)
     cnt = conn.execute(text(f"SELECT COUNT(*) FROM [{alloc_table}]")).scalar()
     return int(cnt or 0)
@@ -701,7 +728,8 @@ def _discover_primary_grids(conn) -> Dict[str, Dict]:
     try:
         rows = conn.execute(text(
             "SELECT grid_name, hierarchy_columns, ISNULL(grid_group,'Primary') "
-            "FROM [ARS_GRID_BUILDER] WHERE UPPER(status) = 'ACTIVE'"
+            "FROM [ARS_GRID_BUILDER] WHERE UPPER(status) = 'ACTIVE' "
+            "ORDER BY grid_name"
         )).fetchall()
     except Exception as e:
         logger.warning(f"_discover_primary_grids: {e}")

@@ -778,20 +778,49 @@ async def upload_delivery_order(
         # Rebuild legacy ARS_pend_alc (BDC-based; kept for backward compat)
         _rebuild_pend_alc(engine)
 
-        # Also deduct from ARS_PEND_ALC (ARS-sourced pending table) and close holds
+        # Also deduct from ARS_PEND_ALC (ARS-sourced pending table) and update
+        # ARS_BDC_HISTORY so the audit trail shows DO_RECEIVED + STATUS.
+        # VENDOR=source warehouse (RDC), RECEIVING STORE=destination (ST_CD).
         try:
-            from app.services.pend_alc_service import apply_do_deductions
+            import uuid as _uuid
+            from app.services.pend_alc_service import (
+                apply_do_deductions, update_bdc_history_with_do, log_operation,
+            )
+            do_batch_id = _uuid.uuid4().hex[:12]
             do_rows = [
-                {"rdc": str(r["RECEIVING STORE"]),
-                 "article_number": str(r["MATERIAL NO"]),
-                 "do_qty": float(r["DO_QTY"])}
+                {"rdc":               str(r["VENDOR"]).strip(),
+                 "st_cd":             str(r["RECEIVING STORE"]).strip(),
+                 "article_number":    str(r["MATERIAL NO"]).strip(),
+                 "do_qty":            float(r["DO_QTY"]),
+                 "allocation_number": str(r["Allocation Number"]).strip()}
                 for _, r in do_df.iterrows()
                 if float(r.get("DO_QTY") or 0) > 0
             ]
             if do_rows:
                 with engine.connect() as _pc:
-                    _updated = apply_do_deductions(_pc, do_rows)
-                    logger.info(f"[pend_alc] DO upload: {_updated} ARS_PEND_ALC rows updated")
+                    _do_res   = apply_do_deductions(_pc, do_rows)
+                    _hist_res = update_bdc_history_with_do(_pc, do_rows)
+                    total_qty = sum(float(r.get("do_qty") or 0) for r in do_rows)
+                    log_operation(
+                        _pc,
+                        op_type="DO",
+                        op_key=do_batch_id,
+                        payload={
+                            "input_rows":      do_rows,
+                            "pend_updates":    _do_res["pend_updates"],
+                            "history_updates": _hist_res["history_updates"],
+                        },
+                        summary=f"DO file upload {do_batch_id}: {len(do_rows)} lines, "
+                                f"{int(total_qty)} units",
+                        rows_affected=_do_res["touched"],
+                        qty_total=total_qty,
+                        created_by=getattr(current_user, "username", None),
+                    )
+                    logger.info(
+                        f"[pend_alc] DO upload: {_do_res['touched']} ARS_PEND_ALC updated, "
+                        f"{_hist_res['touched']} ARS_BDC_HISTORY rows updated, "
+                        f"batch={do_batch_id}"
+                    )
         except Exception as _pe:
             logger.warning(f"[pend_alc] apply_do_deductions skipped: {_pe}")
 

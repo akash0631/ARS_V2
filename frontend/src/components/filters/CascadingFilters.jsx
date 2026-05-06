@@ -167,27 +167,41 @@ const CascadingFilters = ({
     let updatedSelection;
 
     if (currentSelection.includes(value)) {
-      // Remove if already selected
       updatedSelection = currentSelection.filter(v => v !== value);
     } else {
-      // Add if not selected
       updatedSelection = [...currentSelection, value];
     }
 
-    const updatedFilters = {
-      ...selectedFilters,
-      [filterName]: updatedSelection
-    };
+    const updatedFilters = { ...selectedFilters, [filterName]: updatedSelection };
 
     // Clear child selections when parent changes
     const filterIndex = filterHierarchy.findIndex(f => f.name === filterName);
     if (filterIndex >= 0 && filterIndex < filterHierarchy.length - 1) {
-      // Clear all child levels
       for (let i = filterIndex + 1; i < filterHierarchy.length; i++) {
         updatedFilters[filterHierarchy[i].name] = [];
       }
     }
 
+    onSelectionChange(updatedFilters);
+  };
+
+  // Select ALL available values for a filter level
+  const handleSelectAll = (filterName) => {
+    const values = distinctValues[filterName] || [];
+    const updatedFilters = { ...selectedFilters, [filterName]: [...values] };
+    onSelectionChange(updatedFilters);
+  };
+
+  // Clear all selections for a filter level
+  const handleClearAll = (filterName) => {
+    const updatedFilters = { ...selectedFilters, [filterName]: [] };
+    // Also clear children
+    const filterIndex = filterHierarchy.findIndex(f => f.name === filterName);
+    if (filterIndex >= 0) {
+      for (let i = filterIndex + 1; i < filterHierarchy.length; i++) {
+        updatedFilters[filterHierarchy[i].name] = [];
+      }
+    }
     onSelectionChange(updatedFilters);
   };
 
@@ -212,12 +226,38 @@ const CascadingFilters = ({
       }
     }
 
+    const allSelected = values.length > 0 && values.every(v => selected.includes(v))
+
     return (
       <div key={filterLevel.name} className="mb-6">
-        <label className="block text-sm font-semibold text-gray-700 mb-2">
-          {filterLevel.label}
-          {isLoading && <span className="ml-2 text-blue-500 text-xs">Loading...</span>}
-        </label>
+        <div className="flex items-center justify-between mb-2">
+          <label className="block text-sm font-semibold text-gray-700">
+            {filterLevel.label}
+            {isLoading && <span className="ml-2 text-blue-500 text-xs">Loading...</span>}
+          </label>
+
+          {/* Select All / Clear All buttons — hidden when disabled or no values */}
+          {!isDisabled && values.length > 0 && (
+            <div className="flex gap-2">
+              <button
+                onClick={() => handleSelectAll(filterLevel.name)}
+                disabled={isLoading || allSelected}
+                className="text-[10px] px-2 py-0.5 rounded border border-blue-400 text-blue-600 hover:bg-blue-50 disabled:opacity-40 disabled:cursor-not-allowed font-medium"
+                type="button"
+              >
+                Select All ({values.length})
+              </button>
+              <button
+                onClick={() => handleClearAll(filterLevel.name)}
+                disabled={isLoading || selected.length === 0}
+                className="text-[10px] px-2 py-0.5 rounded border border-gray-300 text-gray-500 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed font-medium"
+                type="button"
+              >
+                Clear
+              </button>
+            </div>
+          )}
+        </div>
 
         {error && (
           <div className="mb-3 p-2 bg-red-100 border border-red-400 text-red-700 text-xs rounded">
@@ -252,7 +292,7 @@ const CascadingFilters = ({
 
         {selected.length > 0 && (
           <div className="mt-2 text-xs text-gray-500">
-            {selected.length} selected: {selected.join(', ')}
+            {selected.length} of {values.length} selected: {selected.join(', ')}
           </div>
         )}
       </div>

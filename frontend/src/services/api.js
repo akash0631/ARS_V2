@@ -523,11 +523,34 @@ export const holdDashboardAPI = {
 
 // ============== Pending Allocation (ARS_PEND_ALC) ==============
 export const pendAlcAPI = {
-  summary:   ()                       => api.get('/pend-alc/summary'),
-  sessions:  ()                       => api.get('/pend-alc/sessions'),
-  detail:    (params = {})            => api.get('/pend-alc/detail', { params }),
-  doHistory: (limit = 100)            => api.get('/pend-alc/do-history', { params: { limit } }),
-  doUpdate:  (rows)                   => api.post('/pend-alc/do-update', { rows }),
+  summary:     ()               => api.get('/pend-alc/summary'),
+  sessions:    ()               => api.get('/pend-alc/sessions'),
+  detail:      (params = {})    => api.get('/pend-alc/detail', { params }),
+  doHistory:   (limit = 100)    => api.get('/pend-alc/do-history', { params: { limit } }),
+  doUpdate:    (rows)           => api.post('/pend-alc/do-update', { rows }),
+  bdcPreview:  (params = {})    => api.get('/pend-alc/bdc-preview', { params }),
+  bdcGenerate: (params = {})    => api.post('/pend-alc/bdc-generate', null,
+                                    { params, responseType: 'blob', timeout: 120000,
+                                      paramsSerializer: { indexes: null } }),
+  bdcHistory:  (params = {})    => api.get('/pend-alc/bdc-history', { params }),
+  manualUpload:(rows)           => api.post('/pend-alc/manual-upload', { rows }),
+  reco:        (params = {})    => api.get('/pend-alc/reco', { params }),
+  recoSummary: ()               => api.get('/pend-alc/reco-summary'),
+
+  // Store BDC schedule (Mon-Sat per store)
+  scheduleList:        ()                    => api.get('/pend-alc/schedule'),
+  scheduleStoresFor:   (date)                => api.get('/pend-alc/schedule/stores-for-date', { params: { date } }),
+  scheduleUpsert:      (rows)                => api.post('/pend-alc/schedule', { rows }),
+  scheduleDelete:      (st_cd)               => api.delete(`/pend-alc/schedule/${encodeURIComponent(st_cd)}`),
+
+  // Operations log + revert (BDC / DO / MANUAL)
+  operationsList:      (params = {})         => api.get('/pend-alc/operations', { params }),
+  operationsPreview:   (op_id)               => api.post(`/pend-alc/operations/${op_id}/preview-revert`),
+  operationsRevert:    (op_id, note)         => api.post(`/pend-alc/operations/${op_id}/revert`,
+                                                  { note: note || null },
+                                                  { params: { confirm: true } }),
+  operationsBackfillBdc: (confirm = false)   => api.post('/pend-alc/operations/backfill-bdc',
+                                                  null, { params: { confirm } }),
 }
 
 export default api

@@ -96,9 +96,12 @@ class GenerateRequest(BaseModel):
     default_acs_d: float = 18.0        # Default ACS_D when NULL/0 (used in OPT_TYPE fallback classification)
     min_size_count: int = 3            # Min sizes required for TBL listing (alternative to 60% ratio)
     # PRI_CT% >= 100 gate (R06 + revalidation SKIP_PRI_BROKEN). TBL always enforces.
-    # When False, the opt_type is allowed in even if primary grid coverage is < 100%.
-    pri_ct_check_rl: bool = True
-    pri_ct_check_tbc: bool = True
+    # When False, the opt_type is allowed in even if primary grid coverage is < 100%
+    # (and the boosted MBQ-cap path is activated instead). Default False — matches
+    # the frontend toggle's default state so missing-field requests don't silently
+    # flip behavior to strict-gate.
+    pri_ct_check_rl: bool = False
+    pri_ct_check_tbc: bool = False
     # MBQ cap (only active when the corresponding pri_ct_check is False).
     # Prevents over-allocation by capping total SHIP_QTY per (WERKS, OPT_TYPE) at
     # cap_pct% of MJ_MBQ. e.g. 110 → store can receive at most 110% of its MAJ_CAT target.
@@ -522,7 +525,10 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
             logger.warning(f"[generate] cancel detected at stage={stage} — aborting")
             raise InterruptedError(f"cancelled by user (stage={stage})")
 
-    # Auto-save current variables to DB for next session
+    # Auto-save current variables to DB for next session.
+    # Was previously wrapped in `except: pass` — that swallowed save failures
+    # and made toggle changes appear to "not stick" between sessions. Now logs
+    # the error so the failure is visible in API logs.
     try:
         with de.connect() as sc:
             _save_listing_settings(sc, {
@@ -546,8 +552,8 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
                 "rl_mbq_cap_pct": str(req.rl_mbq_cap_pct),
                 "tbc_mbq_cap_pct": str(req.tbc_mbq_cap_pct),
             })
-    except Exception:
-        pass  # non-critical
+    except Exception as e:
+        logger.error(f"[generate] failed to persist listing settings: {e}")
 
     # ── Full pipeline: MSA calc → Grid build → Listing ──────────────
     pipeline_msg = ""

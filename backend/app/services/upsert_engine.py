@@ -400,8 +400,14 @@ class UpsertEngine:
             # Helper: TRY_CAST for type conversion
             def cast(col, alias="s"):
                 ttype = target_columns.get(col, "NVARCHAR(MAX)")
-                if ttype.upper().startswith(("NVARCHAR", "VARCHAR", "NCHAR", "CHAR", "NTEXT", "TEXT")):
+                upper = ttype.upper()
+                if upper.startswith(("NVARCHAR", "VARCHAR", "NCHAR", "CHAR", "NTEXT", "TEXT")):
                     return f"{alias}.[{col}]"
+                # Integer-family targets: pivot via FLOAT first. SQL Server's
+                # TRY_CAST returns NULL for decimal-suffixed string literals
+                # like '18.00' when the target is INT/BIGINT/SMALLINT/TINYINT.
+                if upper.startswith(("INT", "BIGINT", "SMALLINT", "TINYINT")):
+                    return f"TRY_CAST(TRY_CAST({alias}.[{col}] AS FLOAT) AS {ttype})"
                 return f"TRY_CAST({alias}.[{col}] AS {ttype})"
 
             # PK join condition
@@ -704,10 +710,19 @@ class UpsertEngine:
         def get_cast_expr(col: str, source_alias: str = "source") -> str:
             """Generate TRY_CAST expression for a column based on target type."""
             target_type = target_columns.get(col, "NVARCHAR(MAX)")
+            upper = target_type.upper()
             # For string types, no cast needed
-            if target_type.upper().startswith(("NVARCHAR", "VARCHAR", "NCHAR", "CHAR", "NTEXT", "TEXT")):
+            if upper.startswith(("NVARCHAR", "VARCHAR", "NCHAR", "CHAR", "NTEXT", "TEXT")):
                 return f"{source_alias}.[{col}]"
-            # For other types, use TRY_CAST
+            # Integer-family targets: pivot via FLOAT first. SQL Server's
+            # TRY_CAST returns NULL for decimal-suffixed string literals
+            # like '18.00' when the target is INT/BIGINT/SMALLINT/TINYINT,
+            # which silently nulled out values from CSVs that Excel saved
+            # with a decimal format. Casting to FLOAT first strips the
+            # decimal, then the second cast truncates to the integer type.
+            if upper.startswith(("INT", "BIGINT", "SMALLINT", "TINYINT")):
+                return f"TRY_CAST(TRY_CAST({source_alias}.[{col}] AS FLOAT) AS {target_type})"
+            # All other numeric/date/time/binary types — direct TRY_CAST is fine.
             return f"TRY_CAST({source_alias}.[{col}] AS {target_type})"
 
         # JOIN condition on PKs - need to cast source PK to target type

@@ -7,7 +7,7 @@ import toast from 'react-hot-toast'
 import {
   TrendingUp, Upload, Plus, Trash2, RefreshCw,
   Eye, AlertTriangle, CheckCircle2,
-  Search, Loader2, UploadCloud
+  Search, Loader2, UploadCloud, Download
 } from 'lucide-react'
 import { C } from '@/theme/colors'
 const sInput = { height:28, fontSize:11, padding:'0 8px', borderRadius:5, border:`1px solid ${C.inputBorder}`, outline:'none', color:C.text, background:'#fff' }
@@ -122,6 +122,15 @@ export default function TrendUploadPage() {
             <button onClick={()=>{ trendsAPI.listTables().then(r=>{ const d=r.data?.data; setTables(d?.tables||(Array.isArray(d)?d:[])) }) }}
               title="Refresh tables" style={sBtn(C.primaryLight,C.primary,C.primaryBd)}>
               <RefreshCw size={11}/> Refresh
+            </button>
+            <button onClick={() => {
+              const csv = 'Store_Code,MAJ_CAT,Article_Number,Trend_Qty,Report_Date\nS001,FOOTWEAR,1000000001,120,2026-04-27\nS002,APPAREL,1000000002,85,2026-04-27\n'
+              const a = document.createElement('a')
+              a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }))
+              a.download = 'Trend_Upload_Sample.csv'
+              a.click()
+            }} title="Download sample template" style={sBtn('#fff',C.textSub,C.inputBorder)}>
+              <Download size={11}/> Sample Template
             </button>
           </div>
         </div>

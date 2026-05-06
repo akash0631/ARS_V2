@@ -38,6 +38,10 @@ const ListingLogsPage        = lazy(() => import('@/pages/ListingLogsPage'))
 const PendAlcReportPage          = lazy(() => import('@/pages/PendAlcReportPage'))
 const PendingAllocationPage      = lazy(() => import('@/pages/PendingAllocationPage'))
 const PendingDeliveryOrderPage   = lazy(() => import('@/pages/PendingDeliveryOrderPage'))
+const PendAlcRecoPage            = lazy(() => import('@/pages/PendAlcRecoPage'))
+const StoreBdcSchedulePage       = lazy(() => import('@/pages/StoreBdcSchedulePage'))
+const PendAlcOperationsPage      = lazy(() => import('@/pages/PendAlcOperationsPage'))
+const ManualPendAlcPage          = lazy(() => import('@/pages/ManualPendAlcPage'))
 const HoldDashboardPage      = lazy(() => import('@/pages/HoldDashboardPage'))
 const ChecklistPage          = lazy(() => import('@/pages/ChecklistPage'))
 const TrendUploadPage        = lazy(() => import('@/pages/TrendUploadPage'))
@@ -137,8 +141,12 @@ export default function App() {
         <Route path="reports/pend-alc" element={<PendAlcReportPage />} />
         <Route path="reports/hold" element={<ErrorBoundary><HoldDashboardPage /></ErrorBoundary>} />
         {/* Pending Allocation Lifecycle */}
-        <Route path="pend-alc/overview"  element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
-        <Route path="pend-alc/do-entry"  element={<ErrorBoundary><PendingDeliveryOrderPage /></ErrorBoundary>} />
+        <Route path="pend-alc/overview"      element={<ErrorBoundary><PendingAllocationPage /></ErrorBoundary>} />
+        <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />
+        <Route path="pend-alc/do-entry"      element={<ErrorBoundary><PendingDeliveryOrderPage /></ErrorBoundary>} />
+        <Route path="pend-alc/reco"          element={<ErrorBoundary><PendAlcRecoPage /></ErrorBoundary>} />
+        <Route path="pend-alc/schedule"      element={<ErrorBoundary><StoreBdcSchedulePage /></ErrorBoundary>} />
+        <Route path="pend-alc/operations"    element={<ErrorBoundary><PendAlcOperationsPage /></ErrorBoundary>} />
         {/* Allocations */}
         <Route path="allocations" element={<AllocationsPage />} />
         <Route path="allocations/new" element={<NewAllocationPage />} />

@@ -3,8 +3,8 @@ import {
   LayoutDashboard, Table2, Upload, PackageCheck, Users, Shield, Eye, ScrollText,
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
-  Clock, Truck, FileText, ClipboardCheck, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
-  HardDrive, Code2, Lock
+  Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
+  HardDrive, Code2, Lock, CalendarDays, History
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -47,14 +47,18 @@ const contributionItems = [
 
 // Reports submenu
 const reportsItems = [
-  { label: 'Pending Allocation', path: '/reports/pend-alc', icon: ClipboardCheck, permission: 'REPORTS_PEND_ALC' },
-  { label: 'Hold Dashboard',     path: '/reports/hold',     icon: Lock },
+  { label: 'Hold Dashboard', path: '/reports/hold', icon: Lock },
 ]
 
 // Pending Allocation lifecycle submenu
 const pendAlcItems = [
-  { label: 'Overview',     path: '/pend-alc/overview', icon: PackageCheck },
-  { label: 'Daily DO Entry', path: '/pend-alc/do-entry', icon: Truck },
+  { label: 'Overview',         path: '/pend-alc/overview',     icon: PackageCheck },
+  { label: 'Report',           path: '/reports/pend-alc',      icon: ClipboardCheck, permission: 'REPORTS_PEND_ALC' },
+  { label: 'Manual Entry',     path: '/pend-alc/manual-entry', icon: ClipboardList },
+  { label: 'Daily DO Entry',   path: '/pend-alc/do-entry',     icon: Truck },
+  { label: 'Reconciliation',   path: '/pend-alc/reco',         icon: BarChart3 },
+  { label: 'BDC Schedule',     path: '/pend-alc/schedule',     icon: CalendarDays },
+  { label: 'Operations Log',   path: '/pend-alc/operations',   icon: History },
 ]
 
 // Data Validation submenu
