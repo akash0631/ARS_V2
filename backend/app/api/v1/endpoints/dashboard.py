@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from sqlalchemy import func, text
+from sqlalchemy import func, text, case
 
 from app.database.session import get_db, get_data_db
 from app.security.dependencies import get_current_user
@@ -34,19 +34,22 @@ def get_dashboard_stats(
         ).scalar() or 0
         
         # Upload job stats
+        # `case` is a top-level SQLAlchemy expression, not a SQL function — use
+        # `case(...)` not `func.case(...)`. The latter raises in SA 2.0+:
+        # "Function.__init__() got an unexpected keyword argument 'else_'".
         upload_stats = db.query(
             func.count(UploadJob.id).label('total'),
-            func.sum(func.case((UploadJob.status == 'completed', 1), else_=0)).label('completed'),
-            func.sum(func.case((UploadJob.status == 'running', 1), else_=0)).label('running'),
-            func.sum(func.case((UploadJob.status == 'failed', 1), else_=0)).label('failed'),
+            func.sum(case((UploadJob.status == 'completed', 1), else_=0)).label('completed'),
+            func.sum(case((UploadJob.status == 'running', 1), else_=0)).label('running'),
+            func.sum(case((UploadJob.status == 'failed', 1), else_=0)).label('failed'),
         ).first()
-        
+
         # Export job stats
         export_stats = db.query(
             func.count(ExportJob.id).label('total'),
-            func.sum(func.case((ExportJob.status == 'completed', 1), else_=0)).label('completed'),
-            func.sum(func.case((ExportJob.status == 'running', 1), else_=0)).label('running'),
-            func.sum(func.case((ExportJob.status == 'failed', 1), else_=0)).label('failed'),
+            func.sum(case((ExportJob.status == 'completed', 1), else_=0)).label('completed'),
+            func.sum(case((ExportJob.status == 'running', 1), else_=0)).label('running'),
+            func.sum(case((ExportJob.status == 'failed', 1), else_=0)).label('failed'),
         ).first()
         
         # Get table count and total rows from data database
