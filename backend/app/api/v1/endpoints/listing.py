@@ -2047,21 +2047,13 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         logger.warning(f"Auto-create {FINAL_TABLE} failed: {e}")
     t0 = _time_step(f"Part 7 (Working table + Hierarchy + ALLOC_FLAG → {working_rows} rows)", t0)
 
-    # ── Part 8 — NEW rule engine (list OPTs + allocate VAR_ART × SZ) ──
+    # ── Part 8 — Rule engine (list OPTs + allocate VAR_ART × SZ) ──
     # Spec: docs/NEW_RULE_ENGINE_SPEC.md
-    # Old rule_engine.py / listing_allocator.py are preserved for reference
-    # but no longer called. The `if False` block below documents the old call
-    # site so reviewers can compare signatures.
-    if False:  # OLD — kept for reference only
-        from app.services.rule_engine import run_rule_based_allocation
-        with de.connect() as ac:
-            _ = run_rule_based_allocation(
-                conn=ac,
-                final_table=FINAL_TABLE,
-                alloc_table=ALLOC_TABLE,
-                size_threshold=req.stock_threshold_pct,
-            )
-
+    # Modes:
+    #   "pandas"     → rule_engine_pandas.run_listing_and_allocation_pandas (default)
+    #   "sequential" → rule_engine_new.run_listing_and_allocation
+    # Older modules (rule_engine.py, listing_allocator.py) moved to
+    # app/services/_legacy/ — see that folder's README for the migration map.
     alloc_rows = 0
     alloc_batch_id = None
     alloc_failed_count = 0
