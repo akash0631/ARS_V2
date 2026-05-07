@@ -1,14 +1,8 @@
 name: Infra Runbook (manual)
 
-# Manual-only workflow for prod migrations. Apply 021/022/023 to Azure SQL
-# from a GitHub-hosted runner when the operator's machine cannot reach
-# Azure (e.g., off corp VPN or behind a TLS-intercepting proxy).
-#
-# Does NOT modify any application code, build, or deploy step. Existing
-# deploy.yml is untouched. No Service Principal required.
-#
-# Requires: Azure SQL "Allow Azure services and resources to access this
-# server" = ON, OR a firewall rule allowing GitHub Actions runner IPs.
+# Manual-only workflow for prod migrations on Azure SQL.
+# Uses pymssql (pip-only, no system ODBC driver). Requires Azure SQL
+# "Allow Azure services" firewall toggle ON.
 
 on:
   workflow_dispatch:
@@ -37,16 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install msodbcsql18 + pyodbc
-        run: |
-          set -euxo pipefail
-          . /etc/os-release
-          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
-          curl -fsSL "https://packages.microsoft.com/config/ubuntu/${VERSION_ID}/prod.list" | sudo tee /etc/apt/sources.list.d/mssql-release.list
-          sudo sed -i "s|deb |deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] |g" /etc/apt/sources.list.d/mssql-release.list
-          sudo apt-get update
-          sudo ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc-dev
-          pip install pyodbc
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pymssql
+        run: pip install pymssql==2.3.1
 
       - name: Run
         env:
@@ -57,31 +47,32 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           python <<'PY'
-          import os, re, pyodbc
+          import os, re, pymssql
           mode = os.environ['MODE']
-          cs = (
-              "DRIVER={ODBC Driver 18 for SQL Server};"
-              f"SERVER={os.environ['SQL_SERVER']};"
-              f"DATABASE={os.environ['SQL_DB']};"
-              f"UID={os.environ['SQL_USER']};"
-              f"PWD={os.environ['SQL_PWD']};"
-              "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30"
+          cn = pymssql.connect(
+              server=os.environ['SQL_SERVER'],
+              user=os.environ['SQL_USER'],
+              password=os.environ['SQL_PWD'],
+              database=os.environ['SQL_DB'],
+              port=1433,
+              autocommit=True,
+              login_timeout=30,
           )
-          cn = pyodbc.connect(cs, autocommit=True)
           cu = cn.cursor()
-          srv, db, who = cu.execute("SELECT @@SERVERNAME, DB_NAME(), SUSER_NAME()").fetchone()
+          cu.execute("SELECT @@SERVERNAME, DB_NAME(), SUSER_NAME()")
+          srv, db, who = cu.fetchone()
           print(f"Connected: server={srv} db={db} as={who} mode={mode}")
 
-          existing = [r[0] for r in cu.execute("""
+          cu.execute("""
               SELECT name FROM sys.objects
               WHERE type='U' AND name IN
                 ('Master_FOCUS_LIST','ARS_ALLOC_HEALTH_HISTORY','Master_ST_SPECIFIC')
               ORDER BY name
-          """).fetchall()]
+          """)
+          existing = [r[0] for r in cu.fetchall()]
           print(f"Target tables already present: {existing or 'none'}")
-          n = cu.execute(
-              "SELECT COUNT(*) FROM sys.objects WHERE type='U' AND name LIKE 'Master_ALC_INPUT%'"
-          ).fetchone()[0]
+          cu.execute("SELECT COUNT(*) FROM sys.objects WHERE type='U' AND name LIKE 'Master_ALC_INPUT%'")
+          n = cu.fetchone()[0]
           print(f"Master_ALC_INPUT_* tables on this DB: {n}")
 
           if mode == 'dry_run':
@@ -112,9 +103,8 @@ jobs:
               print("  applied")
 
           for t in ('Master_FOCUS_LIST', 'ARS_ALLOC_HEALTH_HISTORY', 'Master_ST_SPECIFIC'):
-              cnt = cu.execute(
-                  f"SELECT COUNT(*) FROM sys.objects WHERE type='U' AND name=?", t
-              ).fetchone()[0]
+              cu.execute(f"SELECT COUNT(*) FROM sys.objects WHERE type='U' AND name=%s", (t,))
+              cnt = cu.fetchone()[0]
               status = 'OK' if cnt else 'MISSING'
               print(f"  {t}: {status}")
               assert cnt, f"Migration verification failed for {t}"
