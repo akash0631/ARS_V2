@@ -13,6 +13,7 @@ forward. They are captured here with concrete, actionable next steps.
 | Quarantine dead engines (`listing_allocator.py`, `rule_engine.py`) | DONE | `backend/app/services/_legacy/` |
 | Pure-Python formula spec + 38-test regression suite | DONE | `backend/app/services/allocation_formulas.py` + `backend/tests/` |
 | Excel reconciliation harness | DONE | `backend/scripts/excel_reconciliation.py` |
+| **Delivery Order output (multi-sheet xlsx, BDC-ready)** | **DONE** *(on `functionality/delivery-order-output`)* | `backend/app/services/delivery_order.py`, `GET /listing/parked-runs/{sid}/delivery-order`, 15 tests |
 
 Run the tests:
 ```bash
@@ -100,7 +101,7 @@ implemented in code. Decide for each: build / cut / defer.
 | Store-specific listing overrides (`ST_SPECIFIC=9999`) | Allocation Terminology | 3-5 days | Build — high business value (planner overrides) |
 | Two-DC routing (DH24/DW01 each serves its own stores) | Handover doc | 1 week | Build — the `RDC` field exists but no serving rules |
 | Pipeline inventory (INT/PRD/STO from SAP) | Handover doc | 2 weeks (SAP RFC) | Defer — separate SAP integration |
-| Delivery order output (Fresh Lorry-style file) | Handover doc | 1 week | Build — this is the literal output your replenishment head needs |
+| ~~Delivery order output (Fresh Lorry-style file)~~ | Handover doc | ~~1 week~~ | **DONE** on `functionality/delivery-order-output` (2026-05-07). Multi-sheet xlsx with Dispatch_Detail / Store / RDC / Article summaries + BDC-ready sheet. Hold isolated from dispatch. 15 unit tests. |
 | 12-month planning view | 29-step §3 | 2 weeks | Defer — separate planning module |
 
 ## Item 4 — Re-deploy to Azure with real data
