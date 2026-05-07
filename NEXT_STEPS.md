@@ -89,6 +89,12 @@ underperforms attribute-weighted scoring on one of the tested MAJ_CATs.
 Decide after Item 1 produces a real diff — if the Excel reference matches
 ARS within tolerance using the SQL pipeline, you do not need Snowflake.
 
+**Update 2026-05-07: went with (b).** Decommissioned on
+`cleanup/snowflake-decommission` branch — `services/allocation/`
+subpackage, the 8 `/allocation-engine/*` endpoints, and
+`static/allocation.html` are gone. Net −3,800 LOC. Recover from git
+history if reactivation is ever needed.
+
 ## Item 3 — Missing pieces from the original 29-step spec
 
 These are listed in `Obsidian/v2retail/ARS 29-Step Algorithm.md` but not
@@ -97,7 +103,7 @@ implemented in code. Decide for each: build / cut / defer.
 | Feature | Spec source | Likely effort | Recommendation |
 |---|---|---|---|
 | Multi-option tagging (article scoring ≥ 150 takes 2-3 slots, 4-level cascade) | 29-step §9 | 2-3 weeks | Defer until reconciliation passes — without scoring it's vestigial |
-| Hero / Focus / Assorted lists population | Handover doc | 1 week | Build — `FOCUS_W_CAP`/`FOCUS_WO_CAP` columns already exist, need ingest |
+| ~~Hero / Focus / Assorted lists population~~ | Handover doc | ~~1 week~~ | **DONE** on `functionality/focus-list-ingest`. `Master_FOCUS_LIST` table + service + 5 endpoints + listing-pipeline hook + 46 tests. |
 | Store-specific listing overrides (`ST_SPECIFIC=9999`) | Allocation Terminology | 3-5 days | Build — high business value (planner overrides) |
 | Two-DC routing (DH24/DW01 each serves its own stores) | Handover doc | 1 week | Build — the `RDC` field exists but no serving rules |
 | Pipeline inventory (INT/PRD/STO from SAP) | Handover doc | 2 weeks (SAP RFC) | Defer — separate SAP integration |
