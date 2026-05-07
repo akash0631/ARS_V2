@@ -65,24 +65,99 @@ function PageLoader() {
 }
 
 class ErrorBoundary extends Component {
-  constructor(props) { super(props); this.state = { error: null } }
-  static getDerivedStateFromError(error) { return { error } }
-  componentDidCatch(error, info) { console.error('ErrorBoundary caught:', error, info) }
+  constructor(props) {
+    super(props)
+    this.state = { error: null, errorId: null }
+  }
+
+  static getDerivedStateFromError(error) {
+    // Tag every render error with a short id so the user can quote it in
+    // a bug report and ops can grep server logs for the same id.
+    const errorId = `ERR-${Date.now().toString(36).toUpperCase()}-${
+      Math.random().toString(36).slice(2, 6).toUpperCase()
+    }`
+    return { error, errorId }
+  }
+
+  componentDidCatch(error, info) {
+    // Local diagnostics — keep regardless of whether the upstream
+    // logging endpoint exists.
+    console.error('ErrorBoundary caught:', { error, info, errorId: this.state.errorId })
+
+    // Best-effort: post to the backend so we have a server-side trail.
+    // Endpoint is optional; if it's a 404 we swallow silently. Body is
+    // small (truncated stack) and never includes user input that wasn't
+    // already part of the crash.
+    try {
+      const token = localStorage.getItem('access_token')
+      fetch('/api/v1/frontend-errors', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          error_id: this.state.errorId,
+          message: String(error?.message || error).slice(0, 500),
+          stack: String(error?.stack || '').slice(0, 4000),
+          component_stack: String(info?.componentStack || '').slice(0, 2000),
+          path: window.location.pathname,
+          user_agent: navigator.userAgent,
+        }),
+        keepalive: true,
+      }).catch(() => {})
+    } catch (_) { /* best-effort only */ }
+  }
+
+  handleRetry = () => this.setState({ error: null, errorId: null })
+
+  handleGoHome = () => { window.location.href = '/' }
+
   render() {
-    if (this.state.error) {
-      return (
-        <div style={{ padding: 40, color: '#dc2626' }}>
-          <h2 style={{ marginBottom: 10 }}>Page Error</h2>
-          <pre style={{ whiteSpace: 'pre-wrap', fontSize: 13, background: '#fef2f2', padding: 16, borderRadius: 8 }}>
-            {this.state.error.message}{'\n'}{this.state.error.stack}
-          </pre>
-          <button onClick={() => this.setState({ error: null })} style={{ marginTop: 10, padding: '6px 16px', cursor: 'pointer' }}>
-            Retry
-          </button>
+    if (!this.state.error) return this.props.children
+    return (
+      <div className="p-10 max-w-3xl mx-auto">
+        <div className="rounded-lg border border-red-200 bg-red-50 p-6">
+          <h2 className="text-xl font-semibold text-red-700 mb-2">
+            Something broke on this page
+          </h2>
+          <p className="text-sm text-red-600 mb-4">
+            The error has been logged. Try refreshing — if it keeps happening,
+            send the error ID below to your admin so it can be diagnosed.
+          </p>
+          <div className="text-xs text-red-700 bg-white border border-red-200
+                          rounded px-3 py-2 mb-4 font-mono">
+            Error ID: <strong>{this.state.errorId}</strong>
+          </div>
+          <details className="text-xs text-red-700 mb-4">
+            <summary className="cursor-pointer select-none font-medium">
+              Technical detail
+            </summary>
+            <pre className="mt-2 whitespace-pre-wrap break-all bg-white
+                            border border-red-200 rounded p-3
+                            max-h-64 overflow-auto">
+              {String(this.state.error.message || this.state.error)}
+              {'\n\n'}
+              {String(this.state.error.stack || '')}
+            </pre>
+          </details>
+          <div className="flex gap-2">
+            <button
+              onClick={this.handleRetry}
+              className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm"
+            >
+              Retry this page
+            </button>
+            <button
+              onClick={this.handleGoHome}
+              className="px-4 py-2 bg-white border border-gray-300 rounded hover:bg-gray-50 text-sm"
+            >
+              Go to dashboard
+            </button>
+          </div>
         </div>
-      )
-    }
-    return this.props.children
+      </div>
+    )
   }
 }
 
@@ -102,7 +177,13 @@ export default function App() {
     if (isAuthenticated) fetchUser()
   }, [])
 
+  // Top-level ErrorBoundary catches render errors from ANY route — no
+  // per-route wrapping needed. The existing per-route ErrorBoundary
+  // wrappers below are now redundant but harmless (an inner boundary
+  // catches first; outer is a safety net). Leaving them in place to
+  // minimise diff churn — they will be removed in a follow-up cleanup.
   return (
+    <ErrorBoundary>
     <Suspense fallback={<PageLoader />}>
     <Routes>
       <Route path="/login" element={<LoginPage />} />
@@ -168,5 +249,6 @@ export default function App() {
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
     </Suspense>
+    </ErrorBoundary>
   )
 }

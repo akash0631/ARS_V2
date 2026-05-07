@@ -146,3 +146,8 @@ api_router.include_router(focus_list_router)
 # to specific stores (ST_SPECIFIC=9999 from the original 29-step spec).
 from app.api.v1.endpoints.st_specific import router as st_specific_router
 api_router.include_router(st_specific_router)
+
+# Frontend error log sink — React ErrorBoundary POSTs here so render
+# errors land in the same loguru log as backend errors.
+from app.api.v1.endpoints.frontend_errors import router as frontend_errors_router
+api_router.include_router(frontend_errors_router)
