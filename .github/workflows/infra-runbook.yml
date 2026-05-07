@@ -1,0 +1,120 @@
+name: Infra Runbook (manual)
+
+# Manual-only workflow for prod migrations. Apply 021/022/023 to Azure SQL
+# from a GitHub-hosted runner when the operator's machine cannot reach
+# Azure (e.g., off corp VPN or behind a TLS-intercepting proxy).
+#
+# Does NOT modify any application code, build, or deploy step. Existing
+# deploy.yml is untouched. No Service Principal required.
+#
+# Requires: Azure SQL "Allow Azure services and resources to access this
+# server" = ON, OR a firewall rule allowing GitHub Actions runner IPs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'What to do (dry_run is read-only)'
+        type: choice
+        required: true
+        default: dry_run
+        options:
+          - dry_run
+          - migrate
+      sql_db:
+        description: 'Target Azure SQL database name'
+        type: string
+        required: true
+        default: Rep_Data
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install msodbcsql18 + pyodbc
+        run: |
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          sudo apt-get update -qq
+          sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18 unixodbc-dev
+          pip install --quiet pyodbc
+
+      - name: Run
+        env:
+          SQL_SERVER: ars-v2retail-sql.database.windows.net
+          SQL_DB: ${{ inputs.sql_db }}
+          SQL_USER: arsadmin
+          SQL_PWD: ${{ secrets.SQL_ADMIN_PASSWORD }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          python <<'PY'
+          import os, re, pyodbc
+          mode = os.environ['MODE']
+          cs = (
+              "DRIVER={ODBC Driver 18 for SQL Server};"
+              f"SERVER={os.environ['SQL_SERVER']};"
+              f"DATABASE={os.environ['SQL_DB']};"
+              f"UID={os.environ['SQL_USER']};"
+              f"PWD={os.environ['SQL_PWD']};"
+              "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30"
+          )
+          cn = pyodbc.connect(cs, autocommit=True)
+          cu = cn.cursor()
+          srv, db, who = cu.execute("SELECT @@SERVERNAME, DB_NAME(), SUSER_NAME()").fetchone()
+          print(f"Connected: server={srv} db={db} as={who} mode={mode}")
+
+          existing = [r[0] for r in cu.execute("""
+              SELECT name FROM sys.objects
+              WHERE type='U' AND name IN
+                ('Master_FOCUS_LIST','ARS_ALLOC_HEALTH_HISTORY','Master_ST_SPECIFIC')
+              ORDER BY name
+          """).fetchall()]
+          print(f"Target tables already present: {existing or 'none'}")
+          n = cu.execute(
+              "SELECT COUNT(*) FROM sys.objects WHERE type='U' AND name LIKE 'Master_ALC_INPUT%'"
+          ).fetchone()[0]
+          print(f"Master_ALC_INPUT_* tables on this DB: {n}")
+
+          if mode == 'dry_run':
+              print("dry_run: no changes made.")
+              cn.close()
+              raise SystemExit(0)
+
+          targets = ('021_focus_list_table.sql',
+                     '022_alloc_health_history.sql',
+                     '023_st_specific_overrides.sql')
+          for fn in targets:
+              path = os.path.join('backend', 'scripts', fn)
+              print(f"\n--- {fn} ---")
+              with open(path) as fh:
+                  body = fh.read()
+              batches = re.split(r'(?im)^\s*GO\s*$', body)
+              for batch in batches:
+                  batch = batch.strip()
+                  if not batch:
+                      continue
+                  meaningful = "\n".join(
+                      l for l in batch.splitlines()
+                      if l.strip() and not l.strip().startswith("--")
+                  ).strip()
+                  if not meaningful:
+                      continue
+                  cu.execute(batch)
+              print("  applied")
+
+          for t in ('Master_FOCUS_LIST', 'ARS_ALLOC_HEALTH_HISTORY', 'Master_ST_SPECIFIC'):
+              cnt = cu.execute(
+                  f"SELECT COUNT(*) FROM sys.objects WHERE type='U' AND name=?", t
+              ).fetchone()[0]
+              status = 'OK' if cnt else 'MISSING'
+              print(f"  {t}: {status}")
+              assert cnt, f"Migration verification failed for {t}"
+          cn.close()
+          print("\nAll three migrations verified.")
+          PY
