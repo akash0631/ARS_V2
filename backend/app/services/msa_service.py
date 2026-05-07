@@ -235,38 +235,33 @@ class MSAService:
             
             df = pd.read_sql(text(sql), self.db.bind, params=params)
             logger.debug(f"📊 Query returned {len(df)} rows")
-            
+
             if df.empty:
-                logger.warning(f"⚠️ No data returned for column {column} from {self.main_table}")
-                # Fallback: return sample test data if table is empty
-                test_data = self._get_test_distinct_values(column)
-                return test_data
-            
+                # Empty result is a real signal — the view exists but contains
+                # no rows matching the filter. Return [] so the UI shows an
+                # empty dropdown instead of fake "DH24, DH25" values that hide
+                # the real state of the data.
+                logger.warning(
+                    f"⚠️ No data returned for column {column} from {self.main_table}"
+                )
+                return []
+
             values = df[column].astype(str).tolist()
             # Filter empty and nan values
             values = [v for v in values if v and v.lower() != 'nan' and v.strip()]
             logger.info(f"✅ Retrieved {len(values)} distinct values for {column}: {values[:10]}")
             return values
         except Exception as e:
-            logger.error(f"❌ Error getting distinct values for {column}: {str(e)}", exc_info=True)
-            # Return test data as fallback
-            return self._get_test_distinct_values(column)
-
-    def _get_test_distinct_values(self, column: str) -> List[str]:
-        """
-        Return test data for development/testing when real data is unavailable
-        """
-        test_data = {
-            "ST_CD": ["DH24", "DH25", "DH26", "DH27", "DH28"],
-            "SLOC": ["V01", "V02_FRESH", "V02_GRT", "V04", "V06"],
-            "DIV": ["MENS", "WOMENS", "KIDS"],
-            "STK_Q": ["IN_STOCK", "LOW_STOCK", "OUT_STOCK"],
-            "COLOR": ["RED", "BLUE", "GREEN", "BLACK", "WHITE"],
-            "SIZE": ["S", "M", "L", "XL", "XXL"],
-        }
-        data = test_data.get(column.upper(), [f"VALUE_{i}" for i in range(1, 6)])
-        logger.info(f"ℹ️  Using test data for column {column}: {data}")
-        return data
+            # Don't return fake fallback values. Previously this returned a
+            # hard-coded ["DH24","DH25",...] list, which masked DB outages
+            # (rotated credentials, network issues, etc.) — operations team
+            # had no signal until users hit a 500 mid-run. Now the exception
+            # propagates so the caller can return HTTP 500 with a real error.
+            logger.error(
+                f"❌ Error getting distinct values for {column}: {str(e)}",
+                exc_info=True,
+            )
+            raise
 
     # ========================================================================
     # Filtering & Data Loading
@@ -501,12 +496,16 @@ class MSAService:
                     )
             
             # ============ STEP 4: SEG FILTER ============
-            if "SEG" in msa.columns: 
+            if "SEG" in msa.columns:
                 seg_filter = ["APP", "GM"]
                 msa = msa[msa["SEG"].isin(seg_filter)]
                 logger.info(f"After SEG filter {seg_filter}: {len(msa)} rows")
             else:
-                logger.info(f"No SEG filter applied - keeping ALL {msa['SEG'].nunique()} segments")
+                # Reaching here means the SEG column is absent — typically when
+                # an upstream MAJ_CAT/RLS filter excluded all APP/GM rows. The
+                # previous log line referenced msa['SEG'].nunique() inside this
+                # else branch, which raised KeyError: 'SEG' and killed the job.
+                logger.info("No SEG column present — SEG filter skipped")
 
             # ============ STEP 4b: CATEGORY RLS FILTER ============
             # If user has category restrictions, filter to only their assigned MAJ_CATs
@@ -521,8 +520,24 @@ class MSAService:
 
 
             # ============ STEP 5: PIVOT MSA BY SLOC ============
+            # Normalize DATE to midnight (date-only) before it joins pivot_keys.
+            # If DATE arrives as a timestamp, two snapshots of the same SLOC on
+            # the same day (e.g. 09:00 and 23:00) become separate pivot keys —
+            # producing duplicate rows for one (article, store, day) and
+            # corrupting the SEG/CLR aggregates downstream.
+            if "DATE" in msa.columns:
+                try:
+                    msa["DATE"] = pd.to_datetime(
+                        msa["DATE"], errors="coerce"
+                    ).dt.normalize()
+                except Exception as _date_err:
+                    logger.warning(
+                        f"DATE normalization skipped (pivot may double-row "
+                        f"if same-day timestamps exist): {_date_err}"
+                    )
+
             pivot_keys = [c for c in msa.columns if c not in ["SLOC", "STK_Q"]]
-            
+
             msa_pivot = (
                 msa.pivot_table(
                     index=pivot_keys,
@@ -558,6 +573,17 @@ class MSAService:
                         c for c in ars_pend.columns
                         if c not in ("RDC", "ARTICLE_NUMBER")
                     ]
+                    # Force both join keys to str — pandas merge silently produces
+                    # all-NaN matches when dtypes differ (int64 vs object). MSA
+                    # pivot may infer ST_CD as int64 if all store codes are numeric;
+                    # ARS_PEND_ALC.RDC comes from NVARCHAR → object. Without this
+                    # cast, no rows match → fillna(0) → PEND_QTY = 0 → FNL_Q
+                    # over-states pool by every store's actual pending qty.
+                    msa_pivot["ST_CD"] = msa_pivot["ST_CD"].astype(str).str.strip()
+                    msa_pivot["ARTICLE_NUMBER"] = msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    ars_pend["RDC"] = ars_pend["RDC"].astype(str).str.strip()
+                    ars_pend["ARTICLE_NUMBER"] = ars_pend["ARTICLE_NUMBER"].astype(str).str.strip()
+
                     msa_pivot = msa_pivot.merge(
                         ars_pend,
                         left_on=["ST_CD", "ARTICLE_NUMBER"],
@@ -567,10 +593,21 @@ class MSAService:
                     msa_pivot["ARS_PEND"] = msa_pivot["ARS_PEND"].fillna(0)
                     msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
                     msa_pivot["PEND_QTY"] = msa_pivot["ARS_PEND"]
+
+                    matched_pend = float(msa_pivot["ARS_PEND"].sum())
+                    expected_pend = float(ars_pend["ARS_PEND"].sum())
                     logger.info(
                         f"Merged ARS pending: {len(ars_pend)} (RDC,ARTICLE) rows, "
-                        f"total ARS_PEND={float(ars_pend['ARS_PEND'].sum()):.0f}"
+                        f"total ARS_PEND={expected_pend:.0f}, "
+                        f"matched into pivot={matched_pend:.0f}"
                     )
+                    if expected_pend > 0 and matched_pend < expected_pend * 0.99:
+                        logger.warning(
+                            f"[msa] PEND merge mismatch — expected {expected_pend:.0f} "
+                            f"but only {matched_pend:.0f} landed on pivot rows. "
+                            f"Likely ST_CD/RDC value mismatch (whitespace, leading "
+                            f"zeros, or unmapped warehouse keys)."
+                        )
                 else:
                     logger.info("ARS_PEND_ALC: no open pending rows — PEND_QTY = 0")
             except Exception as ars_err:
@@ -588,6 +625,14 @@ class MSAService:
                     not holds_pivot.empty
                     and "ARTICLE_NUMBER" in msa_pivot.columns
                 ):
+                    # Same dtype-coercion as the PEND merge above. Without this,
+                    # holds silently fail to attach → HOLD_QTY = 0 → MSA reports
+                    # reserved stock as available.
+                    msa_pivot["ST_CD"] = msa_pivot["ST_CD"].astype(str).str.strip()
+                    msa_pivot["ARTICLE_NUMBER"] = msa_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+                    holds_pivot["RDC"] = holds_pivot["RDC"].astype(str).str.strip()
+                    holds_pivot["ARTICLE_NUMBER"] = holds_pivot["ARTICLE_NUMBER"].astype(str).str.strip()
+
                     msa_pivot = msa_pivot.merge(
                         holds_pivot,
                         left_on=["ST_CD", "ARTICLE_NUMBER"],
@@ -596,10 +641,20 @@ class MSAService:
                     )
                     msa_pivot["HOLD_QTY"] = msa_pivot["HOLD_QTY"].fillna(0)
                     msa_pivot.drop(columns=["RDC"], inplace=True, errors="ignore")
+
+                    matched_hold = float(msa_pivot["HOLD_QTY"].sum())
+                    expected_hold = float(holds_pivot["HOLD_QTY"].sum())
                     logger.info(
                         f"Merged open holds: {len(holds_pivot)} (RDC,ARTICLE) rows, "
-                        f"total HOLD_QTY={float(holds_pivot['HOLD_QTY'].sum()):.0f}"
+                        f"total HOLD_QTY={expected_hold:.0f}, "
+                        f"matched into pivot={matched_hold:.0f}"
                     )
+                    if expected_hold > 0 and matched_hold < expected_hold * 0.99:
+                        logger.warning(
+                            f"[msa] HOLD merge mismatch — expected {expected_hold:.0f} "
+                            f"but only {matched_hold:.0f} landed on pivot rows. "
+                            f"Check ST_CD/RDC value consistency."
+                        )
                 else:
                     msa_pivot["HOLD_QTY"] = 0
                     logger.info("No open holds to merge")

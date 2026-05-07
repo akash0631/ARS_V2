@@ -19,6 +19,7 @@ import toast from 'react-hot-toast'
 import {
   CalendarDays, Plus, Save, Trash2, RefreshCw, Search, X, Upload, Download,
   ChevronUp, ChevronDown, ChevronRight, AlertTriangle, AlertCircle, CheckCircle2,
+  History,
 } from 'lucide-react'
 
 const C = {
@@ -92,6 +93,15 @@ export default function StoreBdcSchedulePage() {
   // 'inactive' | 'extra' | 'missing' | 'total'.
   // Click a card → set; click the same card again → clear.
   const [cardFilter, setCardFilter] = useState('')
+
+  // After a CSV import, remember the filename + source so the next Save
+  // tags the audit rows with source='CSV_IMPORT'. Reset to UI after Save.
+  const [pendingSource, setPendingSource] = useState({ source: 'UI', note: null })
+
+  // Per-row history drawer
+  const [historyFor,    setHistoryFor]    = useState(null)   // { st_cd } when open
+  const [historyData,   setHistoryData]   = useState([])
+  const [historyLoading,setHistoryLoading]= useState(false)
 
   const handleCardClick = (key) => {
     if (key === 'total') {
@@ -231,7 +241,7 @@ export default function StoreBdcSchedulePage() {
     }
     if (!confirm(`Delete schedule for ${r.st_cd}?`)) return
     try {
-      await pendAlcAPI.scheduleDelete(r.st_cd)
+      await pendAlcAPI.scheduleDelete(r.st_cd, { source: 'UI' })
       setRows(prev => prev.filter(x => x.st_cd !== r.st_cd))
       toast.success(`Deleted ${r.st_cd}`)
     } catch { toast.error('Delete failed') }
@@ -250,30 +260,21 @@ export default function StoreBdcSchedulePage() {
         thu: !!r.thu, fri: !!r.fri, sat: !!r.sat,
         is_active: r.is_active !== false,
       }))
-      await pendAlcAPI.scheduleUpsert(payload)
-      toast.success(`Saved ${payload.length} schedule${payload.length > 1 ? 's' : ''}`)
+      const { data } = await pendAlcAPI.scheduleUpsert(payload, {
+        source: pendingSource.source,
+        note:   pendingSource.note,
+      })
+      const audited = data?.audit_rows_written || 0
+      toast.success(
+        `Saved ${payload.length} schedule${payload.length > 1 ? 's' : ''}` +
+        (audited > 0 ? ` · ${audited} audit entries` : '')
+      )
+      // After a save, revert source back to UI so subsequent edits log as UI.
+      setPendingSource({ source: 'UI', note: null })
       load()
     } catch (e) {
       toast.error(e.response?.data?.detail || 'Save failed')
     } finally { setSaving(false) }
-  }
-
-  const applyPreset = (preset) => {
-    const apply = { mon:false, tue:false, wed:false, thu:false, fri:false, sat:false }
-    if (preset === 'daily') Object.assign(apply, { mon:true, tue:true, wed:true, thu:true, fri:true, sat:true })
-    if (preset === 'mwf')   Object.assign(apply, { mon:true, wed:true, fri:true })
-    if (preset === 'tt')    Object.assign(apply, { tue:true, thu:true })
-    if (filtered.length === 0) return
-    if (!confirm(`Apply "${preset.toUpperCase()}" to ${filtered.length} visible store(s)?`)) return
-    const codes = new Set(filtered.map(r => r.st_cd))
-    setRows(prev => prev.map(r => {
-      if (!codes.has(r.st_cd)) return r
-      const next = { ...r, ...apply, _dirty: true }
-      if (r.master_status === 'MISSING' && DAYS.some(d => next[d.key])) {
-        next.master_status = 'OK'
-      }
-      return next
-    }))
   }
 
   const handleCsvUpload = (e) => {
@@ -305,12 +306,31 @@ export default function StoreBdcSchedulePage() {
           newRows.forEach(r => map.set(r.st_cd, { ...map.get(r.st_cd), ...r, _dirty: true }))
           return [...map.values()]
         })
-        toast.success(`Imported ${newRows.length} row(s) — click Save to persist`)
+        // Tag the next Save as a CSV import (with the filename in the note)
+        // so audit rows can be filtered by source='CSV_IMPORT'.
+        setPendingSource({ source: 'CSV_IMPORT', note: `CSV: ${file.name}` })
+        toast.success(`Imported ${newRows.length} row(s) from ${file.name} — click Save to persist`)
       } catch { toast.error('CSV parse failed') }
     }
     reader.readAsText(file)
     e.target.value = ''
   }
+
+  // ---------------------------------------------------------------------
+  // Per-row history drawer — pulls from /pend-alc/schedule/audit?st_cd=...
+  // ---------------------------------------------------------------------
+  const openHistory = async (r) => {
+    setHistoryFor(r); setHistoryData([]); setHistoryLoading(true)
+    try {
+      const { data } = await pendAlcAPI.scheduleAudit({
+        st_cd: r.st_cd, page_size: 200,
+      })
+      setHistoryData(data?.data || [])
+    } catch (e) {
+      toast.error('Failed to load history')
+    } finally { setHistoryLoading(false) }
+  }
+  const closeHistory = () => { setHistoryFor(null); setHistoryData([]) }
 
   const downloadTemplate = () => {
     const csv = 'ST_CD,ST_NAME,MON,TUE,WED,THU,FRI,SAT\n'
@@ -438,12 +458,6 @@ export default function StoreBdcSchedulePage() {
           <option value="inactive">Inactive only</option>
         </select>
 
-        <div style={{ width:1, height:18, background:C.border, margin:'0 4px' }}/>
-        <button onClick={() => applyPreset('daily')} style={btn(C.border, '#fff', C.textSub)}>Daily</button>
-        <button onClick={() => applyPreset('mwf')}   style={btn(C.border, '#fff', C.textSub)}>M/W/F</button>
-        <button onClick={() => applyPreset('tt')}    style={btn(C.border, '#fff', C.textSub)}>T/Th</button>
-        <button onClick={() => applyPreset('clear')} style={btn(C.border, '#fff', C.textSub)}>Clear</button>
-
         <div style={{ flex:1 }}/>
         <button onClick={() => fileRef.current?.click()} style={btn(C.border, '#fff', C.textSub)}>
           <Upload size={11}/> Import
@@ -544,20 +558,15 @@ export default function StoreBdcSchedulePage() {
                       </td>
                       {DAYS.map(d => (
                         <td key={d.key} style={{ ...td(), textAlign:'center' }}>
-                          <button onClick={() => toggleDay(r.st_cd, d.key)}
+                          <input type="checkbox"
+                            checked={!!r[d.key]}
                             disabled={isExtra}
+                            onChange={() => toggleDay(r.st_cd, d.key)}
                             style={{
-                              width:20, height:20, borderRadius:3,
-                              border:`1px solid ${r[d.key] ? C.primary : C.border}`,
-                              background: r[d.key] ? C.primary : '#fff',
-                              color: r[d.key] ? '#fff' : C.textMuted,
+                              accentColor: C.primary,
                               cursor: isExtra ? 'not-allowed' : 'pointer',
-                              fontSize:10, fontWeight:700,
-                              padding:0,
                               opacity: isExtra ? 0.4 : 1,
-                            }}>
-                            {r[d.key] ? '✓' : ''}
-                          </button>
+                            }}/>
                         </td>
                       ))}
                       <td style={{ ...td(), textAlign:'center' }}>
@@ -565,7 +574,17 @@ export default function StoreBdcSchedulePage() {
                           disabled={isMissing}
                           onChange={e => setField(r.st_cd, 'is_active', e.target.checked)}/>
                       </td>
-                      <td style={{ ...td(), textAlign:'center' }}>
+                      <td style={{ ...td(), textAlign:'center', whiteSpace:'nowrap' }}>
+                        <button
+                          onClick={() => openHistory(r)}
+                          disabled={r._new || isExtra && r.master_status === 'EXTRA' && !r.st_cd}
+                          title="View change history"
+                          style={{ background:'none', border:'none',
+                                   cursor: r._new ? 'not-allowed' : 'pointer',
+                                   color: r._new ? C.textMuted : C.primary,
+                                   padding:2, marginRight:2 }}>
+                          <History size={11}/>
+                        </button>
                         <button onClick={() => removeRow(r)}
                           style={{ background:'none', border:'none', cursor:'pointer',
                                    color:C.red, padding:2 }}>
@@ -577,6 +596,109 @@ export default function StoreBdcSchedulePage() {
                 })}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* CSV-import indicator banner */}
+      {pendingSource.source === 'CSV_IMPORT' && (
+        <div style={{ marginTop:8, padding:'6px 12px', borderRadius:4,
+                       background: C.amber + '15', border:`1px solid ${C.amber}40`,
+                       fontSize:11, color:C.amber, display:'flex', alignItems:'center', gap:8 }}>
+          <Upload size={11}/>
+          <span>Next Save will be tagged as <b>CSV_IMPORT</b> ({pendingSource.note})</span>
+          <span style={{ flex:1 }}/>
+          <button onClick={() => setPendingSource({ source:'UI', note:null })}
+            style={{ background:'none', border:'none', cursor:'pointer', color:C.amber,
+                     fontSize:10, fontWeight:700, textDecoration:'underline' }}>
+            Tag as UI instead
+          </button>
+        </div>
+      )}
+
+      {/* History drawer */}
+      {historyFor && (
+        <div onClick={closeHistory}
+          style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.4)', zIndex:50,
+                   display:'flex', justifyContent:'flex-end' }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ width:640, maxWidth:'95vw', height:'100vh', background:'#fff',
+                     boxShadow:'-8px 0 24px rgba(0,0,0,.15)',
+                     display:'flex', flexDirection:'column' }}>
+            <div style={{ padding:'12px 16px', borderBottom:`1px solid ${C.border}`,
+                          display:'flex', alignItems:'center', gap:10 }}>
+              <History size={14} color={C.primary}/>
+              <div style={{ fontSize:13, fontWeight:800 }}>
+                Change History · <code>{historyFor.st_cd}</code>
+              </div>
+              <span style={{ fontSize:10, color:C.textMuted }}>
+                {historyData.length} entries
+              </span>
+              <div style={{ flex:1 }}/>
+              <button onClick={closeHistory}
+                style={{ background:'none', border:'none', cursor:'pointer',
+                         fontSize:18, color:C.textMuted }}>×</button>
+            </div>
+            <div style={{ flex:1, overflowY:'auto', padding:'8px 0' }}>
+              {historyLoading ? (
+                <div style={{ padding:30, textAlign:'center', color:C.textMuted }}>Loading…</div>
+              ) : historyData.length === 0 ? (
+                <div style={{ padding:30, textAlign:'center', color:C.textMuted }}>
+                  No audit entries yet for this store.
+                </div>
+              ) : (
+                <table style={{ width:'100%', borderCollapse:'collapse', fontSize:11 }}>
+                  <thead>
+                    <tr style={{ background:C.bg }}>
+                      <th style={th({ width:120 })}>WHEN</th>
+                      <th style={th({ width:60 })}>ACTION</th>
+                      <th style={th({ width:70 })}>SOURCE</th>
+                      <th style={th({ width:80 })}>USER</th>
+                      <th style={th({ width:80 })}>FIELD</th>
+                      <th style={th()}>OLD → NEW</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {historyData.map(h => (
+                      <tr key={h.log_id} style={{ borderBottom:`1px solid ${C.border}` }}>
+                        <td style={{ ...td(), fontSize:9, color:C.textMuted, whiteSpace:'nowrap' }}>
+                          {h.change_time?.replace('T', ' ').slice(0, 19)}
+                        </td>
+                        <td style={td()}>
+                          <span style={{ fontSize:8, fontWeight:700, padding:'2px 6px',
+                                          borderRadius:3,
+                                          background: h.action === 'INSERT' ? '#dcfce7'
+                                                    : h.action === 'DELETE' ? '#fee2e2'
+                                                    : '#dbeafe',
+                                          color: h.action === 'INSERT' ? C.green
+                                               : h.action === 'DELETE' ? C.red
+                                               : C.blue }}>
+                            {h.action}
+                          </span>
+                        </td>
+                        <td style={{ ...td(), fontSize:9 }}>{h.source}</td>
+                        <td style={{ ...td(), fontSize:10 }}>{h.user || '—'}</td>
+                        <td style={{ ...td(), fontFamily:'monospace', fontSize:10, fontWeight:700 }}>{h.field}</td>
+                        <td style={td()}>
+                          <span style={{ color:C.textMuted, textDecoration:'line-through' }}>
+                            {h.old_value ?? '—'}
+                          </span>
+                          {' → '}
+                          <span style={{ color:C.text, fontWeight:600 }}>
+                            {h.new_value ?? '—'}
+                          </span>
+                          {h.note && (
+                            <div style={{ fontSize:9, color:C.textMuted, marginTop:2 }}>
+                              {h.note}
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
         </div>
       )}

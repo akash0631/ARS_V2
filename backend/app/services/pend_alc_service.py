@@ -759,28 +759,174 @@ def list_schedules(conn) -> List[Dict]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# ARS_STORE_BDC_SCHEDULE_AUDIT — field-level audit log for the schedule.
+# One row per (FIELD changed) per (store touched in a save). A single Save
+# button click might write 24 stores × 4 changed fields = 96 audit rows,
+# all sharing the same BATCH_ID so the UI can group them as one event.
+# ---------------------------------------------------------------------------
+SCHEDULE_AUDIT_TABLE = "ARS_STORE_BDC_SCHEDULE_AUDIT"
+
+_SCHEDULE_AUDIT_DDL = f"""
+IF OBJECT_ID('dbo.{SCHEDULE_AUDIT_TABLE}','U') IS NULL
+CREATE TABLE dbo.{SCHEDULE_AUDIT_TABLE} (
+    LOG_ID        BIGINT IDENTITY(1,1),
+    CHANGE_TIME   DATETIME       NOT NULL DEFAULT GETDATE(),
+    ST_CD         NVARCHAR(20)   NOT NULL,
+    ACTION        NVARCHAR(10)   NOT NULL,   -- INSERT / UPDATE / DELETE
+    SOURCE        NVARCHAR(20)   NOT NULL DEFAULT 'API',
+    BATCH_ID      NVARCHAR(50)   NULL,
+    USER_NAME     NVARCHAR(100)  NULL,
+    FIELD         NVARCHAR(50)   NOT NULL,
+    OLD_VALUE     NVARCHAR(100)  NULL,
+    NEW_VALUE     NVARCHAR(100)  NULL,
+    NOTE          NVARCHAR(500)  NULL,
+    CONSTRAINT PK_ARS_STORE_BDC_SCHEDULE_AUDIT PRIMARY KEY (LOG_ID)
+)
+"""
+
+_SCHEDULE_AUDIT_INDEXES = [
+    ("IX_ARS_SCHED_AUDIT_time",
+     f"ON dbo.{SCHEDULE_AUDIT_TABLE} (CHANGE_TIME DESC)"),
+    ("IX_ARS_SCHED_AUDIT_st_cd",
+     f"ON dbo.{SCHEDULE_AUDIT_TABLE} (ST_CD, CHANGE_TIME DESC)"),
+    ("IX_ARS_SCHED_AUDIT_batch",
+     f"ON dbo.{SCHEDULE_AUDIT_TABLE} (BATCH_ID)"),
+    ("IX_ARS_SCHED_AUDIT_user",
+     f"ON dbo.{SCHEDULE_AUDIT_TABLE} (USER_NAME, CHANGE_TIME DESC)"),
+]
+
+
+def ensure_schedule_audit_table(conn) -> None:
+    """Idempotent: create ARS_STORE_BDC_SCHEDULE_AUDIT + indexes."""
+    conn.execute(text(_SCHEDULE_AUDIT_DDL))
+    for idx_name, idx_def in _SCHEDULE_AUDIT_INDEXES:
+        conn.execute(text(f"""
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.indexes
+                WHERE name = '{idx_name}'
+                  AND object_id = OBJECT_ID('dbo.{SCHEDULE_AUDIT_TABLE}')
+            )
+            CREATE INDEX {idx_name} {idx_def}
+        """))
+    conn.commit()
+
+
+# Fields tracked by the audit log. Order matches the table.
+_SCHED_AUDIT_FIELDS = [
+    "ST_NAME", "MON", "TUE", "WED", "THU", "FRI", "SAT", "IS_ACTIVE",
+]
+
+def _sched_audit_value(v) -> Optional[str]:
+    """Stringify a value for OLD_VALUE / NEW_VALUE storage."""
+    if v is None: return None
+    if isinstance(v, bool): return "1" if v else "0"
+    return str(v)
+
+def _insert_audit_rows(conn, audit_rows: List[Dict]) -> None:
+    """Bulk-insert audit rows in one round-trip."""
+    if not audit_rows:
+        return
+    conn.execute(text(f"""
+        INSERT INTO {SCHEDULE_AUDIT_TABLE}
+            (ST_CD, ACTION, SOURCE, BATCH_ID, USER_NAME,
+             FIELD, OLD_VALUE, NEW_VALUE, NOTE)
+        VALUES
+            (:st_cd, :action, :source, :batch, :user,
+             :field, :old, :new, :note)
+    """), audit_rows)
+
+
 def upsert_schedules(
-    conn, rows: List[Dict], updated_by: Optional[str] = None,
-) -> int:
-    """Bulk upsert one or more store schedules. Returns count of rows touched."""
+    conn, rows: List[Dict],
+    updated_by: Optional[str] = None,
+    source: str = "API",
+    note: Optional[str] = None,
+) -> Dict:
+    """Bulk upsert store schedules + write per-field audit rows.
+
+    For each input row we SELECT the existing values, diff per field, and
+    write one audit row per changed field. A single BATCH_ID groups all
+    audit rows from one call so the UI can show "Bulk save: 96 changes".
+
+    Returns:
+        { touched: int, inserted: int, updated: int,
+          batch_id: str, audit_rows_written: int }
+    """
     if not rows:
-        return 0
+        return {"touched": 0, "inserted": 0, "updated": 0,
+                "batch_id": None, "audit_rows_written": 0}
     ensure_schedule_table(conn)
-    touched = 0
+    ensure_schedule_audit_table(conn)
+
+    batch_id = uuid.uuid4().hex[:12]
+    audit_rows: List[Dict] = []
+    touched = inserted = updated = 0
+
     for r in rows:
         st_cd = str(r.get("st_cd") or "").strip()
         if not st_cd:
             continue
+
+        # Normalize incoming values
+        new_vals = {
+            "ST_NAME":   (r.get("st_name") or None),
+            "MON":       1 if r.get("mon") else 0,
+            "TUE":       1 if r.get("tue") else 0,
+            "WED":       1 if r.get("wed") else 0,
+            "THU":       1 if r.get("thu") else 0,
+            "FRI":       1 if r.get("fri") else 0,
+            "SAT":       1 if r.get("sat") else 0,
+            "IS_ACTIVE": 0 if r.get("is_active") is False else 1,
+        }
+
+        # Read current state
+        existing = conn.execute(text(f"""
+            SELECT ST_NAME, MON, TUE, WED, THU, FRI, SAT, IS_ACTIVE
+            FROM {SCHEDULE_TABLE} WHERE ST_CD = :st
+        """), {"st": st_cd}).fetchone()
+
+        action = "INSERT" if existing is None else "UPDATE"
+
+        # Diff per field
+        old_vals = {}
+        if existing is not None:
+            for i, f in enumerate(_SCHED_AUDIT_FIELDS):
+                old_vals[f] = existing[i]
+        for f in _SCHED_AUDIT_FIELDS:
+            new_v = new_vals[f]
+            old_v = old_vals.get(f)
+            # Coerce bit columns from DB to int for compare
+            if isinstance(old_v, bool):
+                old_v = 1 if old_v else 0
+            if action == "INSERT":
+                # Skip logging "False/empty" defaults on insert — only log
+                # actually-set fields so the audit trail isn't noisy.
+                if new_v in (None, 0, "", False):
+                    continue
+            else:
+                if old_v == new_v:
+                    continue
+            audit_rows.append({
+                "st_cd":  st_cd,
+                "action": action,
+                "source": source,
+                "batch":  batch_id,
+                "user":   updated_by,
+                "field":  f,
+                "old":    _sched_audit_value(old_v),
+                "new":    _sched_audit_value(new_v),
+                "note":   (note or "")[:500] or None,
+            })
+
+        # Apply the upsert
         params = {
             "st_cd":   st_cd,
-            "name":    (r.get("st_name") or None),
-            "mon":     1 if r.get("mon") else 0,
-            "tue":     1 if r.get("tue") else 0,
-            "wed":     1 if r.get("wed") else 0,
-            "thu":     1 if r.get("thu") else 0,
-            "fri":     1 if r.get("fri") else 0,
-            "sat":     1 if r.get("sat") else 0,
-            "active":  0 if r.get("is_active") is False else 1,
+            "name":    new_vals["ST_NAME"],
+            "mon":     new_vals["MON"],   "tue": new_vals["TUE"],
+            "wed":     new_vals["WED"],   "thu": new_vals["THU"],
+            "fri":     new_vals["FRI"],   "sat": new_vals["SAT"],
+            "active":  new_vals["IS_ACTIVE"],
             "by":      updated_by,
         }
         conn.execute(text(f"""
@@ -795,18 +941,166 @@ def upsert_schedules(
                 VALUES (:st_cd, :name, :mon, :tue, :wed, :thu, :fri, :sat, :active, :by);
         """), params)
         touched += 1
+        if action == "INSERT": inserted += 1
+        else:                  updated  += 1
+
+    _insert_audit_rows(conn, audit_rows)
     conn.commit()
-    return touched
+
+    return {
+        "touched":            touched,
+        "inserted":           inserted,
+        "updated":            updated,
+        "batch_id":           batch_id,
+        "audit_rows_written": len(audit_rows),
+    }
 
 
-def delete_schedule(conn, st_cd: str) -> int:
-    """Hard-delete a schedule row."""
+def delete_schedule(
+    conn, st_cd: str,
+    user: Optional[str] = None,
+    source: str = "API",
+    note: Optional[str] = None,
+) -> Dict:
+    """Hard-delete a schedule row + write per-field audit rows so the
+    deleted state can be reconstructed later from the audit log."""
     ensure_schedule_table(conn)
+    ensure_schedule_audit_table(conn)
+
+    existing = conn.execute(text(f"""
+        SELECT ST_NAME, MON, TUE, WED, THU, FRI, SAT, IS_ACTIVE
+        FROM {SCHEDULE_TABLE} WHERE ST_CD = :s
+    """), {"s": st_cd}).fetchone()
+
+    if existing is None:
+        return {"deleted": 0, "batch_id": None, "audit_rows_written": 0}
+
+    batch_id = uuid.uuid4().hex[:12]
+    audit_rows = []
+    for i, f in enumerate(_SCHED_AUDIT_FIELDS):
+        v = existing[i]
+        if isinstance(v, bool): v = 1 if v else 0
+        if v in (None, 0, ""):
+            continue  # skip logging fields that were already at default
+        audit_rows.append({
+            "st_cd":  st_cd,
+            "action": "DELETE",
+            "source": source,
+            "batch":  batch_id,
+            "user":   user,
+            "field":  f,
+            "old":    _sched_audit_value(v),
+            "new":    None,
+            "note":   (note or "")[:500] or None,
+        })
+
     res = conn.execute(text(
         f"DELETE FROM {SCHEDULE_TABLE} WHERE ST_CD = :s"
     ), {"s": st_cd})
+    _insert_audit_rows(conn, audit_rows)
     conn.commit()
-    return int(res.rowcount or 0)
+    return {
+        "deleted":            int(res.rowcount or 0),
+        "batch_id":           batch_id,
+        "audit_rows_written": len(audit_rows),
+    }
+
+
+def list_schedule_audit(
+    conn, st_cd: Optional[str] = None,
+    user: Optional[str] = None,
+    source: Optional[str] = None,    # CSV: 'UI,CSV_IMPORT'
+    action: Optional[str] = None,    # CSV
+    field:  Optional[str] = None,    # CSV
+    batch_id: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to:   Optional[str] = None,
+    page: int = 1, page_size: int = 100,
+    sort_by: str = "change_time", sort_dir: str = "desc",
+) -> Dict:
+    """Paged audit log query."""
+    ensure_schedule_audit_table(conn)
+
+    sortable = {
+        "change_time": "CHANGE_TIME",
+        "st_cd":       "ST_CD",
+        "user":        "USER_NAME",
+        "source":      "SOURCE",
+        "action":      "ACTION",
+        "field":       "FIELD",
+        "batch_id":    "BATCH_ID",
+    }
+    order_col = sortable.get(sort_by, "CHANGE_TIME")
+    order_dir = "ASC" if sort_dir == "asc" else "DESC"
+
+    where = ["1=1"]
+    params: dict = {}
+
+    def _multi(col, csv, prefix):
+        if not csv: return
+        vals = [v.strip() for v in csv.split(",") if v.strip()]
+        if not vals: return
+        phs = ",".join(f":{prefix}{i}" for i in range(len(vals)))
+        where.append(f"{col} IN ({phs})")
+        for i, v in enumerate(vals):
+            params[f"{prefix}{i}"] = v
+
+    if st_cd:
+        where.append("ST_CD = :st"); params["st"] = st_cd
+    if user:
+        where.append("USER_NAME LIKE :u"); params["u"] = f"%{user}%"
+    if batch_id:
+        where.append("BATCH_ID = :b"); params["b"] = batch_id
+    if date_from:
+        where.append("CHANGE_TIME >= :df"); params["df"] = date_from
+    if date_to:
+        where.append("CHANGE_TIME < DATEADD(day,1,:dt)"); params["dt"] = date_to
+    _multi("SOURCE", source, "fsrc")
+    _multi("ACTION", action, "fact")
+    _multi("FIELD",  field,  "ffld")
+
+    where_sql = "WHERE " + " AND ".join(where)
+    offset = (page - 1) * page_size
+    params["offset"] = offset
+    params["psize"]  = page_size
+
+    total = conn.execute(text(f"""
+        SELECT COUNT(*) FROM {SCHEDULE_AUDIT_TABLE} {where_sql}
+    """), params).scalar() or 0
+
+    rows = conn.execute(text(f"""
+        SELECT LOG_ID, CHANGE_TIME, ST_CD, ACTION, SOURCE, BATCH_ID,
+               USER_NAME, FIELD, OLD_VALUE, NEW_VALUE, NOTE
+        FROM {SCHEDULE_AUDIT_TABLE}
+        {where_sql}
+        ORDER BY {order_col} {order_dir}, LOG_ID DESC
+        OFFSET :offset ROWS FETCH NEXT :psize ROWS ONLY
+    """), params).fetchall()
+
+    total_pages = max(1, (int(total) + page_size - 1) // page_size)
+
+    return {
+        "total_rows":  int(total),
+        "page":        page,
+        "page_size":   page_size,
+        "total_pages": total_pages,
+        "data": [
+            {
+                "log_id":      int(r[0]),
+                "change_time": r[1].isoformat() if r[1] else None,
+                "st_cd":       r[2],
+                "action":      r[3],
+                "source":      r[4],
+                "batch_id":    r[5],
+                "user":        r[6],
+                "field":       r[7],
+                "old_value":   r[8],
+                "new_value":   r[9],
+                "note":        r[10],
+            }
+            for r in rows
+        ],
+    }
 
 # All non-computed columns that must exist; order matters for NOT NULL + DEFAULT
 _ENSURE_COLS = [

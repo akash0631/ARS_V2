@@ -540,8 +540,11 @@ export const pendAlcAPI = {
   // Store BDC schedule (Mon-Sat per store)
   scheduleList:        ()                    => api.get('/pend-alc/schedule'),
   scheduleStoresFor:   (date)                => api.get('/pend-alc/schedule/stores-for-date', { params: { date } }),
-  scheduleUpsert:      (rows)                => api.post('/pend-alc/schedule', { rows }),
-  scheduleDelete:      (st_cd)               => api.delete(`/pend-alc/schedule/${encodeURIComponent(st_cd)}`),
+  scheduleUpsert:      (rows, opts = {})     => api.post('/pend-alc/schedule',
+                                                  { rows, source: opts.source || 'API', note: opts.note || null }),
+  scheduleDelete:      (st_cd, opts = {})    => api.delete(`/pend-alc/schedule/${encodeURIComponent(st_cd)}`,
+                                                  { params: { source: opts.source || 'UI', ...(opts.note ? { note: opts.note } : {}) } }),
+  scheduleAudit:       (params = {})         => api.get('/pend-alc/schedule/audit', { params }),
 
   // Operations log + revert (BDC / DO / MANUAL)
   operationsList:      (params = {})         => api.get('/pend-alc/operations', { params }),
@@ -551,6 +554,24 @@ export const pendAlcAPI = {
                                                   { params: { confirm: true } }),
   operationsBackfillBdc: (confirm = false)   => api.post('/pend-alc/operations/backfill-bdc',
                                                   null, { params: { confirm } }),
+}
+
+// ============== Project Tracker ==============
+export const ptAPI = {
+  enums:        ()                       => api.get('/pt/enums'),
+  list:         (params = {})            => api.get('/pt/projects',          { params }),
+  tree:         (params = {})            => api.get('/pt/projects/tree',     { params }),
+  get:          (id)                     => api.get(`/pt/projects/${id}`),
+  create:       (data)                   => api.post('/pt/projects', data),
+  update:       (id, data)               => api.put(`/pt/projects/${id}`, data),
+  archive:      (id)                     => api.delete(`/pt/projects/${id}`),
+  restore:      (id)                     => api.post(`/pt/projects/${id}/restore`),
+  move:         (id, new_parent_id)      => api.post(`/pt/projects/${id}/move`,
+                                                     { new_parent_id }),
+  activity:     (id, limit = 100)        => api.get(`/pt/projects/${id}/activity`,
+                                                    { params: { limit } }),
+  dashboard:    ()                       => api.get('/pt/dashboard'),
+  myTasks:      ()                       => api.get('/pt/my-tasks'),
 }
 
 export default api

@@ -183,16 +183,18 @@ def get_distinct_values(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Error getting distinct values for {column}: {str(e)}", exc_info=True)
+        # Don't swallow into a 200-OK with empty values + buried error message —
+        # the frontend treats that as "no data" and the user sees a blank dropdown
+        # while the DB is silently down. Log the full stack for ops, then fail
+        # loudly with HTTP 500 so the UI shows an explicit error toast.
+        logger.error(
+            f"❌ Error getting distinct values for {column}: {str(e)}",
+            exc_info=True,
+        )
         logger.error(f"   Column: {column}, Date: {date}, Filters: {filters}")
-        # Return empty list instead of throwing error
-        return APIResponse(
-            data={
-                "column": column,
-                "values": [],
-                "total_count": 0
-            },
-            message=f"Error: {str(e)}"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load distinct values for {column}",
         )
 
 
@@ -408,23 +410,23 @@ def debug_test_date(
         logger.info(f"✅ Date '{date}' has {row_count} rows")
         
         # Test 2: Get sample ST_CD values for this date
+        # SQL Server uses TOP n, not LIMIT n. The previous LIMIT 10 made this
+        # endpoint 500 with "Incorrect syntax near 'LIMIT'" since it was written.
         sql2 = f"""
-        SELECT DISTINCT ST_CD
+        SELECT DISTINCT TOP 10 ST_CD
         FROM {MSAService(db).main_table}
         WHERE CAST([DATE] AS DATE) = :test_date
-        LIMIT 10
         """
         sample_df = pd.read_sql(text(sql2), db.bind, params={"test_date": date})
         st_cd_samples = sample_df['ST_CD'].tolist() if len(sample_df) > 0 else []
-        
+
         logger.info(f"✅ Sample ST_CD values for date: {st_cd_samples}")
-        
-        # Test 3: Get all available dates in the view
+
+        # Test 3: Get recent available dates in the view
         sql3 = f"""
-        SELECT DISTINCT CAST([DATE] AS DATE) as date_val
+        SELECT DISTINCT TOP 20 CAST([DATE] AS DATE) as date_val
         FROM {MSAService(db).main_table}
         ORDER BY date_val DESC
-        LIMIT 20
         """
         dates_df = pd.read_sql(text(sql3), db.bind)
         available_dates = [str(d) for d in dates_df['date_val'].tolist()]

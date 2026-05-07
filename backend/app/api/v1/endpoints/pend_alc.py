@@ -43,6 +43,7 @@ from app.services.pend_alc_service import (
     get_stores_for_date,
     insert_bdc_history,
     list_operations,
+    list_schedule_audit,
     list_schedules,
     log_operation,
     preview_revert,
@@ -55,6 +56,7 @@ from app.services.pend_alc_service import (
     BDC_HISTORY_TABLE,
     OPERATIONS_TABLE,
     PEND_ALC_TABLE,
+    SCHEDULE_AUDIT_TABLE,
     SCHEDULE_TABLE,
 )
 
@@ -809,7 +811,9 @@ class ScheduleRow(BaseModel):
 
 
 class ScheduleUpsertRequest(BaseModel):
-    rows: List[ScheduleRow]
+    rows:    List[ScheduleRow]
+    source:  Optional[str] = "API"   # 'UI' / 'CSV_IMPORT' / 'API'
+    note:    Optional[str] = None    # e.g. "CSV: BDC_Schedule_2026-05-07.csv"
 
 
 @router.post("/schedule")
@@ -817,35 +821,81 @@ def pend_alc_schedule_upsert(
     body: ScheduleUpsertRequest,
     current_user: User = Depends(get_current_user),
 ):
-    """Bulk upsert one or more store schedules. Used by the schedule admin UI."""
+    """Bulk upsert one or more store schedules.
+
+    Every changed field on every row is logged to ARS_STORE_BDC_SCHEDULE_AUDIT
+    with a shared BATCH_ID for this call. The optional `source` and `note`
+    are stored verbatim in the audit log."""
     if not body.rows:
         raise HTTPException(400, "No rows provided")
     try:
         with _engine().connect() as conn:
-            n = upsert_schedules(
+            res = upsert_schedules(
                 conn,
                 [r.model_dump() for r in body.rows],
                 updated_by=getattr(current_user, "username", None),
+                source=(body.source or "API"),
+                note=body.note,
             )
         logger.info(
-            f"[schedule] upsert by {getattr(current_user,'username','?')}: "
-            f"{n} rows touched"
+            f"[schedule] upsert by {getattr(current_user,'username','?')} "
+            f"source={body.source}: {res}"
         )
-        return {"success": True, "rows_upserted": n}
+        return {"success": True, **res}
     except Exception as e:
         raise HTTPException(500, str(e))
 
 
 @router.delete("/schedule/{st_cd}")
 def pend_alc_schedule_delete(
-    st_cd: str,
+    st_cd:  str,
+    source: Optional[str] = Query("UI"),
+    note:   Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
-    """Hard-delete a store's schedule row."""
+    """Hard-delete a store's schedule row + write per-field audit rows so the
+    deleted state can be reconstructed later."""
     try:
         with _engine().connect() as conn:
-            n = delete_schedule(conn, st_cd)
-        return {"success": True, "deleted": n}
+            res = delete_schedule(
+                conn, st_cd,
+                user=getattr(current_user, "username", None),
+                source=(source or "UI"),
+                note=note,
+            )
+        return {"success": True, **res}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/schedule/audit")
+def pend_alc_schedule_audit(
+    st_cd:     Optional[str] = Query(None),
+    user:      Optional[str] = Query(None),
+    source:    Optional[str] = Query(None, description="CSV: 'UI,CSV_IMPORT'"),
+    action:    Optional[str] = Query(None, description="CSV"),
+    field:     Optional[str] = Query(None, description="CSV"),
+    batch_id:  Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to:   Optional[str] = Query(None),
+    page:      int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=10000),
+    sort_by:   str = Query("change_time"),
+    sort_dir:  str = Query("desc", pattern="^(asc|desc)$"),
+    current_user: User = Depends(get_current_user),
+):
+    """Paged audit log of every schedule field change."""
+    try:
+        with _engine().connect() as conn:
+            res = list_schedule_audit(
+                conn,
+                st_cd=st_cd, user=user, source=source, action=action,
+                field=field, batch_id=batch_id,
+                date_from=date_from, date_to=date_to,
+                page=page, page_size=page_size,
+                sort_by=sort_by, sort_dir=sort_dir,
+            )
+        return {"success": True, **res}
     except Exception as e:
         raise HTTPException(500, str(e))
 

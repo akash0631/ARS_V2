@@ -40,6 +40,7 @@ const PendingAllocationPage      = lazy(() => import('@/pages/PendingAllocationP
 const PendingDeliveryOrderPage   = lazy(() => import('@/pages/PendingDeliveryOrderPage'))
 const PendAlcRecoPage            = lazy(() => import('@/pages/PendAlcRecoPage'))
 const StoreBdcSchedulePage       = lazy(() => import('@/pages/StoreBdcSchedulePage'))
+const ScheduleAuditPage          = lazy(() => import('@/pages/ScheduleAuditPage'))
 const PendAlcOperationsPage      = lazy(() => import('@/pages/PendAlcOperationsPage'))
 const ManualPendAlcPage          = lazy(() => import('@/pages/ManualPendAlcPage'))
 const HoldDashboardPage      = lazy(() => import('@/pages/HoldDashboardPage'))
@@ -51,6 +52,11 @@ const TrendDashboardPage     = lazy(() => import('@/pages/TrendDashboardPage'))
 const ProcessPage            = lazy(() => import('@/pages/ProcessPage'))
 const TempDBAdminPage        = lazy(() => import('@/pages/TempDBAdminPage'))
 const DeveloperGuidePage     = lazy(() => import('@/pages/DeveloperGuidePage'))
+// Project Tracker
+const PTDashboardPage        = lazy(() => import('@/pages/pt/PTDashboardPage'))
+const PTProjectsPage         = lazy(() => import('@/pages/pt/PTProjectsPage'))
+const PTProjectDetailPage    = lazy(() => import('@/pages/pt/PTProjectDetailPage'))
+const PTMyTasksPage          = lazy(() => import('@/pages/pt/PTMyTasksPage'))
 
 function PageLoader() {
   return (
@@ -132,6 +138,11 @@ export default function App() {
         <Route path="data-prep/listing/logs" element={<ErrorBoundary><ListingLogsPage /></ErrorBoundary>} />
         <Route path="process" element={<ErrorBoundary><ProcessPage /></ErrorBoundary>} />
         <Route path="dev-guide" element={<ErrorBoundary><DeveloperGuidePage /></ErrorBoundary>} />
+        {/* Project Tracker */}
+        <Route path="pt"                   element={<ErrorBoundary><PTDashboardPage /></ErrorBoundary>} />
+        <Route path="pt/projects"          element={<ErrorBoundary><PTProjectsPage /></ErrorBoundary>} />
+        <Route path="pt/projects/:id"      element={<ErrorBoundary><PTProjectDetailPage /></ErrorBoundary>} />
+        <Route path="pt/my-tasks"          element={<ErrorBoundary><PTMyTasksPage /></ErrorBoundary>} />
         {/* Trends */}
         <Route path="trends/dashboard" element={<ProtectedRoute permission="TRENDS_DASHBOARD"><ErrorBoundary><TrendDashboardPage /></ErrorBoundary></ProtectedRoute>} />
         <Route path="trends/upload" element={<ProtectedRoute permission="TRENDS_UPLOAD"><ErrorBoundary><TrendUploadPage /></ErrorBoundary></ProtectedRoute>} />
@@ -145,8 +156,9 @@ export default function App() {
         <Route path="pend-alc/manual-entry"  element={<ErrorBoundary><ManualPendAlcPage /></ErrorBoundary>} />
         <Route path="pend-alc/do-entry"      element={<ErrorBoundary><PendingDeliveryOrderPage /></ErrorBoundary>} />
         <Route path="pend-alc/reco"          element={<ErrorBoundary><PendAlcRecoPage /></ErrorBoundary>} />
-        <Route path="pend-alc/schedule"      element={<ErrorBoundary><StoreBdcSchedulePage /></ErrorBoundary>} />
-        <Route path="pend-alc/operations"    element={<ErrorBoundary><PendAlcOperationsPage /></ErrorBoundary>} />
+        <Route path="pend-alc/schedule"        element={<ErrorBoundary><StoreBdcSchedulePage /></ErrorBoundary>} />
+        <Route path="pend-alc/schedule-audit"  element={<ErrorBoundary><ScheduleAuditPage /></ErrorBoundary>} />
+        <Route path="pend-alc/operations"      element={<ErrorBoundary><PendAlcOperationsPage /></ErrorBoundary>} />
         {/* Allocations */}
         <Route path="allocations" element={<AllocationsPage />} />
         <Route path="allocations/new" element={<NewAllocationPage />} />

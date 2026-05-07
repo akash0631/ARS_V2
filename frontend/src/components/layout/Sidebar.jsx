@@ -4,7 +4,7 @@ import {
   ChevronLeft, ChevronRight, Box, ChevronDown, FolderOpen, FilePlus, FileUp, Plus,
   FileDown, Edit3, Settings, Database, Columns, BarChart3, Cpu, Cog, Activity,
   Clock, Truck, FileText, ClipboardCheck, ClipboardList, ShieldCheck, LayoutGrid, Search, TrendingUp, List, BookOpen,
-  HardDrive, Code2, Lock, CalendarDays, History
+  HardDrive, Code2, Lock, CalendarDays, History, FolderKanban, ListTodo
 } from 'lucide-react'
 import useAuthStore from '@/store/authStore'
 import clsx from 'clsx'
@@ -58,6 +58,7 @@ const pendAlcItems = [
   { label: 'Daily DO Entry',   path: '/pend-alc/do-entry',     icon: Truck },
   { label: 'Reconciliation',   path: '/pend-alc/reco',         icon: BarChart3 },
   { label: 'BDC Schedule',     path: '/pend-alc/schedule',     icon: CalendarDays },
+  { label: 'Schedule Audit',   path: '/pend-alc/schedule-audit', icon: History },
   { label: 'Operations Log',   path: '/pend-alc/operations',   icon: History },
 ]
 
@@ -65,6 +66,13 @@ const pendAlcItems = [
 const dataValidationItems = [
   { label: 'Store Sloc Validation', path: '/data-validation/store-sloc', icon: ShieldCheck, permission: 'STORE_SLOC_VIEW' },
   { label: 'Data Checklist', path: '/data-validation/checklist', icon: ClipboardCheck, permission: 'CHECKLIST_VIEW' },
+]
+
+// Project Tracker submenu — enterprise-style task management
+const projectTrackerItems = [
+  { label: 'Dashboard',     path: '/pt',          icon: LayoutDashboard },
+  { label: 'All Projects',  path: '/pt/projects', icon: FolderKanban },
+  { label: 'My Tasks',      path: '/pt/my-tasks', icon: ListTodo },
 ]
 
 // Settings submenu (admin features)
@@ -294,6 +302,15 @@ export default function Sidebar({ collapsed, onToggle }) {
           title="Data Validation"
           icon={ClipboardCheck}
           items={dataValidationItems}
+          collapsed={collapsed}
+          hasPermission={hasPermission}
+        />
+
+        {/* Project Tracker submenu — hierarchical project & task management */}
+        <SubMenu
+          title="Project Tracker"
+          icon={FolderKanban}
+          items={projectTrackerItems}
           collapsed={collapsed}
           hasPermission={hasPermission}
         />

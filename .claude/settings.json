@@ -27,7 +27,8 @@
       "Bash(node -e ' *)",
       "Bash(node --experimental-vm-modules -e ' *)",
       "Bash(/e/ARS/backend/venv/Scripts/python.exe -c \"import docx; print\\('python-docx', docx.__version__\\)\")",
-      "Bash(/e/ARS/backend/venv/Scripts/python.exe /e/ARS/docs/generate_project_tracker_brd.py)"
+      "Bash(/e/ARS/backend/venv/Scripts/python.exe /e/ARS/docs/generate_project_tracker_brd.py)",
+      "Bash(e:/ARS/backend/venv/Scripts/python.exe e:/ARS/scripts/load_review_findings.py)"
     ]
   }
 }
