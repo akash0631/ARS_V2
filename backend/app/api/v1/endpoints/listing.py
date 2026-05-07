@@ -2560,6 +2560,55 @@ def get_parked_run_detail(session_id: str,
     }
 
 
+@router.get("/parked-runs/{session_id}/delivery-order")
+def download_delivery_order(
+    session_id: str,
+    source: str = Query("parked", regex="^(parked|history)$"),
+    current_user: User = Depends(get_current_user),
+):
+    """Build the Delivery Order workbook for a parked or historical run.
+
+    Source:
+      - 'parked'  → ARS_ALLOC_PARKED  (default — review-stage runs)
+      - 'history' → ARS_ALLOC_HISTORY (post-approval; use when re-issuing)
+
+    Returns a multi-sheet xlsx (Run_Meta, Dispatch_Detail, Store_Summary,
+    RDC_Summary, Article_Summary, BDC_Format). The dispatch and BDC sheets
+    contain SHIP_QTY > 0 only — HOLD_QTY stays in the summary sheets so
+    the operator can see the reserve position separately.
+
+    See backend/app/services/delivery_order.py for the contract.
+    """
+    from app.services.delivery_order import (
+        build_delivery_order_workbook,
+        load_alloc_for_session,
+    )
+    de = get_data_engine()
+    with de.connect() as conn:
+        df = load_alloc_for_session(conn, session_id, source=source)
+    if df.empty:
+        raise HTTPException(
+            404,
+            f"No allocation rows found for session {session_id!r} in {source}.",
+        )
+    xlsx_bytes = build_delivery_order_workbook(
+        df,
+        run_meta={
+            "session_id":   session_id,
+            "source":       source,
+            "generated_by": getattr(current_user, "username", "user"),
+        },
+    )
+    filename = f"DO_{session_id}_{source}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(xlsx_bytes),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/parked-runs/{session_id}/approve")
 def approve_parked_run(session_id: str,
                        current_user: User = Depends(get_current_user)):

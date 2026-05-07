@@ -368,6 +368,13 @@ export const listingAPI = {
   approveParked:   (sid) => api.post(`/listing/parked-runs/${sid}/approve`),
   rejectParked:    (sid, note) =>
                     api.post(`/listing/parked-runs/${sid}/reject`, { note: note || '' }),
+  // Multi-sheet xlsx (Dispatch_Detail / Store / RDC / Article / BDC) for
+  // parked or approved runs. source='parked' (default) reads ARS_ALLOC_PARKED;
+  // 'history' reads ARS_ALLOC_HISTORY for re-issuing a past run.
+  downloadDeliveryOrder: (sid, source = 'parked') =>
+                    api.get(`/listing/parked-runs/${sid}/delivery-order`,
+                            { params: { source }, responseType: 'blob',
+                              timeout: 600000 }),
   allocHistory:    (params) => api.get('/listing/alloc-history', { params }),
   listingHistory:  (params) => api.get('/listing/listing-history', { params }),
 }
