@@ -34,6 +34,9 @@ psutil>=6.1.0
 # Logging
 loguru>=0.7.2
 
+# Rate limiting (used on /listing/generate to prevent duplicate runs / DoS)
+slowapi>=0.1.9
+
 # Cloud Storage (Azure Blob — for exports/uploads in production)
 azure-storage-blob>=12.24.0
 

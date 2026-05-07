@@ -166,6 +166,22 @@ app = FastAPI(
     redirect_slashes=False,
 )
 
+# Per-user rate limiter — used as a Depends() on long-running endpoints
+# (currently /listing/generate). Skipped if slowapi is not installed so
+# the existing test suite keeps running without the new dependency.
+try:
+    from slowapi.errors import RateLimitExceeded
+    from slowapi import _rate_limit_exceeded_handler
+    from app.middleware.rate_limit import limiter as _rate_limiter
+    app.state.limiter = _rate_limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    logger.info("Rate limiter (slowapi) registered")
+except ImportError:
+    logger.warning(
+        "slowapi not installed — rate limiting disabled. "
+        "Install with: pip install slowapi"
+    )
+
 # Store debug flag for exception handler
 app.state.debug = settings.DEBUG
 

@@ -347,10 +347,19 @@ def save_listing_settings(body: dict, current_user: User = Depends(get_current_u
 
 
 @router.post("/generate")
-def generate_listing(req: GenerateRequest, current_user: User = Depends(get_current_user)):
+def generate_listing(
+    req: GenerateRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
     """Build ARS_LISTING = Grid data + MSA missing options.
 
     run_mode: "listing" = generate listing only, "full" = MSA calc → Grid build → Listing
+
+    Rate-limited at 5 calls per hour per user (override with the
+    ARS_GENERATE_RATE_PER_HOUR env var). The has_running_session() check
+    below adds idempotency: even within rate quota, the second call is
+    refused 409 if a previous run is still in progress.
 
     Runs ASYNCHRONOUSLY: a background thread does the actual work; this
     endpoint returns within milliseconds so reverse proxies (Cloudflare's
@@ -360,6 +369,23 @@ def generate_listing(req: GenerateRequest, current_user: User = Depends(get_curr
       - GET /listing/alloc-progress?batch_id=…  (per-MAJ_CAT, parallel modes)
     """
     import threading
+
+    # Apply per-user rate limit if slowapi is installed. Skipped silently
+    # if not (the import guard in main.py already logs a warning at boot).
+    try:
+        import os as _os
+        _limit_str = _os.environ.get("ARS_GENERATE_RATE_PER_HOUR", "5") + "/hour"
+        if hasattr(request.app.state, "limiter"):
+            # slowapi's Limiter exposes .check (sync) for non-decorator use.
+            request.app.state.limiter.limit(_limit_str)(lambda: None)()
+    except Exception as _rl_err:
+        # Rate-limit-exceeded raises a RateLimitExceeded exception that
+        # FastAPI's exception handler turns into 429. Other failures are
+        # logged but should not break the endpoint.
+        from slowapi.errors import RateLimitExceeded
+        if isinstance(_rl_err, RateLimitExceeded):
+            raise
+        logger.warning(f"rate limit check failed (allowing call): {_rl_err}")
 
     from app.services.listing_sessions import (
         make_session_id, start_session,
