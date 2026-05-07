@@ -2165,6 +2165,44 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
     summary["majcat_fallback"] = fb_summary
     t0 = _time_step("Part 8.3 (majcat fallback)", t0)
 
+    # ── Part 8.35 — Allocation-correctness health snapshot ──────────
+    # Capture per-run health metrics (mix%, fill rate, fallback share,
+    # budget pressure) into ARS_ALLOC_HEALTH_HISTORY so ops/planners
+    # can see at-a-glance whether this run is structurally sound BEFORE
+    # they approve it for dispatch. Failure logged but does NOT abort.
+    health_summary: Dict[str, Any] = {}
+    try:
+        from app.services import alloc_health
+        with de.connect() as ac:
+            from app.utils.db_helpers import table_exists as _table_exists_check
+            if _table_exists_check(ac, "ARS_ALLOC_HEALTH_HISTORY"):
+                health_summary = alloc_health.capture_for_session(
+                    ac, session_id,
+                    alloc_table=ALLOC_TABLE,
+                    working_table=FINAL_TABLE,
+                    user=getattr(current_user, "username", None) if 'current_user' in dir() else None,
+                )
+                alerts_active = [k for k in (
+                    "ALERT_HIGH_MIX", "ALERT_LOW_FILL",
+                    "ALERT_HIGH_FALLBACK", "ALERT_BUDGET_PRESSURE"
+                ) if health_summary.get(k)]
+                logger.info(
+                    f"Part 8.35: health snapshot — "
+                    f"mix={health_summary.get('PCT_MIX', 0)}% "
+                    f"fill={health_summary.get('AVG_FILL_RATE_PCT', 0)}% "
+                    f"fallback={health_summary.get('FALLBACK_PCT', 0)}% "
+                    f"alerts={alerts_active or 'none'}"
+                )
+            else:
+                logger.info(
+                    "Part 8.35: ARS_ALLOC_HEALTH_HISTORY not found — "
+                    "skipping snapshot (run migration 022_alloc_health_history.sql)"
+                )
+    except Exception as e:
+        logger.warning(f"Part 8.35: health snapshot failed (continuing): {e}")
+    summary["health"] = health_summary
+    t0 = _time_step("Part 8.35 (health snapshot)", t0)
+
     t0 = _time_step(
         f"Part 8 ({mode}, workers={n_workers} → {alloc_rows} alloc rows, "
         f"failed={alloc_failed_count}, batch={alloc_batch_id})",
@@ -2624,6 +2662,37 @@ def get_parked_run_detail(session_id: str,
             session_id, page=page, page_size=page_size, which=which
         ),
     }
+
+
+@router.get("/health-snapshots")
+def list_health_snapshots(
+    limit: int = 20,
+    current_user: User = Depends(get_current_user),
+):
+    """List recent allocation-health snapshots (ARS_ALLOC_HEALTH_HISTORY).
+    Each row carries the structural metrics (mix%, fill rate, fallback%,
+    budget pressure) plus boolean ALERT_* flags so the dashboard can
+    highlight bad runs without recomputing thresholds."""
+    from app.services import alloc_health
+    de = get_data_engine()
+    with de.connect() as ac:
+        rows = alloc_health.list_recent(ac, limit=int(limit))
+    return {"success": True, "rows": rows, "count": len(rows)}
+
+
+@router.get("/health-snapshots/{session_id}")
+def get_health_snapshot(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """Get one health snapshot by session_id."""
+    from app.services import alloc_health
+    de = get_data_engine()
+    with de.connect() as ac:
+        row = alloc_health.get_for_session(ac, session_id)
+    if row is None:
+        raise HTTPException(404, f"No health snapshot for session {session_id!r}")
+    return {"success": True, "data": row}
 
 
 @router.get("/parked-runs/{session_id}/delivery-order")

@@ -349,6 +349,12 @@ export const listingAPI = {
   contribution:  (majCats) => api.get('/listing/contribution', {
     params: { maj_cats: (majCats || []).join(',') }, ..._POLL,
   }),
+  // Allocation-correctness health snapshots — per-run mix%, fill rate,
+  // fallback share, budget pressure with boolean ALERT_* flags. Read
+  // from ARS_ALLOC_HEALTH_HISTORY (populated each /listing/generate run).
+  healthSnapshots:    (limit = 20) => api.get('/listing/health-snapshots',
+                                               { params: { limit } }),
+  healthSnapshot:     (sid)        => api.get(`/listing/health-snapshots/${sid}`),
   // Per-session log capture (Logs page).
   sessions:      (params)    => api.get('/listing/sessions', { params }),
   session:       (sid)       => api.get(`/listing/sessions/${sid}`),
