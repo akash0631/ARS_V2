@@ -2047,6 +2047,32 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         logger.warning(f"Auto-create {FINAL_TABLE} failed: {e}")
     t0 = _time_step(f"Part 7 (Working table + Hierarchy + ALLOC_FLAG → {working_rows} rows)", t0)
 
+    # ── Part 7.5 — Apply Master_FOCUS_LIST → FOCUS_W_CAP / FOCUS_WO_CAP ──
+    # Stamps planner-curated 'always include this article' flags onto the
+    # working table just before allocation. The allocator already reads
+    # both columns (eligibility bypass + MJ_REQ uncap). Best-effort: if
+    # Master_FOCUS_LIST does not exist yet (migration 021 not run), the
+    # call no-ops via the table_exists guard inside the service. Failure
+    # here MUST NOT abort generate — focus list is additive, not required.
+    try:
+        from app.services import focus_list as _fl
+        from app.utils.db_helpers import table_exists as _table_exists_check
+        with de.connect() as ac:
+            if _table_exists_check(ac, _fl.TABLE):
+                fcounts = _fl.apply_focus_flags(ac, working_table=FINAL_TABLE)
+                logger.info(
+                    f"Part 7.5: focus flags applied — "
+                    f"W_CAP={fcounts['w_cap']} WO_CAP={fcounts['wo_cap']}"
+                )
+            else:
+                logger.info(
+                    f"Part 7.5: {_fl.TABLE} not found, skipping focus apply "
+                    f"(run migration 021_focus_list_table.sql to enable)"
+                )
+    except Exception as e:
+        logger.warning(f"Part 7.5: focus apply failed (continuing): {e}")
+    t0 = _time_step("Part 7.5 (focus flags)", t0)
+
     # ── Part 8 — Rule engine (list OPTs + allocate VAR_ART × SZ) ──
     # Spec: docs/NEW_RULE_ENGINE_SPEC.md
     # Modes:
