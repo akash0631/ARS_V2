@@ -6,27 +6,17 @@ The workflow does **only** what you tell it via the dropdown — `dry_run` is th
 
 ## What needs to be configured (on the fork: `akash0631/ARS_V2`)
 
-### Repository secrets (Settings → Secrets and variables → Actions → Secrets)
+### Repository secret (Settings → Secrets and variables → Actions → Secrets)
 
-| Name | Value | Where it comes from |
+| Name | Value | Source |
 |---|---|---|
-| `AZURE_CREDENTIALS` | Service Principal JSON (see format below) | `az ad sp create-for-rbac` output |
-| `SQL_ADMIN_PASSWORD` | Azure SQL admin password | Repo CLAUDE.md (`SQL_PASS_IN_ENV`) or Azure portal |
+| `SQL_ADMIN_PASSWORD` | Azure SQL admin password for `arsadmin` | The `DB_PASSWORD` app setting on `ars-v2retail-api` |
 
-`AZURE_CREDENTIALS` format (one line in the secret value):
-```json
-{"clientId":"<sp-app-id>","clientSecret":"<sp-secret>","subscriptionId":"7c2e7784-61b3-4aa7-9967-f41b381406dd","tenantId":"3eb968d0-bf19-40f9-b191-f3186ac38f02"}
-```
+### Azure SQL firewall
 
-The SP needs `Contributor` (or narrower: `SQL Server Contributor` + `SQL DB Contributor`) on `rg-ars-prod`.
-
-### Repository variables (Settings → Secrets and variables → Actions → Variables)
-
-| Name | Value |
-|---|---|
-| `SQL_RG` | `rg-ars-prod` |
-| `SQL_SERVER` | `ars-v2retail-sql` |
-| `SQL_USER` | `arsadmin` |
+The runner connects from a GitHub-hosted IP, so Azure SQL must accept it. Either:
+- **(Recommended)** Toggle ON: Azure portal → `ars-v2retail-sql` → Networking → "Allow Azure services and resources to access this server"
+- OR add a permanent firewall rule for the runner's static range (less common for hosted runners)
 
 ### Environment (recommended — Settings → Environments → New environment)
 
@@ -38,13 +28,13 @@ Create an environment named **`prod`** and add at least one required reviewer. E
 2. Pick **Infra Runbook (manual)** in the left sidebar
 3. Click **Run workflow**
 4. Branch: `infra/gh-actions-runbook`
-5. Mode: choose one
+5. Mode:
    - `dry_run` — connects, lists target tables and master inputs, no writes
    - `migrate` — applies 021/022/023 (idempotent `CREATE TABLE IF NOT EXISTS`)
-   - `ltr` — sets Long-Term Retention to 12W / 12M / 1Y
-   - `migrate_and_ltr` — both, in order
-6. SQL DB: defaults to `Rep_data`. Override if the deployed app's database name differs.
+6. SQL DB: defaults to `Rep_Data` (capital D, matches the prod DB on `ars-v2retail-sql`).
 7. Click **Run workflow**. Approve at the `prod` environment gate.
+
+LTR: do this once via Azure portal → `ars-v2retail-sql/Rep_Data` → Backups → Retention policies → set Weekly=12W, Monthly=12M, Yearly=1Y, Week-of-year=1.
 
 ## Safety guarantees
 
