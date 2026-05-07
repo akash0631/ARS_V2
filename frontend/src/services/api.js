@@ -447,6 +447,24 @@ export const contribAPI = {
   deleteExport:     (id)    => api.delete(`/contrib/review/exports/${id}`),
 }
 
+// ============== Focus / Hero list (Master_FOCUS_LIST) ==============
+// Populates FOCUS_W_CAP / FOCUS_WO_CAP on ARS_LISTING_WORKING so the
+// allocator force-includes planner-curated articles regardless of demand.
+export const focusListAPI = {
+  list:    (params)        => api.get('/focus-list', { params }),
+  upsertOne: (entry)       => api.post('/focus-list', entry),
+  upload:  (formData, onProgress) =>
+                              api.post('/focus-list/upload', formData, {
+                                headers: { 'Content-Type': 'multipart/form-data' },
+                                onUploadProgress: onProgress,
+                                timeout: 300000,
+                              }),
+  delete:  (id)            => api.delete(`/focus-list/${id}`),
+  applyNow: (workingTable = 'ARS_LISTING_WORKING') =>
+                              api.post('/focus-list/apply', null,
+                                       { params: { working_table: workingTable } }),
+}
+
 // ============== Data Checklist ==============
 export const checklistAPI = {
   getItems:         ()           => api.get('/checklist/items'),
