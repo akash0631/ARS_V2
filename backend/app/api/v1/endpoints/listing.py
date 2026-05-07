@@ -2081,6 +2081,31 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         logger.warning(f"Part 7.5: focus apply failed (continuing): {e}")
     t0 = _time_step("Part 7.5 (focus flags)", t0)
 
+    # ── Part 7.6 — Apply Master_ST_SPECIFIC store-specific overrides ──
+    # Stamps FOCUS_WO_CAP=1 and ST_SPECIFIC_TARGET on rows where the
+    # planner has pinned an article to a specific store. Runs AFTER
+    # focus-list so ST_SPECIFIC takes precedence (it's strictly stronger
+    # than a global focus entry — same flag, plus a target qty).
+    try:
+        from app.services import st_specific as _sts
+        from app.utils.db_helpers import table_exists as _table_exists_check
+        with de.connect() as ac:
+            if _table_exists_check(ac, _sts.TABLE):
+                scounts = _sts.apply_overrides(ac, working_table=FINAL_TABLE)
+                logger.info(
+                    f"Part 7.6: ST_SPECIFIC overrides applied — "
+                    f"opts={scounts['opts_overridden']} "
+                    f"target_qty={scounts['ship_target_qty']}"
+                )
+            else:
+                logger.info(
+                    f"Part 7.6: {_sts.TABLE} not found, skipping ST_SPECIFIC apply "
+                    f"(run migration 023_st_specific_overrides.sql to enable)"
+                )
+    except Exception as e:
+        logger.warning(f"Part 7.6: ST_SPECIFIC apply failed (continuing): {e}")
+    t0 = _time_step("Part 7.6 (st_specific overrides)", t0)
+
     # ── Part 8 — Rule engine (list OPTs + allocate VAR_ART × SZ) ──
     # Spec: docs/NEW_RULE_ENGINE_SPEC.md
     # Modes:

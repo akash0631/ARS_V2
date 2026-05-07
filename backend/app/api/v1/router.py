@@ -141,3 +141,8 @@ api_router.include_router(dev_guide_router)
 # allocator reads to force-include planner-curated articles.
 from app.api.v1.endpoints.focus_list import router as focus_list_router
 api_router.include_router(focus_list_router)
+
+# Store-specific overrides — Master_ST_SPECIFIC. Pins specific articles
+# to specific stores (ST_SPECIFIC=9999 from the original 29-step spec).
+from app.api.v1.endpoints.st_specific import router as st_specific_router
+api_router.include_router(st_specific_router)

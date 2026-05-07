@@ -471,6 +471,24 @@ export const focusListAPI = {
                                        { params: { working_table: workingTable } }),
 }
 
+// ============== Store-Specific Overrides (Master_ST_SPECIFIC) ==============
+// ST_SPECIFIC=9999 from the 29-step spec — pins articles to specific stores
+// regardless of normal scoring. Applied during /listing/generate Part 7.6.
+export const stSpecificAPI = {
+  list:    (params)        => api.get('/st-specific', { params }),
+  upsertOne: (entry)       => api.post('/st-specific', entry),
+  upload:  (formData, onProgress) =>
+                              api.post('/st-specific/upload', formData, {
+                                headers: { 'Content-Type': 'multipart/form-data' },
+                                onUploadProgress: onProgress,
+                                timeout: 300000,
+                              }),
+  delete:  (id)            => api.delete(`/st-specific/${id}`),
+  applyNow: (workingTable = 'ARS_LISTING_WORKING') =>
+                              api.post('/st-specific/apply', null,
+                                       { params: { working_table: workingTable } }),
+}
+
 // ============== Data Checklist ==============
 export const checklistAPI = {
   getItems:         ()           => api.get('/checklist/items'),
