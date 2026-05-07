@@ -32,8 +32,13 @@ not grow new callers. Delete them once nothing in the open repo points at them.
 - `rule_engine_parallel_python.py`, `rule_engine_parallel_sql.py` — kept in
   `services/`. Used by `scripts/validate_alloc_modes.py` for performance
   benchmarking; not on the API path but still useful.
-- `app/services/allocation/*` (Snowflake-based engine, ~2,200 lines) — kept
-  in place. Still wired to `/api/v1/allocation-engine/*` endpoints, even
-  though Snowflake itself is currently suspended. Quarantining requires
-  also disabling those eight endpoints; punted to a follow-up. See
-  `NEXT_STEPS.md`.
+- ~~`app/services/allocation/*` (Snowflake-based engine, ~2,200 lines)~~ —
+  **DELETED** in commit "cleanup: decommission Snowflake-backed allocation
+  engine" on the `cleanup/snowflake-decommission` branch. The Snowflake
+  account was suspended for non-payment so every `/api/v1/allocation-engine/*`
+  endpoint was returning 500. The SQL-Server-only path
+  (`/listing/generate` + `rule_engine_pandas`) covers the same use case
+  without the Snowflake dependency. The eight endpoints, the
+  `static/allocation.html` dashboard, and the `services/allocation/`
+  subpackage are gone. Recover from git history if reactivation is ever
+  needed.

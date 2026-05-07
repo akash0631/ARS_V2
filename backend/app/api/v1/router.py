@@ -121,9 +121,12 @@ api_router.include_router(maintenance_router)
 from app.api.v1.endpoints.pipeline import router as pipeline_router
 api_router.include_router(pipeline_router)
 
-# Allocation Engine v2 (score-based, replaces Excel 8-level waterfall)
-from app.api.v1.endpoints.allocation_engine import router as alloc_engine_router
-api_router.include_router(alloc_engine_router)
+# Allocation Engine v2 (Snowflake-based, score-driven) — DECOMMISSIONED.
+# The Snowflake account that backed this engine was suspended for non-payment;
+# every endpoint under /api/v1/allocation-engine/* returned 500 in production.
+# The SQL-Server-only path (/listing/generate + rule_engine_pandas) covers the
+# same functionality without the Snowflake dependency. Delete history is in
+# commit "cleanup: decommission Snowflake-backed allocation engine".
 
 # Process Docs (SOPs rendered on the Process page)
 from app.api.v1.endpoints.process_docs import router as process_docs_router

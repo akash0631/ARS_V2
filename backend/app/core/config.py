@@ -83,7 +83,8 @@ class Settings(BaseSettings):
         "/listing/generate",
         "/listing/run",
         "/allocation",
-        "/allocation-engine",
+        # /allocation-engine removed — endpoints decommissioned with the
+        # Snowflake stack (see commit "cleanup: decommission Snowflake-...").
         "/contrib/execute",
         "/contrib/run",
         "/grid-builder/run",
