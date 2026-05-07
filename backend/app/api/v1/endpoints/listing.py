@@ -116,6 +116,14 @@ class GenerateRequest(BaseModel):
     st_master_table: str = "Master_ALC_INPUT_ST_MASTER"
     ssn_values: List[str] = []  # restrict run to MAJ_CATs whose articles belong to selected seasons
     opt_types: List[str] = ["RL", "TBC", "TBL"]  # which OPT_TYPEs the waterfall runs (subset to skip types)
+    # MAJ_CAT-level fallback fill: when primary allocation under-fills a
+    # (store, MAJ_CAT) gap because MSA lacks attribute-matched variants,
+    # fill from any unconsumed pool in that category. Tagged
+    # ALLOC_TYPE='MAJ_CAT_FALLBACK' so planners can see it. Off by default.
+    enable_majcat_fallback: bool = False
+    # Cap fallback at this fraction of MJ_REQ. 0.5 = at most 50% of the
+    # store's MJ_REQ can be satisfied by best-effort attribute-blind fills.
+    majcat_fallback_max_pct: float = 0.5
 
 
 # ── Helpers — delegating to shared db_helpers ───────────────────────────────
@@ -2125,6 +2133,38 @@ def _generate_listing_impl(req: GenerateRequest, current_user, session_id: str,
         alloc_failed_count = alloc_result.get("failed", 0) or 0
     except Exception as e:
         logger.warning(f"Rule engine ({mode}) failed: {e}")
+
+    # ── Part 8.3 — MAJ_CAT-level fallback fill ──────────────────────
+    # When primary allocation leaves a (WERKS, MAJ_CAT) gap because MSA
+    # lacks attribute-matched variants, satisfy what we can from any
+    # unconsumed pool in that category. Tagged ALLOC_TYPE='MAJ_CAT_FALLBACK'.
+    # Off by default; turn on with enable_majcat_fallback=True. Failure
+    # MUST NOT abort generate — fallback is additive, not required.
+    fb_summary: Dict[str, Any] = {"fills": 0, "qty": 0.0,
+                                  "stores_helped": 0, "majcats_touched": 0}
+    if req.enable_majcat_fallback:
+        try:
+            from app.services.majcat_fallback import run_fallback_for_session
+            with de.connect() as ac:
+                fb_summary = run_fallback_for_session(
+                    ac,
+                    alloc_table=ALLOC_TABLE,
+                    working_table=FINAL_TABLE,
+                    max_fill_pct=float(req.majcat_fallback_max_pct or 0.5),
+                )
+            logger.info(
+                f"Part 8.3: MAJ_CAT fallback — "
+                f"fills={fb_summary['fills']} qty={fb_summary['qty']:.0f} "
+                f"stores={fb_summary['stores_helped']} "
+                f"cats={fb_summary['majcats_touched']}"
+            )
+        except Exception as e:
+            logger.warning(f"Part 8.3: MAJ_CAT fallback failed (continuing): {e}")
+    else:
+        logger.info("Part 8.3: MAJ_CAT fallback disabled (enable_majcat_fallback=False)")
+    summary["majcat_fallback"] = fb_summary
+    t0 = _time_step("Part 8.3 (majcat fallback)", t0)
+
     t0 = _time_step(
         f"Part 8 ({mode}, workers={n_workers} → {alloc_rows} alloc rows, "
         f"failed={alloc_failed_count}, batch={alloc_batch_id})",
